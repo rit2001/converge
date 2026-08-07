@@ -3,8 +3,11 @@ import {
   createBoardRequestSchema,
   durableCommandSchema,
   ephemeralEventTypeSchema,
+  joinBoardAckSchema,
   joinBoardRequestSchema,
   operationRangeQuerySchema,
+  operationRangeResponseSchema,
+  protocolErrorSchema,
   SCHEMA_VERSION,
 } from "../src/index.js";
 
@@ -86,8 +89,66 @@ describe("protocol schemas", () => {
       false,
     );
     expect(
-      operationRangeQuerySchema.safeParse({ from: "1", to: "2", surprise: true }).success,
+      operationRangeQuerySchema.safeParse({ after: "0", watermark: "2", surprise: true }).success,
     ).toBe(false);
+  });
+
+  it("validates strict join acknowledgements and synchronization errors", () => {
+    expect(
+      joinBoardAckSchema.parse({
+        ok: true,
+        boardId: command.boardId,
+        joinWatermark: 2,
+      }),
+    ).toEqual({ ok: true, boardId: command.boardId, joinWatermark: 2 });
+    expect(
+      joinBoardAckSchema.safeParse({
+        ok: true,
+        boardId: command.boardId,
+        joinWatermark: 2,
+        surprise: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      protocolErrorSchema.safeParse({
+        ok: false,
+        code: "RESYNC_REQUIRED",
+        message: "Resynchronize",
+        retryable: true,
+        surprise: true,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects malformed synchronization ranges", () => {
+    expect(operationRangeQuerySchema.parse({ after: "0", watermark: "2" })).toEqual({
+      after: 0,
+      watermark: 2,
+    });
+    expect(operationRangeQuerySchema.safeParse({ after: -1, watermark: 2 }).success).toBe(false);
+    expect(operationRangeQuerySchema.safeParse({ after: 3, watermark: 2 }).success).toBe(false);
+    expect(operationRangeQuerySchema.safeParse({ after: 0.5, watermark: 2 }).success).toBe(false);
+  });
+
+  it("validates bounded, contiguous operation-range responses", () => {
+    const operation = {
+      ...command,
+      seq: 1,
+      committedAt: "2026-08-06T12:00:01.000Z",
+    };
+    const response = {
+      boardId: command.boardId,
+      afterSeq: 0,
+      watermark: 1,
+      operations: [operation],
+      nextSeq: 1,
+      hasMore: false,
+    };
+    expect(operationRangeResponseSchema.parse(response)).toEqual(response);
+    expect(operationRangeResponseSchema.safeParse({ ...response, nextSeq: 0 }).success).toBe(false);
+    expect(operationRangeResponseSchema.safeParse({ ...response, surprise: true }).success).toBe(
+      false,
+    );
   });
 
   it("classifies previews as ephemeral", () => {

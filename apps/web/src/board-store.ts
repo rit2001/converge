@@ -17,24 +17,36 @@ import type {
 } from "@converge/protocol";
 import { removePending, savePending } from "./pending-db";
 
-type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "offline";
+export type SynchronizationStatus =
+  | "disconnected"
+  | "connecting"
+  | "joining"
+  | "catching-up"
+  | "ready"
+  | "authorization-failed"
+  | "error";
+export type IngestResult = "applied" | "buffered" | "duplicate" | "conflict";
+
 interface BoardStore {
   boardId: string | null;
   name: string;
   committed: BoardState;
   pending: DurableCommand[];
   buffered: Record<number, CommittedOperation>;
+  appliedOpIds: Record<string, number>;
+  appliedSeqOpIds: Record<number, string>;
   objects: CanvasObject[];
   selectedId: string | null;
-  connection: ConnectionStatus;
+  connection: SynchronizationStatus;
   hash: string;
   error: string | null;
   initialize(snapshot: BoardSnapshot, pending: DurableCommand[]): void;
-  setConnection(status: ConnectionStatus): void;
+  setConnection(status: SynchronizationStatus): void;
+  setSynchronizationError(message: string, authorizationFailed?: boolean): void;
   select(id: string | null): void;
   enqueue(command: DurableCommand): void;
   acknowledge(opId: string, ack: OperationAck): void;
-  ingest(operation: CommittedOperation): void;
+  ingest(operation: CommittedOperation): IngestResult;
 }
 
 function stateFromSnapshot(snapshot: BoardSnapshot): BoardState {
@@ -68,9 +80,11 @@ export const useBoardStore = create<BoardStore>((set, get) => ({
   committed: emptyBoardState(),
   pending: [],
   buffered: {},
+  appliedOpIds: {},
+  appliedSeqOpIds: {},
   objects: [],
   selectedId: null,
-  connection: "connecting",
+  connection: "disconnected",
   hash: "calculating…",
   error: null,
   initialize(snapshot, pending) {
@@ -82,12 +96,20 @@ export const useBoardStore = create<BoardStore>((set, get) => ({
       pending,
       objects: derive(committed, pending),
       buffered: {},
+      appliedOpIds: {},
+      appliedSeqOpIds: {},
       error: null,
     });
     scheduleHash(committed);
   },
   setConnection(connection) {
     set({ connection });
+  },
+  setSynchronizationError(error, authorizationFailed = false) {
+    set({
+      connection: authorizationFailed ? "authorization-failed" : "error",
+      error,
+    });
   },
   select(selectedId) {
     set({ selectedId });
@@ -114,17 +136,49 @@ export const useBoardStore = create<BoardStore>((set, get) => ({
     } else set({ error: `${ack.code}: ${ack.message}` });
   },
   ingest(operation) {
-    let committed = get().committed;
-    if (operation.seq <= committed.lastSeq) return;
-    const buffered = { ...get().buffered, [operation.seq]: operation };
+    const current = get();
+    const appliedOpId = current.appliedSeqOpIds[operation.seq];
+    if (appliedOpId !== undefined && appliedOpId !== operation.opId) {
+      set({ error: "Conflicting operations share an applied sequence", connection: "error" });
+      return "conflict";
+    }
+    const appliedSeq = current.appliedOpIds[operation.opId];
+    if (appliedSeq !== undefined) {
+      if (appliedSeq !== operation.seq) {
+        set({ error: "Conflicting sequence for committed operation", connection: "error" });
+        return "conflict";
+      }
+      return "duplicate";
+    }
+    if (operation.seq <= current.committed.lastSeq) return "duplicate";
+    const existing = current.buffered[operation.seq];
+    if (existing) {
+      if (existing.opId === operation.opId) return "duplicate";
+      set({ error: "Conflicting operations share a sequence", connection: "error" });
+      return "conflict";
+    }
+
+    let committed = current.committed;
+    const buffered = { ...current.buffered, [operation.seq]: operation };
+    const appliedOpIds = { ...current.appliedOpIds };
+    const appliedSeqOpIds = { ...current.appliedSeqOpIds };
     let next = buffered[committed.lastSeq + 1];
     while (next) {
       committed = applyCommitted(committed, next);
+      appliedOpIds[next.opId] = next.seq;
+      appliedSeqOpIds[next.seq] = next.opId;
       delete buffered[next.seq];
       next = buffered[committed.lastSeq + 1];
     }
-    set({ committed, buffered, objects: derive(committed, get().pending) });
+    set({
+      committed,
+      buffered,
+      appliedOpIds,
+      appliedSeqOpIds,
+      objects: derive(committed, get().pending),
+    });
     scheduleHash(committed);
+    return operation.seq <= committed.lastSeq ? "applied" : "buffered";
   },
 }));
 

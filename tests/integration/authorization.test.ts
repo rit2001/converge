@@ -4,7 +4,12 @@ import { buildApp, type AppContext } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
 import type { Environment } from "@converge/api/env";
 import { createPool } from "@converge/database";
-import { boardSnapshotSchema, type DurableCommand, type OperationAck } from "@converge/protocol";
+import {
+  boardSnapshotSchema,
+  type DurableCommand,
+  type JoinBoardAck,
+  type OperationAck,
+} from "@converge/protocol";
 import {
   createRectangleCommand,
   createTestSocket,
@@ -135,7 +140,7 @@ function rejectedConnection(
   });
 }
 
-function joinBoard(socket: TestSocket, boardId: string): Promise<OperationAck | { ok: true }> {
+function joinBoard(socket: TestSocket, boardId: string): Promise<JoinBoardAck> {
   return new Promise((resolve) => socket.emit("board:join", joinRequest(boardId), resolve));
 }
 
@@ -197,7 +202,11 @@ describe("authentication boundaries", () => {
     expect(persisted.rows[0]?.created_by).toBe(identities.owner.id);
 
     const socket = await connectSocket(tokens.owner);
-    await expect(joinBoard(socket, board.id)).resolves.toEqual({ ok: true });
+    await expect(joinBoard(socket, board.id)).resolves.toEqual({
+      ok: true,
+      boardId: board.id,
+      joinWatermark: 0,
+    });
     const before = await persistedState(board.id);
     const command = createRectangleCommand(board.id);
     const forged = await submit(socket, { ...command, actorId: identities.outsider.id });
@@ -246,7 +255,11 @@ describe("HTTP and Socket.IO authorization matrix", () => {
     });
     expect(response.statusCode).toBe(200);
     const socket = await connectSocket(tokens.owner);
-    await expect(joinBoard(socket, boardId)).resolves.toEqual({ ok: true });
+    await expect(joinBoard(socket, boardId)).resolves.toEqual({
+      ok: true,
+      boardId,
+      joinWatermark: 0,
+    });
     const acknowledgement = await submit(socket, createRectangleCommand(boardId));
     expect(acknowledgement).toMatchObject({ ok: true, operation: { seq: 1 } });
   });
@@ -260,7 +273,11 @@ describe("HTTP and Socket.IO authorization matrix", () => {
     });
     expect(response.statusCode).toBe(200);
     const socket = await connectSocket(tokens.editor);
-    await expect(joinBoard(socket, boardId)).resolves.toEqual({ ok: true });
+    await expect(joinBoard(socket, boardId)).resolves.toEqual({
+      ok: true,
+      boardId,
+      joinWatermark: 0,
+    });
     const acknowledgement = await submit(socket, createRectangleCommand(boardId));
     expect(acknowledgement).toMatchObject({ ok: true, operation: { seq: 1 } });
   });
@@ -274,7 +291,11 @@ describe("HTTP and Socket.IO authorization matrix", () => {
     });
     expect(response.statusCode).toBe(200);
     const socket = await connectSocket(tokens.viewer);
-    await expect(joinBoard(socket, boardId)).resolves.toEqual({ ok: true });
+    await expect(joinBoard(socket, boardId)).resolves.toEqual({
+      ok: true,
+      boardId,
+      joinWatermark: 0,
+    });
     const before = await persistedState(boardId);
     const create = createRectangleCommand(boardId);
     const commands: DurableCommand[] = [
@@ -353,7 +374,11 @@ describe("HTTP and Socket.IO authorization matrix", () => {
   it("rechecks authorization for a connected editor after membership removal", async () => {
     const boardId = await createPrivateBoard();
     const socket = await connectSocket(tokens.editor);
-    await expect(joinBoard(socket, boardId)).resolves.toEqual({ ok: true });
+    await expect(joinBoard(socket, boardId)).resolves.toEqual({
+      ok: true,
+      boardId,
+      joinWatermark: 0,
+    });
     await pool.query("DELETE FROM board_members WHERE board_id = $1 AND user_id = $2", [
       boardId,
       identities.editor.id,

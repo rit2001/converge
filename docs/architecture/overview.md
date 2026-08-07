@@ -18,11 +18,23 @@ adequate for this single-instance milestone and is not claimed to close crash-af
 
 ## Client recovery
 
-The client applies committed operations only in board-sequence order, ignores duplicates, buffers
-future operations, and fetches a bounded missing range after detecting a gap. On reconnect it sends
-`lastAppliedSeq` and pending operation IDs. Optimistic state is rebuilt by reducing committed state
-then pending commands. Canonical serialization sorts objects and recursively sorts object keys before
-SHA-256 hashing.
+Initial synchronization and reconnect use the same application-level protocol. After authentication
+and authorization, the server joins the socket to the board room and then captures a fixed
+`joinWatermark`. The client fetches the operation-log tail after its `lastAppliedSeq` through that
+watermark in server-bounded batches of at most 100 operations. Live room events received while joining
+or catching up are buffered, deduplicated by operation identity and sequence, and drained only in
+strict sequence order. `READY` means every operation through the join watermark has been applied and
+no known gap remains; a raw Socket.IO connection is not readiness.
+
+Optimistic pending commands remain intact across synchronization and are resubmitted with their
+original `opId` only after `READY`, preserving repository idempotency. Canonical serialization still
+provides a current-state diagnostic hash, but the database does not yet persist a trustworthy hash for
+each historical sequence, so the client cannot verify a server-issued hash specifically at the join
+watermark.
+
+This closes initial-load and temporary-disconnection gaps for the single API instance. Milestone 2
+still owns crash-window outbox delivery, Redis multi-instance fan-out, snapshots, compaction, and
+server-crash recovery.
 
 ## Boundaries
 

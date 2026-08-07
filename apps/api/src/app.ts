@@ -5,12 +5,16 @@ import { Server, type DefaultEventsMap } from "socket.io";
 import { z } from "zod";
 import { BoardRepository, RepositoryError, type DatabasePool } from "@converge/database";
 import {
+  MAX_SYNC_BATCH_SIZE,
   createBoardRequestSchema,
   durableCommandSchema,
+  joinBoardAckSchema,
   joinBoardRequestSchema,
   operationRangeQuerySchema,
+  operationRangeResponseSchema,
   type ClientToServerEvents,
   type OperationAck,
+  type ProtocolError,
   type ServerToClientEvents,
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
@@ -22,11 +26,16 @@ function errorStatus(code: RepositoryError["code"]): number {
   return 409;
 }
 
-function failedAck(error: unknown): OperationAck {
+function failedAck(error: unknown): ProtocolError {
   if (error instanceof AuthenticationError)
     return { ok: false, code: error.code, message: error.message, retryable: false };
   if (error instanceof RepositoryError)
-    return { ok: false, code: error.code, message: error.message, retryable: false };
+    return {
+      ok: false,
+      code: error.code,
+      message: error.message,
+      retryable: error.code === "RESYNC_REQUIRED",
+    };
   if (error instanceof z.ZodError)
     return {
       ok: false,
@@ -57,15 +66,31 @@ interface AuthenticatedSocketData {
   principal: AuthenticatedPrincipal;
 }
 
+export interface SynchronizationHooks {
+  afterRoomJoin?: (context: { boardId: string; userId: string; socketId: string }) => Promise<void>;
+}
+
+export interface BuildAppOptions {
+  synchronizationBatchSize?: number;
+  synchronizationHooks?: SynchronizationHooks;
+}
+
 export async function buildApp(
   environment: Environment,
   pool: DatabasePool,
   auth: AuthAdapter,
+  options: BuildAppOptions = {},
 ): Promise<AppContext> {
   const app = Fastify({ logger: { level: environment.LOG_LEVEL }, bodyLimit: 64 * 1024 });
   await app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   const repository = new BoardRepository(pool);
+  const synchronizationBatchSize = z
+    .number()
+    .int()
+    .positive()
+    .max(MAX_SYNC_BATCH_SIZE)
+    .parse(options.synchronizationBatchSize ?? MAX_SYNC_BATCH_SIZE);
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AuthenticationError)
@@ -106,7 +131,7 @@ export async function buildApp(
       throw error;
     }
   });
-  app.get<{ Params: { boardId: string }; Querystring: { from: string; to: string } }>(
+  app.get<{ Params: { boardId: string }; Querystring: { after: string; watermark: string } }>(
     "/v1/boards/:boardId/operations",
     async (request, reply) => {
       const user = await authenticateHttp(request);
@@ -114,13 +139,23 @@ export async function buildApp(
       const range = operationRangeQuerySchema.parse(request.query);
       try {
         return {
-          operations: await repository.getOperations(boardId, user.id, range.from, range.to),
+          ...operationRangeResponseSchema.parse(
+            await repository.getOperationBatch(
+              boardId,
+              user.id,
+              range.after,
+              range.watermark,
+              synchronizationBatchSize,
+            ),
+          ),
         };
       } catch (error) {
         if (error instanceof RepositoryError)
-          return reply
-            .code(errorStatus(error.code))
-            .send({ code: error.code, message: error.message });
+          return reply.code(errorStatus(error.code)).send({
+            code: error.code,
+            message: error.message,
+            retryable: error.code === "RESYNC_REQUIRED",
+          });
         throw error;
       }
     },
@@ -159,9 +194,26 @@ export async function buildApp(
         if (!(await repository.roleFor(request.boardId, user.id)))
           throw new RepositoryError("FORBIDDEN", "Board membership required");
         await socket.join(`board:${request.boardId}`);
-        acknowledge({ ok: true });
+        await options.synchronizationHooks?.afterRoomJoin?.({
+          boardId: request.boardId,
+          userId: user.id,
+          socketId: socket.id,
+        });
+        const joinWatermark = await repository.getBoardSequence(request.boardId, user.id);
+        if (request.lastAppliedSeq > joinWatermark)
+          throw new RepositoryError(
+            "RESYNC_REQUIRED",
+            "Client sequence exceeds authoritative board head",
+          );
+        acknowledge(
+          joinBoardAckSchema.parse({
+            ok: true,
+            boardId: request.boardId,
+            joinWatermark,
+          }),
+        );
       } catch (error) {
-        acknowledge(failedAck(error));
+        acknowledge(joinBoardAckSchema.parse(failedAck(error)));
       }
     });
     socket.on("operation:submit", async (raw, acknowledge) => {

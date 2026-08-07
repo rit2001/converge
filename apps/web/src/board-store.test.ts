@@ -45,8 +45,12 @@ beforeEach(() => {
     committed: emptyBoardState(),
     pending: [],
     buffered: {},
+    appliedOpIds: {},
+    appliedSeqOpIds: {},
     objects: [],
     hash: "calculating…",
+    connection: "disconnected",
+    error: null,
   });
 });
 
@@ -67,5 +71,32 @@ describe("committed sequence reconciliation", () => {
     useBoardStore.getState().ingest(created);
     expect(useBoardStore.getState().committed.lastSeq).toBe(1);
     expect(useBoardStore.getState().objects).toHaveLength(1);
+  });
+
+  it("rejects conflicting operation identities for one sequence", () => {
+    useBoardStore.getState().ingest(transformed);
+    const conflict = useBoardStore.getState().ingest({
+      ...transformed,
+      opId: "40000000-0000-4000-8000-000000000099",
+    });
+    expect(conflict).toBe("conflict");
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "error",
+      committed: { lastSeq: 0 },
+    });
+  });
+
+  it("rejects a conflicting identity for an already applied sequence", () => {
+    useBoardStore.getState().ingest(created);
+    const conflict = useBoardStore.getState().ingest({
+      ...created,
+      opId: "40000000-0000-4000-8000-000000000098",
+    });
+    expect(conflict).toBe("conflict");
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "error",
+      committed: { lastSeq: 1 },
+      objects: [{ id: objectId }],
+    });
   });
 });

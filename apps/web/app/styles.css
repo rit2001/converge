@@ -82,11 +82,13 @@ button {
   border-radius: 50%;
   background: #f59e0b;
 }
-.connection i.connected {
+.connection i.ready {
   background: #22c55e;
   box-shadow: 0 0 0 3px #dcfce7;
 }
-.connection i.offline {
+.connection i.disconnected,
+.connection i.authorization-failed,
+.connection i.error {
   background: #ef4444;
 }
 .avatar {

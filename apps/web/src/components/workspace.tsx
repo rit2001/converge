@@ -56,7 +56,7 @@ export function Workspace(): React.JSX.Element {
     void start().catch((error: unknown) =>
       useBoardStore.setState({
         error: error instanceof Error ? error.message : "Startup failed",
-        connection: "offline",
+        connection: "error",
       }),
     );
     return () => {

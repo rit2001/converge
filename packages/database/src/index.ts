@@ -12,6 +12,7 @@ import {
   type BoardSnapshot,
   type CommittedOperation,
   type DurableCommand,
+  type OperationRangeResponse,
 } from "@converge/protocol";
 
 export class RepositoryError extends Error {
@@ -22,7 +23,8 @@ export class RepositoryError extends Error {
       | "INVALID_COMMAND"
       | "TARGET_NOT_FOUND"
       | "TARGET_DELETED"
-      | "CONFLICT",
+      | "CONFLICT"
+      | "RESYNC_REQUIRED",
     message: string,
   ) {
     super(message);
@@ -66,6 +68,19 @@ export class BoardRepository {
       [boardId, userId],
     );
     return result.rows[0]?.role ?? null;
+  }
+
+  async getBoardSequence(boardId: string, userId: string): Promise<number> {
+    const result = await this.pool.query<{ last_seq: string }>(
+      `SELECT b.last_seq
+       FROM boards b
+       JOIN board_members m ON m.board_id = b.id AND m.user_id = $2
+       WHERE b.id = $1`,
+      [boardId, userId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new RepositoryError("FORBIDDEN", "Board membership required");
+    return Number(row.last_seq);
   }
 
   async getBoard(boardId: string, userId: string): Promise<BoardSnapshot> {
@@ -115,6 +130,52 @@ export class BoardRepository {
         committedAt: row.committed_at.toISOString(),
       }),
     );
+  }
+
+  async getOperationBatch(
+    boardId: string,
+    userId: string,
+    afterSeq: number,
+    watermark: number,
+    batchSize: number,
+  ): Promise<OperationRangeResponse> {
+    if (watermark < afterSeq)
+      throw new RepositoryError("RESYNC_REQUIRED", "Invalid synchronization cursor");
+    const head = await this.getBoardSequence(boardId, userId);
+    if (watermark > head)
+      throw new RepositoryError("RESYNC_REQUIRED", "Synchronization watermark exceeds board head");
+    const result = await this.pool.query<{ command: unknown; seq: string; committed_at: Date }>(
+      `SELECT command, seq, committed_at
+       FROM board_operations
+       WHERE board_id = $1 AND seq > $2 AND seq <= $3
+       ORDER BY seq
+       LIMIT $4`,
+      [boardId, afterSeq, watermark, batchSize],
+    );
+    const operations = result.rows.map((row) =>
+      committedOperationSchema.parse({
+        ...durableCommandSchema.parse(row.command),
+        seq: Number(row.seq),
+        committedAt: row.committed_at.toISOString(),
+      }),
+    );
+    let expected = afterSeq + 1;
+    for (const operation of operations) {
+      if (operation.seq !== expected)
+        throw new RepositoryError("RESYNC_REQUIRED", "Operation log is not contiguous");
+      expected += 1;
+    }
+    const nextSeq = operations.at(-1)?.seq ?? afterSeq;
+    if (nextSeq < watermark && operations.length === 0)
+      throw new RepositoryError("RESYNC_REQUIRED", "Operation range is unavailable");
+    return {
+      boardId,
+      afterSeq,
+      watermark,
+      operations,
+      nextSeq,
+      hasMore: nextSeq < watermark,
+    };
   }
 
   async commitOperation(

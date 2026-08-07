@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const SCHEMA_VERSION = 1 as const;
+export const MAX_SYNC_BATCH_SIZE = 100 as const;
 
 export const idSchema = z.string().uuid();
 export const sequenceSchema = z.number().int().nonnegative().safe();
@@ -145,17 +146,24 @@ export const errorCodeSchema = z.enum([
   "TARGET_NOT_FOUND",
   "TARGET_DELETED",
   "CONFLICT",
+  "RESYNC_REQUIRED",
   "INTERNAL_ERROR",
 ]);
 
-export const operationAckSchema = z.discriminatedUnion("ok", [
-  z.object({ ok: z.literal(true), duplicate: z.boolean(), operation: committedOperationSchema }),
-  z.object({
+export const protocolErrorSchema = z
+  .object({
     ok: z.literal(false),
     code: errorCodeSchema,
     message: z.string().max(500),
     retryable: z.boolean(),
-  }),
+  })
+  .strict();
+
+export const operationAckSchema = z.discriminatedUnion("ok", [
+  z
+    .object({ ok: z.literal(true), duplicate: z.boolean(), operation: committedOperationSchema })
+    .strict(),
+  protocolErrorSchema,
 ]);
 
 export const boardSnapshotSchema = z.object({
@@ -176,16 +184,64 @@ export const joinBoardRequestSchema = z
     pendingOpIds: z.array(idSchema).max(1_000),
   })
   .strict();
+
+export const joinBoardSuccessSchema = z
+  .object({
+    ok: z.literal(true),
+    boardId: idSchema,
+    joinWatermark: sequenceSchema,
+  })
+  .strict();
+
+export const joinBoardAckSchema = z.discriminatedUnion("ok", [
+  joinBoardSuccessSchema,
+  protocolErrorSchema,
+]);
+
 export const operationRangeQuerySchema = z
   .object({
-    from: z.coerce.number().int().positive(),
-    to: z.coerce.number().int().positive(),
+    after: z.coerce.number().int().nonnegative().safe(),
+    watermark: z.coerce.number().int().nonnegative().safe(),
   })
   .strict()
-  .refine(
-    ({ from, to }) => to >= from && to - from < 1_000,
-    "Range must contain at most 1,000 operations",
-  );
+  .refine(({ after, watermark }) => watermark >= after, "Watermark must not precede cursor");
+
+export const operationRangeResponseSchema = z
+  .object({
+    boardId: idSchema,
+    afterSeq: sequenceSchema,
+    watermark: sequenceSchema,
+    operations: z.array(committedOperationSchema).max(MAX_SYNC_BATCH_SIZE),
+    nextSeq: sequenceSchema,
+    hasMore: z.boolean(),
+  })
+  .strict()
+  .superRefine((response, context) => {
+    if (response.watermark < response.afterSeq) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid response range" });
+      return;
+    }
+    let expected = response.afterSeq + 1;
+    for (const operation of response.operations) {
+      if (operation.boardId !== response.boardId || operation.seq !== expected) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Operations must be contiguous and belong to the requested board",
+        });
+        return;
+      }
+      if (operation.seq > response.watermark) {
+        context.addIssue({ code: z.ZodIssueCode.custom, message: "Operation exceeds watermark" });
+        return;
+      }
+      expected += 1;
+    }
+    const expectedNext = response.operations.at(-1)?.seq ?? response.afterSeq;
+    if (response.nextSeq !== expectedNext || response.hasMore !== expectedNext < response.watermark)
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid pagination metadata" });
+    if (response.hasMore && response.operations.length === 0)
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Pagination made no progress" });
+  });
 
 export type CanvasObject = z.infer<typeof canvasObjectSchema>;
 export type ObjectPatch = z.infer<typeof objectPatchSchema>;
@@ -193,14 +249,15 @@ export type TransformPatch = z.infer<typeof transformPatchSchema>;
 export type DurableCommand = z.infer<typeof durableCommandSchema>;
 export type CommittedOperation = z.infer<typeof committedOperationSchema>;
 export type OperationAck = z.infer<typeof operationAckSchema>;
+export type ProtocolError = z.infer<typeof protocolErrorSchema>;
 export type BoardSnapshot = z.infer<typeof boardSnapshotSchema>;
 export type JoinBoardRequest = z.infer<typeof joinBoardRequestSchema>;
+export type JoinBoardAck = z.infer<typeof joinBoardAckSchema>;
+export type OperationRangeQuery = z.infer<typeof operationRangeQuerySchema>;
+export type OperationRangeResponse = z.infer<typeof operationRangeResponseSchema>;
 
 export interface ClientToServerEvents {
-  "board:join": (
-    request: JoinBoardRequest,
-    acknowledge: (ack: OperationAck | { ok: true }) => void,
-  ) => void;
+  "board:join": (request: JoinBoardRequest, acknowledge: (ack: JoinBoardAck) => void) => void;
   "operation:submit": (command: DurableCommand, acknowledge: (ack: OperationAck) => void) => void;
 }
 export interface ServerToClientEvents {
