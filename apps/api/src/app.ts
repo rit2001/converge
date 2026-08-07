@@ -66,6 +66,46 @@ function failedAck(error: unknown): ProtocolError {
   };
 }
 
+function fastifyClientError(
+  error: unknown,
+): { status: 400 | 413 | 415; response: ProtocolError } | null {
+  if (error instanceof Fastify.errorCodes.FST_ERR_CTP_BODY_TOO_LARGE)
+    return {
+      status: 413,
+      response: {
+        ok: false,
+        code: "PAYLOAD_TOO_LARGE",
+        message: "Request body exceeds the maximum allowed size",
+        retryable: false,
+      },
+    };
+  if (error instanceof Fastify.errorCodes.FST_ERR_CTP_INVALID_MEDIA_TYPE)
+    return {
+      status: 415,
+      response: {
+        ok: false,
+        code: "INVALID_COMMAND",
+        message: "Request content type is not supported",
+        retryable: false,
+      },
+    };
+  if (
+    error instanceof Fastify.errorCodes.FST_ERR_CTP_INVALID_CONTENT_LENGTH ||
+    error instanceof Fastify.errorCodes.FST_ERR_CTP_EMPTY_JSON_BODY ||
+    error instanceof Fastify.errorCodes.FST_ERR_CTP_INVALID_JSON_BODY
+  )
+    return {
+      status: 400,
+      response: {
+        ok: false,
+        code: "INVALID_COMMAND",
+        message: "Request body is invalid",
+        retryable: false,
+      },
+    };
+  return null;
+}
+
 function socketAuthenticationError(error: AuthenticationError): Error {
   return Object.assign(new Error(error.message), {
     data: { code: error.code, message: error.message, retryable: false },
@@ -199,6 +239,9 @@ export async function buildApp(
         message: "Request validation failed",
         retryable: false,
       });
+    const clientError = fastifyClientError(error);
+    if (clientError)
+      return reply.code(clientError.status).send(protocolErrorSchema.parse(clientError.response));
     if (error.statusCode === 429)
       return reply.code(429).send({
         ok: false,

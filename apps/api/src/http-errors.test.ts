@@ -63,6 +63,107 @@ function captureLogs(): { entries: Record<string, unknown>[]; stream: Writable }
 }
 
 describe("HTTP error sanitization", () => {
+  it("returns a strict sanitized client error for malformed JSON", async () => {
+    const context = await buildApp(environment("test"), queryPool(), authenticated);
+    try {
+      const malformed = await context.app.inject({
+        method: "POST",
+        url: "/v1/boards",
+        headers: { "content-type": "application/json" },
+        payload: '{"name":"private-parser-fragment"',
+      });
+      expect(malformed.statusCode).toBe(400);
+      expect(protocolErrorSchema.parse(malformed.json())).toEqual({
+        ok: false,
+        code: "INVALID_COMMAND",
+        message: "Request body is invalid",
+        retryable: false,
+      });
+      for (const forbidden of [
+        "FST_ERR",
+        "SyntaxError",
+        "Unexpected",
+        "private-parser-fragment",
+        "/Users/",
+        "node_modules",
+      ])
+        expect(malformed.body).not.toContain(forbidden);
+
+      const health = await context.app.inject({ method: "GET", url: "/health" });
+      expect(health.statusCode).toBe(200);
+      expect(health.json()).toEqual({ ok: true });
+    } finally {
+      await context.io.close();
+      await context.app.close();
+    }
+  });
+
+  it("returns a strict sanitized client error for an oversized JSON body", async () => {
+    const context = await buildApp(environment("test"), queryPool(), authenticated);
+    const oversizedMarker = "private-oversized-payload";
+    try {
+      const oversized = await context.app.inject({
+        method: "POST",
+        url: "/v1/boards",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({ name: `${oversizedMarker}${"x".repeat(70 * 1024)}` }),
+      });
+      expect(oversized.statusCode).toBe(413);
+      expect(protocolErrorSchema.parse(oversized.json())).toEqual({
+        ok: false,
+        code: "PAYLOAD_TOO_LARGE",
+        message: "Request body exceeds the maximum allowed size",
+        retryable: false,
+      });
+      for (const forbidden of ["FST_ERR", "RangeError", oversizedMarker, "/Users/", "node_modules"])
+        expect(oversized.body).not.toContain(forbidden);
+    } finally {
+      await context.io.close();
+      await context.app.close();
+    }
+  });
+
+  it("preserves rate-limit handling and rejects forged client-error identity", async () => {
+    const rateLimitContext = await buildApp(environment("test"), queryPool(), authenticated);
+    const forged = Object.assign(
+      new Error("private forged parser error at /srv/converge/parser.ts"),
+      {
+        statusCode: 413,
+        code: "FST_ERR_CTP_BODY_TOO_LARGE",
+      },
+    );
+    const forgedContext = await buildApp(environment("test"), failingPool(forged), authenticated);
+    try {
+      let limited;
+      for (let request = 0; request <= 120; request += 1)
+        limited = await rateLimitContext.app.inject({ method: "GET", url: "/health" });
+      expect(limited?.statusCode).toBe(429);
+      expect(protocolErrorSchema.parse(limited?.json())).toEqual({
+        ok: false,
+        code: "RATE_LIMITED",
+        message: "Request rate exceeded",
+        retryable: true,
+      });
+
+      const response = await forgedContext.app.inject({
+        method: "POST",
+        url: "/v1/boards",
+        payload: { name: "Valid board" },
+      });
+      expect(response.statusCode).toBe(500);
+      expect(httpInternalErrorResponseSchema.parse(response.json())).toMatchObject({
+        ok: false,
+        code: "INTERNAL_ERROR",
+        retryable: true,
+      });
+      expect(response.body).not.toContain(forged.message);
+      expect(response.body).not.toContain(forged.code);
+    } finally {
+      await Promise.all([rateLimitContext.io.close(), forgedContext.io.close()]);
+      await Promise.all([rateLimitContext.app.close(), forgedContext.app.close()]);
+    }
+  });
+
   it.each(["development", "production"] as const)(
     "returns the same sanitized 500 contract in %s and keeps bounded server evidence",
     async (nodeEnvironment) => {
