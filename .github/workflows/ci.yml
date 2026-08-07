@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env: { POSTGRES_DB: converge_test, POSTGRES_USER: converge, POSTGRES_PASSWORD: converge }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U converge -d converge_test"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://converge:converge@localhost:5432/converge_test
+      WEB_ORIGIN: http://localhost:3000
+      DEV_AUTH_USER_ID: 00000000-0000-4000-8000-000000000001
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.18.0, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm --filter @converge/database migrate
+      - run: pnpm test:integration
+      - run: pnpm --filter @converge/playwright exec playwright install --with-deps chromium
+      - run: pnpm test:playwright

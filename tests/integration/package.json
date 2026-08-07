@@ -1,0 +1,22 @@
+{
+  "name": "@converge/integration",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@converge/database": "workspace:*",
+    "@converge/protocol": "workspace:*",
+    "@converge/testkit": "workspace:*",
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "8.15.5",
+    "vitest": "3.2.4"
+  }
+}

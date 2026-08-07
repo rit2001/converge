@@ -1,0 +1,11 @@
+{
+  "name": "@converge/k6",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "echo 'k6 scripts require the external k6 runtime'",
+    "lint": "eslint smoke.js",
+    "test": "echo 'k6 deferred until benchmark milestone'",
+    "typecheck": "echo 'no TypeScript sources'"
+  }
+}

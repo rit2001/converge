@@ -1,0 +1,27 @@
+{
+  "name": "@converge/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/server.ts",
+    "lint": "eslint src",
+    "start": "tsx src/server.ts",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@converge/database": "workspace:*",
+    "@converge/protocol": "workspace:*",
+    "@fastify/cors": "10.1.0",
+    "@fastify/rate-limit": "10.3.0",
+    "fastify": "5.5.0",
+    "socket.io": "4.8.1",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "tsx": "4.20.4",
+    "vitest": "3.2.4"
+  }
+}
