@@ -501,6 +501,155 @@ describe("join watermark catch-up", () => {
 });
 
 describe("catch-up authorization", () => {
+  it("keeps HTTP authentication failures structured through catch-up and snapshot rebase", async () => {
+    const boardId = await board();
+    await repository.commitOperation(identities.owner.id, createRectangleCommand(boardId));
+    const before = await persistedState(boardId);
+    const expectedFailure = {
+      ok: false as const,
+      code: "AUTHENTICATION_REQUIRED" as const,
+      message: "Authentication required",
+      retryable: false,
+    };
+
+    const unauthenticatedSnapshot = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}`,
+      headers: testAuthorizationHeaders("expired-token"),
+    });
+    const unauthenticatedRange = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}/operations?after=0&watermark=1`,
+      headers: testAuthorizationHeaders("expired-token"),
+    });
+    const missingSnapshot = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${crypto.randomUUID()}`,
+      headers: testAuthorizationHeaders("expired-token"),
+    });
+    const missingRange = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${crypto.randomUUID()}/operations?after=0&watermark=1`,
+      headers: testAuthorizationHeaders("expired-token"),
+    });
+    for (const response of [
+      unauthenticatedSnapshot,
+      unauthenticatedRange,
+      missingSnapshot,
+      missingRange,
+    ]) {
+      expect(response.statusCode).toBe(401);
+      expect(protocolErrorSchema.parse(response.json())).toEqual(expectedFailure);
+    }
+    expect(missingSnapshot.body).toBe(unauthenticatedSnapshot.body);
+    expect(missingRange.body).toBe(unauthenticatedRange.body);
+    expect(await persistedState(boardId)).toEqual(before);
+
+    const validSnapshot = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}`,
+      headers: testAuthorizationHeaders(tokens.owner),
+    });
+    const validRange = await range(boardId, tokens.owner, 0, 1);
+    expect(boardSnapshotSchema.parse(validSnapshot.json())).toMatchObject({ id: boardId });
+    expect(operationRangeResponseSchema.parse(validRange.json())).toMatchObject({ boardId });
+
+    const catchUpToken: BoardSessionToken = {
+      generation: 70_003,
+      nonce: Symbol("expired-range-auth"),
+    };
+    useBoardStore.getState().beginSession(catchUpToken, boardId);
+    useBoardStore
+      .getState()
+      .initializeSession(
+        catchUpToken,
+        { id: boardId, name: "expired range", lastSeq: 0, objects: [] },
+        [],
+      );
+    const catchUpTransport = new BoardTransport(boardId, crypto.randomUUID(), catchUpToken, {
+      apiUrl: serverUrl,
+      scheduler: new IntegrationScheduler(),
+      pendingStore: new IntegrationPendingStore(),
+      socketFactory: () => {
+        const socket = createTestSocket(serverUrl, tokens.owner);
+        sockets.add(socket);
+        return socket as never;
+      },
+      fetcher: (input, init) =>
+        fetch(input, {
+          ...init,
+          headers: testAuthorizationHeaders("expired-token"),
+        }),
+    });
+    try {
+      catchUpTransport.connect();
+      await vi.waitFor(() =>
+        expect(useBoardStore.getState()).toMatchObject({
+          connection: "authorization-failed",
+          synchronizationDiagnostics: {
+            retryCode: "AUTHENTICATION_REQUIRED",
+            retryScheduled: false,
+          },
+        }),
+      );
+      expect(await persistedState(boardId)).toEqual(before);
+    } finally {
+      catchUpTransport.disconnect();
+      useBoardStore.getState().endSession(catchUpToken);
+    }
+
+    await pool.query("DELETE FROM board_operations WHERE board_id = $1", [boardId]);
+    const afterLogRemoval = await persistedState(boardId);
+    const snapshotToken: BoardSessionToken = {
+      generation: 70_004,
+      nonce: Symbol("expired-snapshot-auth"),
+    };
+    useBoardStore.getState().beginSession(snapshotToken, boardId);
+    useBoardStore
+      .getState()
+      .initializeSession(
+        snapshotToken,
+        { id: boardId, name: "expired snapshot", lastSeq: 0, objects: [] },
+        [],
+      );
+    const snapshotTransport = new BoardTransport(boardId, crypto.randomUUID(), snapshotToken, {
+      apiUrl: serverUrl,
+      scheduler: new IntegrationScheduler(),
+      pendingStore: new IntegrationPendingStore(),
+      socketFactory: () => {
+        const socket = createTestSocket(serverUrl, tokens.owner);
+        sockets.add(socket);
+        return socket as never;
+      },
+      fetcher: (input, init) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        return fetch(input, {
+          ...init,
+          headers: testAuthorizationHeaders(
+            url.includes("/operations?") ? tokens.owner : "expired-token",
+          ),
+        });
+      },
+    });
+    try {
+      snapshotTransport.connect();
+      await vi.waitFor(() =>
+        expect(useBoardStore.getState()).toMatchObject({
+          connection: "authorization-failed",
+          synchronizationDiagnostics: {
+            retryCode: "AUTHENTICATION_REQUIRED",
+            retryScheduled: false,
+          },
+        }),
+      );
+      expect(await persistedState(boardId)).toEqual(afterLogRemoval);
+    } finally {
+      snapshotTransport.disconnect();
+      useBoardStore.getState().endSession(snapshotToken);
+    }
+  });
+
   it("returns the shared protocol error for inaccessible board snapshots", async () => {
     const boardId = await board();
     const successful = await context.app.inject({

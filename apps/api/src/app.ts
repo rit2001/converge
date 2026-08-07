@@ -190,7 +190,7 @@ export async function buildApp(
     if (error instanceof AuthenticationError)
       return reply
         .code(error.code === "AUTHENTICATION_REQUIRED" ? 401 : 400)
-        .send({ code: error.code, message: error.message, retryable: false });
+        .send(protocolErrorSchema.parse(failedAck(error)));
     if (error instanceof RepositoryError)
       return reply.code(errorStatus(error.code)).send(failedAck(error));
     if (error instanceof z.ZodError)

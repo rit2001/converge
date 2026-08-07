@@ -1,7 +1,7 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { RepositoryError, type DatabasePool } from "@converge/database";
-import { httpInternalErrorResponseSchema } from "@converge/protocol";
+import { httpInternalErrorResponseSchema, protocolErrorSchema } from "@converge/protocol";
 import { buildApp } from "./app.js";
 import type { AuthAdapter, AuthenticatedPrincipal } from "./auth.js";
 import type { Environment } from "./env.js";
@@ -133,7 +133,8 @@ describe("HTTP error sanitization", () => {
         payload: { name: "Board" },
       });
       expect(authentication.statusCode).toBe(401);
-      expect(authentication.json()).toEqual({
+      expect(protocolErrorSchema.parse(authentication.json())).toEqual({
+        ok: false,
         code: "AUTHENTICATION_REQUIRED",
         message: "Authentication required",
         retryable: false,
