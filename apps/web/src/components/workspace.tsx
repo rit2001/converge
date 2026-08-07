@@ -10,7 +10,7 @@ import {
   type BoardSessionToken,
 } from "../board-session";
 import { useBoardStore } from "../board-store";
-import { loadPending } from "../pending-db";
+import { indexedDbPendingOperationStore } from "../pending-db";
 import { API_URL, BoardTransport } from "../transport";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
@@ -50,10 +50,18 @@ export function Workspace(): React.JSX.Element {
           if (!response.ok) throw new Error("Could not load board");
           return (await response.json()) as BoardSnapshot;
         },
-        loadPending,
+        loadPending: async (boardId) => {
+          try {
+            return await indexedDbPendingOperationStore.load(boardId);
+          } catch {
+            throw new Error("LOCAL_PERSISTENCE_ERROR: Pending storage is unavailable");
+          }
+        },
         updateBoardLocation: (boardId) => window.history.replaceState({}, "", `?board=${boardId}`),
         createTransport: (boardId: string, token: BoardSessionToken) =>
-          new BoardTransport(boardId, clientId, token),
+          new BoardTransport(boardId, clientId, token, {
+            pendingStore: indexedDbPendingOperationStore,
+          }),
       }),
     [clientId],
   );
@@ -70,10 +78,8 @@ export function Workspace(): React.JSX.Element {
     };
   }, [sessions]);
 
-  const submit = (command: DurableCommand): void => {
-    store.enqueue(command);
-    session.current?.submit(command);
-  };
+  const submit = (command: DurableCommand): Promise<boolean> =>
+    session.current?.submit(command) ?? Promise.resolve(false);
   const addObject = (kind: "rectangle" | "sticky"): void => {
     if (!store.boardId) return;
     const targetId = crypto.randomUUID();
@@ -103,19 +109,21 @@ export function Workspace(): React.JSX.Element {
             fill: "#818cf8",
             text: "" as const,
           };
-    submit({
+    const activeSession = session.current;
+    void submit({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.create",
       payload,
+    }).then((persisted) => {
+      if (persisted && session.current === activeSession) store.select(targetId);
     });
-    store.select(targetId);
   };
   const transform = (
     targetId: string,
     payload: { x: number; y: number; width?: number; height?: number },
   ): void => {
     if (!store.boardId) return;
-    submit({
+    void submit({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.transform",
       payload,
@@ -123,12 +131,14 @@ export function Workspace(): React.JSX.Element {
   };
   const remove = (): void => {
     if (!store.boardId || !store.selectedId) return;
-    submit({
+    const activeSession = session.current;
+    void submit({
       ...commandBase(store.boardId, clientId, store.selectedId, store.committed.lastSeq),
       type: "object.delete",
       payload: {},
+    }).then((persisted) => {
+      if (persisted && session.current === activeSession) store.select(null);
     });
-    store.select(null);
   };
 
   useEffect(() => {
@@ -227,6 +237,10 @@ export function Workspace(): React.JSX.Element {
             <div>
               <dt>Pending</dt>
               <dd data-testid="pending-count">{store.pending.length}</dd>
+            </div>
+            <div>
+              <dt>Pending recovery</dt>
+              <dd data-testid="pending-status">{store.pendingStatus}</dd>
             </div>
             <div className="hash">
               <dt>Committed objects</dt>

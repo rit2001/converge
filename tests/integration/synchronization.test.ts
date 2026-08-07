@@ -118,7 +118,6 @@ function join(socket: TestSocket, boardId: string, lastAppliedSeq: number): Prom
         boardId,
         clientId: crypto.randomUUID(),
         lastAppliedSeq,
-        pendingOpIds: [],
       },
       resolve,
     ),
@@ -309,7 +308,6 @@ describe("join watermark catch-up", () => {
         boardId,
         clientId: crypto.randomUUID(),
         lastAppliedSeq: 0,
-        pendingOpIds: [],
         surprise: true,
       };
       socket.emit("board:join", request, resolve);

@@ -13,10 +13,9 @@ import type {
   CanvasObject,
   CommittedOperation,
   DurableCommand,
-  OperationAck,
 } from "@converge/protocol";
 import type { BoardSessionToken } from "./board-session";
-import { removePending, savePending } from "./pending-db";
+import type { PendingRecoveryStatus } from "./pending-command-queue";
 
 export type SynchronizationStatus =
   | "disconnected"
@@ -56,6 +55,7 @@ export interface BoardStore {
   objects: CanvasObject[];
   selectedId: string | null;
   connection: SynchronizationStatus;
+  pendingStatus: PendingRecoveryStatus;
   authoritativeHash: AuthoritativeHash;
   error: string | null;
   beginSession(token: BoardSessionToken, boardId: string | null): void;
@@ -74,9 +74,14 @@ export interface BoardStore {
     message: string,
     authorizationFailed?: boolean,
   ): void;
+  setPendingStatus(
+    token: BoardSessionToken,
+    status: PendingRecoveryStatus,
+    message?: string | null,
+  ): void;
   select(id: string | null): void;
-  enqueue(command: DurableCommand): void;
-  acknowledge(token: BoardSessionToken, opId: string, ack: OperationAck): void;
+  addPersistedPending(token: BoardSessionToken, command: DurableCommand): boolean;
+  removePending(token: BoardSessionToken, opId: string, error?: string): void;
   ingest(token: BoardSessionToken, operation: CommittedOperation): IngestResult | "stale";
 }
 
@@ -174,6 +179,7 @@ export function createBoardStore(
       objects: [],
       selectedId: null,
       connection: "disconnected",
+      pendingStatus: "idle",
       authoritativeHash: idleHash(),
       error: null,
       beginSession(sessionToken, boardId) {
@@ -190,6 +196,7 @@ export function createBoardStore(
           objects: [],
           selectedId: null,
           connection: "connecting",
+          pendingStatus: "idle",
           authoritativeHash: idleHash(),
           error: null,
         });
@@ -243,6 +250,7 @@ export function createBoardStore(
           objects: [],
           selectedId: null,
           connection: "disconnected",
+          pendingStatus: "idle",
           authoritativeHash: idleHash(),
           error: null,
         });
@@ -258,32 +266,29 @@ export function createBoardStore(
           error,
         });
       },
+      setPendingStatus(sessionToken, pendingStatus, message) {
+        if (!isCurrent(sessionToken)) return;
+        set({ pendingStatus, ...(message === undefined ? {} : { error: message }) });
+      },
       select(selectedId) {
         set({ selectedId });
       },
-      enqueue(command) {
+      addPersistedPending(sessionToken, command) {
         const current = get();
-        if (current.boardId !== command.boardId || current.sessionToken === null) return;
+        if (!isCurrent(sessionToken, command.boardId)) return false;
+        if (current.pending.some(({ opId }) => opId === command.opId)) return true;
         const pending = [...current.pending, command];
         set({ pending, objects: derive(current.committed, pending), error: null });
-        void savePending(command);
+        return true;
       },
-      acknowledge(sessionToken, opId, ack) {
+      removePending(sessionToken, opId, error) {
         if (!isCurrent(sessionToken)) return;
-        if (ack.ok) {
-          const pending = get().pending.filter((command) => command.opId !== opId);
-          set({ pending, objects: derive(get().committed, pending) });
-          void removePending(opId);
-          get().ingest(sessionToken, ack.operation);
-        } else if (!ack.retryable) {
-          const pending = get().pending.filter((command) => command.opId !== opId);
-          set({
-            pending,
-            objects: derive(get().committed, pending),
-            error: `${ack.code}: ${ack.message}`,
-          });
-          void removePending(opId);
-        } else set({ error: `${ack.code}: ${ack.message}` });
+        const pending = get().pending.filter((command) => command.opId !== opId);
+        set({
+          pending,
+          objects: derive(get().committed, pending),
+          ...(error === undefined ? {} : { error }),
+        });
       },
       ingest(sessionToken, operation) {
         if (!isCurrent(sessionToken)) return "stale";

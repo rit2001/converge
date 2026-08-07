@@ -182,7 +182,6 @@ export const joinBoardRequestSchema = z
     boardId: idSchema,
     clientId: idSchema,
     lastAppliedSeq: sequenceSchema,
-    pendingOpIds: z.array(idSchema).max(1_000),
   })
   .strict();
 

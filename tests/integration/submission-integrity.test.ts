@@ -89,7 +89,6 @@ function join(socket: TestSocket, boardId: string, lastAppliedSeq = 0): Promise<
         boardId,
         clientId: crypto.randomUUID(),
         lastAppliedSeq,
-        pendingOpIds: [],
       },
       resolve,
     ),
@@ -241,5 +240,31 @@ describe("Socket.IO mutation-submission integrity", () => {
       retryable: false,
     });
     expect(await durableState(boardId)).toEqual(afterFirst);
+  });
+
+  it("recovers an acknowledgement-lost commit through exact replay without durable duplication", async () => {
+    const boardId = await board();
+    const editor = await connect(tokens.editor);
+    const observer = await connect(tokens.owner);
+    await join(editor, boardId);
+    await join(observer, boardId);
+    const command = createRectangleCommand(boardId);
+    const firstLive = nextCommitted(observer);
+
+    editor.emit("operation:submit", command, () => undefined);
+    await expect(firstLive).resolves.toMatchObject({ opId: command.opId, seq: 1 });
+    const afterUnknownOutcome = await durableState(boardId);
+    expect(afterUnknownOutcome).toMatchObject({
+      last_seq: "1",
+      operation_count: "1",
+      outbox_count: "1",
+    });
+
+    await expect(submit(editor, command)).resolves.toMatchObject({
+      ok: true,
+      duplicate: true,
+      operation: { opId: command.opId, seq: 1 },
+    });
+    expect(await durableState(boardId)).toEqual(afterUnknownOutcome);
   });
 });

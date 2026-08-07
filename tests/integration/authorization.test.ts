@@ -110,7 +110,6 @@ function joinRequest(boardId: string) {
     boardId,
     clientId: "10000000-0000-4000-8000-000000000031",
     lastAppliedSeq: 0,
-    pendingOpIds: [],
   };
 }
 

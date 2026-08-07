@@ -78,8 +78,27 @@ describe("protocol schemas", () => {
         boardId: command.boardId,
         clientId: command.clientId,
         lastAppliedSeq: 0,
-        pendingOpIds: [],
         surprise: true,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects the obsolete pending-operation list on board join", () => {
+    expect(
+      joinBoardRequestSchema.parse({
+        schemaVersion: SCHEMA_VERSION,
+        boardId: command.boardId,
+        clientId: command.clientId,
+        lastAppliedSeq: 0,
+      }),
+    ).toMatchObject({ boardId: command.boardId, lastAppliedSeq: 0 });
+    expect(
+      joinBoardRequestSchema.safeParse({
+        schemaVersion: SCHEMA_VERSION,
+        boardId: command.boardId,
+        clientId: command.clientId,
+        lastAppliedSeq: 0,
+        pendingOpIds: [],
       }).success,
     ).toBe(false);
   });

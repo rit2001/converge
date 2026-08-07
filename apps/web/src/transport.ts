@@ -7,14 +7,31 @@ import {
   type CommittedOperation,
   type DurableCommand,
   type JoinBoardAck,
-  type OperationAck,
   type ServerToClientEvents,
 } from "@converge/protocol";
 import type { BoardSessionToken } from "./board-session";
 import { firstBufferedGap, useBoardStore } from "./board-store";
+import {
+  PendingCommandQueue,
+  retryableSubmission,
+  timedSubmission,
+  type RetryScheduler,
+  type SubmissionAttempt,
+} from "./pending-command-queue";
+import { indexedDbPendingOperationStore, type PendingOperationStore } from "./pending-db";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 const ACK_TIMEOUT_MS = 10_000;
+const transportScheduler: RetryScheduler = {
+  setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+  clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+  random: () => Math.random(),
+};
+
+export interface BoardTransportOptions {
+  pendingStore?: PendingOperationStore;
+  scheduler?: RetryScheduler;
+}
 
 class SynchronizationError extends Error {
   constructor(
@@ -33,12 +50,39 @@ export class BoardTransport {
   private ready = false;
   private liveConflict = false;
   private readonly liveBuffer = new Map<number, CommittedOperation>();
+  private readonly scheduler: RetryScheduler;
+  private readonly pendingQueue: PendingCommandQueue;
 
   constructor(
     private readonly boardId: string,
     private readonly clientId: string,
     private readonly sessionToken: BoardSessionToken,
-  ) {}
+    options: BoardTransportOptions = {},
+  ) {
+    this.scheduler = options.scheduler ?? transportScheduler;
+    const state = useBoardStore.getState();
+    this.pendingQueue = new PendingCommandQueue({
+      boardId,
+      initialCommands: state.pending,
+      persistence: options.pendingStore ?? indexedDbPendingOperationStore,
+      scheduler: this.scheduler,
+      isActive: () => this.isSessionActive(),
+      addPersisted: (command) =>
+        useBoardStore.getState().addPersistedPending(this.sessionToken, command),
+      removePending: (operationId, error) =>
+        useBoardStore.getState().removePending(this.sessionToken, operationId, error),
+      ingest: (operation) => useBoardStore.getState().ingest(this.sessionToken, operation),
+      setStatus: (status, message) =>
+        useBoardStore.getState().setPendingStatus(this.sessionToken, status, message),
+      submit: (command) => this.createSubmissionAttempt(command),
+      requestSynchronization: () => {
+        if (!this.isSessionActive()) return;
+        this.ready = false;
+        this.pendingQueue.setReady(false);
+        if (this.socket?.connected) this.beginSynchronization(this.socket);
+      },
+    });
+  }
 
   connect(): void {
     if (!this.isSessionActive()) return;
@@ -48,6 +92,7 @@ export class BoardTransport {
     socket.on("connect", () => this.beginSynchronization(socket));
     socket.on("disconnect", () => {
       this.ready = false;
+      this.pendingQueue.setReady(false);
       this.synchronizing = false;
       this.synchronizationGeneration += 1;
       this.liveBuffer.clear();
@@ -60,7 +105,7 @@ export class BoardTransport {
         this.bufferLive(operation);
         return;
       }
-      const result = useBoardStore.getState().ingest(this.sessionToken, operation);
+      const result = this.pendingQueue.observeCommitted(operation);
       if (result === "buffered") this.beginSynchronization(socket);
       if (result === "conflict") this.ready = false;
     });
@@ -74,15 +119,13 @@ export class BoardTransport {
     );
   }
 
-  submit(command: DurableCommand): void {
-    if (!this.isSessionActive() || !this.socket?.connected || !this.ready) return;
-    this.socket.emit("operation:submit", command, (ack: OperationAck) =>
-      useBoardStore.getState().acknowledge(this.sessionToken, command.opId, ack),
-    );
+  submit(command: DurableCommand): Promise<boolean> {
+    return this.pendingQueue.enqueue(command);
   }
 
   disconnect(): void {
     this.ready = false;
+    this.pendingQueue.cancel();
     this.synchronizing = false;
     this.synchronizationGeneration += 1;
     this.liveBuffer.clear();
@@ -95,6 +138,7 @@ export class BoardTransport {
   private beginSynchronization(socket: Socket<ServerToClientEvents, ClientToServerEvents>): void {
     if (!this.isSessionActive() || !socket.connected || this.synchronizing) return;
     this.ready = false;
+    this.pendingQueue.setReady(false);
     this.synchronizing = true;
     const generation = ++this.synchronizationGeneration;
     void this.synchronize(socket, generation)
@@ -162,7 +206,7 @@ export class BoardTransport {
 
       this.ready = true;
       useBoardStore.getState().setConnection(this.sessionToken, "ready");
-      for (const command of useBoardStore.getState().pending) this.submit(command);
+      this.pendingQueue.setReady(true);
       return;
     }
   }
@@ -199,7 +243,7 @@ export class BoardTransport {
       )
         throw new SynchronizationError("RESYNC_REQUIRED", "Catch-up response mismatch", true);
       for (const operation of batch.operations) {
-        const result = useBoardStore.getState().ingest(this.sessionToken, operation);
+        const result = this.pendingQueue.observeCommitted(operation);
         if (result === "conflict")
           throw new SynchronizationError("RESYNC_REQUIRED", "Conflicting operation delivery", true);
       }
@@ -229,7 +273,6 @@ export class BoardTransport {
           boardId: this.boardId,
           clientId: this.clientId,
           lastAppliedSeq: state.committed.lastSeq,
-          pendingOpIds: state.pending.map((item) => item.opId),
         },
         (raw) => {
           globalThis.clearTimeout(timeout);
@@ -266,7 +309,7 @@ export class BoardTransport {
     const operations = [...this.liveBuffer.values()].sort((left, right) => left.seq - right.seq);
     this.liveBuffer.clear();
     for (const operation of operations) {
-      const result = useBoardStore.getState().ingest(this.sessionToken, operation);
+      const result = this.pendingQueue.observeCommitted(operation);
       if (result === "conflict")
         throw new SynchronizationError("RESYNC_REQUIRED", "Conflicting operation delivery", true);
     }
@@ -291,6 +334,14 @@ export class BoardTransport {
 
   private isSessionActive(): boolean {
     return useBoardStore.getState().isCurrentSession(this.sessionToken, this.boardId);
+  }
+
+  private createSubmissionAttempt(command: DurableCommand): SubmissionAttempt {
+    if (!this.isSessionActive() || !this.socket?.connected || !this.ready)
+      return retryableSubmission("Operation transport is not ready");
+    return timedSubmission(this.scheduler, ACK_TIMEOUT_MS, (acknowledge) =>
+      this.socket?.emit("operation:submit", command, acknowledge),
+    );
   }
 }
 

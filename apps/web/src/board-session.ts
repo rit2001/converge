@@ -1,4 +1,6 @@
 import { boardSnapshotSchema, type BoardSnapshot, type DurableCommand } from "@converge/protocol";
+import type { PendingRecoveryStatus } from "./pending-command-queue";
+import type { PendingLoadResult } from "./pending-db";
 
 export type BoardSessionToken = Readonly<{ generation: number; nonce: symbol }>;
 
@@ -12,20 +14,25 @@ export interface BoardSessionStoreBoundary {
     pending: DurableCommand[],
   ): boolean;
   failSession(token: BoardSessionToken, message: string): void;
+  setPendingStatus(
+    token: BoardSessionToken,
+    status: PendingRecoveryStatus,
+    message?: string | null,
+  ): void;
   endSession(token: BoardSessionToken): void;
 }
 
 export interface OwnedBoardTransport {
   connect(): void;
   disconnect(): void;
-  submit(command: DurableCommand): void;
+  submit(command: DurableCommand): Promise<boolean>;
 }
 
 export interface BoardSessionDependencies {
   store: BoardSessionStoreBoundary;
   createBoard(signal: AbortSignal): Promise<BoardSnapshot>;
   loadSnapshot(boardId: string, signal: AbortSignal): Promise<BoardSnapshot>;
-  loadPending(boardId: string): Promise<DurableCommand[]>;
+  loadPending(boardId: string): Promise<PendingLoadResult>;
   updateBoardLocation(boardId: string): void;
   createTransport(boardId: string, token: BoardSessionToken): OwnedBoardTransport;
 }
@@ -33,7 +40,7 @@ export interface BoardSessionDependencies {
 export interface BoardSessionHandle {
   readonly token: BoardSessionToken;
   completion: Promise<void>;
-  submit(command: DurableCommand): void;
+  submit(command: DurableCommand): Promise<boolean>;
   cancel(): void;
 }
 
@@ -66,7 +73,11 @@ export class BoardSessionController {
     const handle: BoardSessionHandle = {
       token,
       completion: Promise.resolve(),
-      submit: (command) => transport?.submit(command),
+      submit: async (command) => {
+        await handle.completion;
+        if (cancelled || !transport) return false;
+        return transport.submit(command);
+      },
       cancel: () => {
         if (cancelled) return;
         cancelled = true;
@@ -98,7 +109,13 @@ export class BoardSessionController {
         if (snapshot.id !== boardId) throw new Error("Board snapshot does not match session");
         const pending = await this.dependencies.loadPending(boardId);
         if (!isActive(boardId)) return;
-        if (!this.dependencies.store.initializeSession(token, snapshot, pending)) return;
+        if (!this.dependencies.store.initializeSession(token, snapshot, pending.commands)) return;
+        if (pending.corruptCount > 0)
+          this.dependencies.store.setPendingStatus(
+            token,
+            "persistence-error",
+            `LOCAL_PERSISTENCE_WARNING: Ignored ${pending.corruptCount} invalid pending row${pending.corruptCount === 1 ? "" : "s"}`,
+          );
         if (!isActive(boardId)) return;
         transport = this.dependencies.createTransport(boardId, token);
         if (!isActive(boardId)) {

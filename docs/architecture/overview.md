@@ -5,7 +5,8 @@ packages, and PostgreSQL as durable authority. The system intentionally begins a
 
 ## Durable write path
 
-1. The client applies a command optimistically and emits it with an `opId` and `baseSeq`.
+1. The client strictly validates the complete command, writes it to board-scoped IndexedDB storage,
+   and only after that write succeeds applies it optimistically and makes it network-submittable.
 2. On the already authenticated socket, Socket.IO requires an acknowledgement callback before any
    durable mutation is attempted, then validates size/schema and rate-limits.
 3. A PostgreSQL transaction takes a transaction-scoped advisory lock derived from `boardId`, loads
@@ -34,12 +35,26 @@ or catching up are buffered, deduplicated by operation identity and sequence, an
 strict sequence order. `READY` means every operation through the join watermark has been applied and
 no known gap remains; a raw Socket.IO connection is not readiness.
 
-Optimistic pending commands remain intact across synchronization and are resubmitted with their
-original `opId` only after `READY`, preserving repository idempotency. Canonical serialization still
-provides a diagnostic hash of authoritative committed state. Each hash is labelled with its board,
-board-session generation, and committed sequence; an asynchronous result is published only while all
-three still match. Optimistic pending overlays remain visible on the canvas but do not change or
-relabel the authoritative hash.
+Pending persistence mutations are serialized per board. New records carry a monotonic enqueue
+ordinal; legacy records remain loadable using a deterministic timestamp/operation-ID fallback.
+Invalid stored rows are reported and skipped without clearing valid work. The transport drains one
+command at a time only after `READY`, retaining the original normalized command, `opId`, and client
+timestamp across acknowledgement timeouts and retryable responses. Retry delay starts at 500 ms,
+doubles to a 10-second cap, and includes bounded production jitter; disconnect or session replacement
+cancels timers, while a later `READY` resumes the same command. `RESYNC_REQUIRED` pauses submission
+until the existing join/catch-up protocol reaches `READY` again.
+
+The obsolete pending-operation-ID join field had no reconciliation behavior and has been removed, so
+even large durable queues cannot invalidate board join. Successful acknowledgements and matching live
+operations both prove commitment and schedule serialized IndexedDB deletion. A deletion failure does
+not roll back committed state: it raises a cleanup warning and is retried, while refresh-time exact
+replay remains safe if the row is still present. This is transactional idempotency with recoverable
+at-least-once retry, not exactly-once network delivery. Multi-tab queue coordination remains deferred.
+
+Canonical serialization provides a diagnostic hash of authoritative committed state. Each hash is
+labelled with its board, board-session generation, and committed sequence; an asynchronous result is
+published only while all three still match. Optimistic pending overlays remain visible on the canvas
+but do not change or relabel the authoritative hash.
 
 Each Workspace startup owns an opaque board-session generation, cancellation controller, and local
 transport. Snapshot and pending-command continuations recheck generation ownership before every

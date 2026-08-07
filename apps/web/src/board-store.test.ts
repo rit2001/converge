@@ -1,13 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import type { CommittedOperation, DurableCommand } from "@converge/protocol";
 import { emptyBoardState } from "@converge/canvas-engine";
 import type { BoardSessionToken } from "./board-session";
 import { createBoardStore, useBoardStore } from "./board-store";
-
-vi.mock("./pending-db", () => ({
-  savePending: vi.fn(() => Promise.resolve()),
-  removePending: vi.fn(() => Promise.resolve()),
-}));
 
 const boardId = "10000000-0000-4000-8000-000000000001";
 const clientId = "20000000-0000-4000-8000-000000000001";
@@ -247,7 +242,7 @@ describe("sequence-specific authoritative hashing", () => {
       type: created.type,
       payload: created.payload,
     };
-    store.getState().enqueue(pending);
+    store.getState().addPersistedPending(session, pending);
 
     expect(store.getState().objects).toHaveLength(1);
     expect(store.getState().committed).toEqual(emptyBoardState());

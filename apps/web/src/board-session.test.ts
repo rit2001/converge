@@ -49,8 +49,9 @@ class FakeTransport implements OwnedBoardTransport {
     this.store.getState().setConnection(this.token, "disconnected");
   }
 
-  submit(command: DurableCommand): void {
+  submit(command: DurableCommand): Promise<boolean> {
     this.submitted.push(command);
+    return Promise.resolve(true);
   }
 
   lateReady(): void {
@@ -62,12 +63,9 @@ class FakeTransport implements OwnedBoardTransport {
   }
 
   lateAcknowledgement(): void {
-    this.store.getState().acknowledge(this.token, "stale-operation", {
-      ok: false,
-      code: "INTERNAL_ERROR",
-      message: "late acknowledgement",
-      retryable: true,
-    });
+    this.store
+      .getState()
+      .removePending(this.token, "stale-operation", "INTERNAL_ERROR: late acknowledgement");
   }
 
   lateOperation(operation: CommittedOperation): void {
@@ -78,7 +76,10 @@ class FakeTransport implements OwnedBoardTransport {
 function harness() {
   const store = createBoardStore(() => Promise.resolve("hash"));
   const snapshotQueues = new Map<string, Array<Promise<BoardSnapshot>>>();
-  const pendingQueues = new Map<string, Array<Promise<DurableCommand[]>>>();
+  const pendingQueues = new Map<
+    string,
+    Array<Promise<{ commands: DurableCommand[]; corruptCount: number }>>
+  >();
   const createQueue: Array<Promise<BoardSnapshot>> = [];
   const transports: FakeTransport[] = [];
   const locations: string[] = [];
@@ -92,7 +93,7 @@ function harness() {
     createBoard: () => createQueue.shift() ?? Promise.resolve(snapshot(boardA, "created A")),
     loadSnapshot: (boardId) =>
       take(snapshotQueues, boardId, snapshot(boardId, boardId === boardA ? "A" : "B")),
-    loadPending: (boardId) => take(pendingQueues, boardId, []),
+    loadPending: (boardId) => take(pendingQueues, boardId, { commands: [], corruptCount: 0 }),
     updateBoardLocation: (boardId) => locations.push(boardId),
     createTransport: (boardId, token) => {
       const transport = new FakeTransport(boardId, token, store);
@@ -109,7 +110,10 @@ function harness() {
     queueSnapshot(boardId: string, promise: Promise<BoardSnapshot>): void {
       snapshotQueues.set(boardId, [...(snapshotQueues.get(boardId) ?? []), promise]);
     },
-    queuePending(boardId: string, promise: Promise<DurableCommand[]>): void {
+    queuePending(
+      boardId: string,
+      promise: Promise<{ commands: DurableCommand[]; corruptCount: number }>,
+    ): void {
       pendingQueues.set(boardId, [...(pendingQueues.get(boardId) ?? []), promise]);
     },
     queueCreate(promise: Promise<BoardSnapshot>): void {
@@ -121,13 +125,13 @@ function harness() {
 describe("board session lifecycle", () => {
   it("discards a delayed pending load after session B initializes", async () => {
     const test = harness();
-    const pendingA = deferred<DurableCommand[]>();
+    const pendingA = deferred<{ commands: DurableCommand[]; corruptCount: number }>();
     test.queuePending(boardA, pendingA.promise);
     const sessionA = test.controller.start(boardA);
     await settlePromises();
     const sessionB = test.controller.start(boardB);
     await sessionB.completion;
-    pendingA.resolve([]);
+    pendingA.resolve({ commands: [], corruptCount: 0 });
     await sessionA.completion;
 
     expect(test.store.getState()).toMatchObject({
@@ -137,6 +141,47 @@ describe("board session lifecycle", () => {
       sessionGeneration: sessionB.token.generation,
     });
     expect(test.transports.map((transport) => transport.boardId)).toEqual([boardB]);
+  });
+
+  it("keeps valid startup state while surfacing ignored corrupt pending rows", async () => {
+    const test = harness();
+    test.queuePending(boardA, Promise.resolve({ commands: [], corruptCount: 2 }));
+    const session = test.controller.start(boardA);
+    await session.completion;
+
+    expect(test.store.getState()).toMatchObject({
+      boardId: boardA,
+      connection: "joining",
+      pending: [],
+      pendingStatus: "persistence-error",
+      error: "LOCAL_PERSISTENCE_WARNING: Ignored 2 invalid pending rows",
+    });
+    expect(test.transports).toHaveLength(1);
+  });
+
+  it("holds startup-time submissions until the owned transport exists", async () => {
+    const test = harness();
+    const pending = deferred<{ commands: DurableCommand[]; corruptCount: number }>();
+    test.queuePending(boardA, pending.promise);
+    const session = test.controller.start(boardA);
+    const command: DurableCommand = {
+      schemaVersion: 1,
+      opId: "40000000-0000-4000-8000-000000000021",
+      boardId: boardA,
+      clientId: "20000000-0000-4000-8000-000000000021",
+      baseSeq: 0,
+      targetId: "30000000-0000-4000-8000-000000000021",
+      clientTimestamp: "2026-08-07T12:00:00.000Z",
+      type: "object.delete",
+      payload: {},
+    };
+    const submitted = session.submit(command);
+    await settlePromises();
+    expect(test.transports).toHaveLength(0);
+
+    pending.resolve({ commands: [], corruptCount: 0 });
+    await expect(submitted).resolves.toBe(true);
+    expect(test.transports[0]?.submitted).toEqual([command]);
   });
 
   it("discards a delayed snapshot after a newer board initializes", async () => {
@@ -289,12 +334,12 @@ describe("board session lifecycle", () => {
     expect(snapshotTest.store.getState().boardId).toBeNull();
 
     const pendingTest = harness();
-    const loadingPending = deferred<DurableCommand[]>();
+    const loadingPending = deferred<{ commands: DurableCommand[]; corruptCount: number }>();
     pendingTest.queuePending(boardA, loadingPending.promise);
     const pendingSession = pendingTest.controller.start(boardA);
     await settlePromises();
     pendingTest.controller.stop(pendingSession);
-    loadingPending.resolve([]);
+    loadingPending.resolve({ commands: [], corruptCount: 0 });
     await pendingSession.completion;
     expect(pendingTest.transports).toEqual([]);
     expect(pendingTest.store.getState().boardId).toBeNull();
