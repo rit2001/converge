@@ -170,10 +170,7 @@ function canonicalValue(value: unknown): unknown {
 }
 
 export function canonicalBoard(state: BoardState): string {
-  const active = Object.values(state.objects)
-    .filter((object) => object.deletedSeq === null)
-    .map((object) => object.value)
-    .sort((left, right) => left.id.localeCompare(right.id));
+  const active = visibleObjects(state);
   return JSON.stringify(canonicalValue({ objects: active }));
 }
 

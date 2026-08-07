@@ -115,7 +115,7 @@ export class BoardRepository {
       `SELECT b.id, b.name, b.last_seq, o.object_data
        FROM boards b JOIN board_members m ON m.board_id = b.id AND m.user_id = $2
        LEFT JOIN board_objects o ON o.board_id = b.id AND o.deleted_seq IS NULL
-       WHERE b.id = $1 ORDER BY o.object_id`,
+       WHERE b.id = $1 ORDER BY o.stack_order, o.object_id`,
       [boardId, userId],
     );
     if (!result.rowCount) {
@@ -326,13 +326,16 @@ export class BoardRepository {
         object_data: unknown;
         field_seq: Record<string, number>;
         created_seq: string;
+        stack_order: string;
         updated_seq: string;
         deleted_seq: string | null;
       }>(
-        "SELECT object_id, object_data, field_seq, created_seq, updated_seq, deleted_seq FROM board_objects WHERE board_id = $1",
+        `SELECT object_id, object_data, field_seq, created_seq, stack_order, updated_seq, deleted_seq
+         FROM board_objects WHERE board_id = $1 ORDER BY stack_order, object_id`,
         [command.boardId],
       );
       const state: BoardState = emptyBoardState();
+      const stackOrderByObjectId = new Map<string, number>();
       state.lastSeq = authoritativeLastSeq;
       for (const row of rows.rows) {
         const projected: ProjectedObject = {
@@ -343,14 +346,15 @@ export class BoardRepository {
           deletedSeq: row.deleted_seq === null ? null : Number(row.deleted_seq),
         };
         state.objects[row.object_id] = projected;
+        stackOrderByObjectId.set(row.object_id, Number(row.stack_order));
         if (projected.deletedSeq === null) state.order.push(row.object_id);
       }
-      state.order.sort();
       const seq = state.lastSeq + 1;
       const reduced = reduceCommand(state, command, seq);
       if (!reduced.ok) throw new RepositoryError(reduced.code, reduced.message);
       const projected = reduced.state.objects[command.targetId];
       if (!projected) throw new RepositoryError("CONFLICT", "Projection update failed");
+      const stackOrder = stackOrderByObjectId.get(command.targetId) ?? seq;
       const committedAt = new Date().toISOString();
       const operation = committedOperationSchema.parse({ ...command, seq, committedAt });
       await client.query(
@@ -370,10 +374,10 @@ export class BoardRepository {
         ],
       );
       await client.query(
-        `INSERT INTO board_objects(board_id, object_id, kind, object_data, field_seq, created_seq, updated_seq, deleted_seq)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        `INSERT INTO board_objects(board_id, object_id, kind, object_data, field_seq, created_seq, stack_order, updated_seq, deleted_seq)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (board_id, object_id) DO UPDATE SET object_data=EXCLUDED.object_data, field_seq=EXCLUDED.field_seq,
-           updated_seq=EXCLUDED.updated_seq, deleted_seq=EXCLUDED.deleted_seq`,
+           stack_order=EXCLUDED.stack_order, updated_seq=EXCLUDED.updated_seq, deleted_seq=EXCLUDED.deleted_seq`,
         [
           command.boardId,
           command.targetId,
@@ -381,6 +385,7 @@ export class BoardRepository {
           projected.value,
           projected.fieldSeq,
           projected.createdSeq,
+          stackOrder,
           projected.updatedSeq,
           projected.deletedSeq,
         ],

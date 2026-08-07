@@ -194,6 +194,9 @@ importers:
       '@converge/api':
         specifier: workspace:*
         version: link:../../apps/api
+      '@converge/canvas-engine':
+        specifier: workspace:*
+        version: link:../../packages/canvas-engine
       '@converge/database':
         specifier: workspace:*
         version: link:../../packages/database

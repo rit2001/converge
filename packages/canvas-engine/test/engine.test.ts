@@ -170,4 +170,36 @@ describe("canvas engine", () => {
     expect(canonicalBoard(reordered.state)).toBe(canonicalBoard(original.state));
     expect(await hashBoardState(reordered.state)).toBe(await hashBoardState(original.state));
   });
+
+  it("makes canonical hashing sensitive to stacking order", async () => {
+    const highId = "f0000000-0000-4000-8000-000000000001";
+    const lowId = "10000000-0000-4000-8000-000000000002";
+    const high = reduceCommand(
+      emptyBoardState(),
+      {
+        ...createRectangle,
+        targetId: highId,
+        payload: { ...createRectangle.payload, id: highId },
+      },
+      1,
+    );
+    if (!high.ok) throw new Error("fixture failed");
+    const low = reduceCommand(
+      high.state,
+      {
+        ...createRectangle,
+        opId: "40000000-0000-4000-8000-000000000009",
+        baseSeq: 1,
+        targetId: lowId,
+        payload: { ...createRectangle.payload, id: lowId },
+      },
+      2,
+    );
+    if (!low.ok) throw new Error("fixture failed");
+    const reversed = { ...low.state, order: [...low.state.order].reverse() };
+
+    expect(low.state.order).toEqual([highId, lowId]);
+    expect(canonicalBoard(low.state)).not.toBe(canonicalBoard(reversed));
+    expect(await hashBoardState(low.state)).not.toBe(await hashBoardState(reversed));
+  });
 });

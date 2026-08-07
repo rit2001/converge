@@ -1,7 +1,14 @@
+import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  applyCommitted,
+  emptyBoardState,
+  hashBoardState,
+  visibleObjects,
+} from "@converge/canvas-engine";
 import { BoardRepository, createPool } from "@converge/database";
 import { createRectangleCommand, fixtureIds } from "@converge/testkit";
-import { boardSnapshotSchema, type DurableCommand } from "@converge/protocol";
+import { boardSnapshotSchema, type BoardSnapshot, type DurableCommand } from "@converge/protocol";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
@@ -28,6 +35,7 @@ async function durableState(boardId: string) {
                    'objectData', o.object_data,
                    'fieldSeq', o.field_seq,
                    'createdSeq', o.created_seq,
+                   'stackOrder', o.stack_order,
                    'updatedSeq', o.updated_seq,
                    'deletedSeq', o.deleted_seq
                  ) ORDER BY o.object_id
@@ -49,6 +57,22 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+function stateFromSnapshot(snapshot: BoardSnapshot) {
+  const state = emptyBoardState();
+  state.lastSeq = snapshot.lastSeq;
+  for (const value of snapshot.objects) {
+    state.objects[value.id] = {
+      value,
+      createdSeq: 0,
+      updatedSeq: snapshot.lastSeq,
+      deletedSeq: null,
+      fieldSeq: {},
+    };
+    state.order.push(value.id);
+  }
+  return state;
+}
+
 beforeAll(async () => {
   await pool.query("SELECT 1");
 });
@@ -57,6 +81,149 @@ afterAll(async () => {
 });
 
 describe("authoritative operation transactions", () => {
+  it("backfills stack order from created sequence for existing projections", async () => {
+    const migration = await readFile(
+      new URL(
+        "../../packages/database/migrations/0003_authoritative_stacking_order.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `CREATE TEMP TABLE board_objects (
+           board_id uuid NOT NULL,
+           object_id uuid NOT NULL,
+           created_seq bigint NOT NULL,
+           PRIMARY KEY (board_id, object_id)
+         )`,
+      );
+      await client.query("SET LOCAL search_path TO pg_temp");
+      const boardId = crypto.randomUUID();
+      await client.query(
+        `INSERT INTO board_objects(board_id, object_id, created_seq)
+         VALUES ($1, $2, 7), ($1, $3, 3)`,
+        [boardId, "f0000000-0000-4000-8000-000000000001", "10000000-0000-4000-8000-000000000002"],
+      );
+
+      await client.query(migration);
+      const rows = await client.query<{ created_seq: string; stack_order: string }>(
+        "SELECT created_seq, stack_order FROM board_objects ORDER BY stack_order",
+      );
+      expect(rows.rows).toEqual([
+        { created_seq: "3", stack_order: "3" },
+        { created_seq: "7", stack_order: "7" },
+      ]);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
+  });
+
+  it("persists creation stacking across live replay, snapshots, mutations, and exact replay", async () => {
+    const boardId = await board();
+    const highId = "f0000000-0000-4000-8000-000000000001";
+    const lowId = "10000000-0000-4000-8000-000000000002";
+    const high = createRectangleCommand(boardId, highId);
+    const low = { ...createRectangleCommand(boardId, lowId), baseSeq: 1 };
+    const first = await repository.commitOperation(fixtureIds.user, high);
+    const second = await repository.commitOperation(fixtureIds.user, low);
+    const live = applyCommitted(
+      applyCommitted(emptyBoardState(), first.operation),
+      second.operation,
+    );
+    const afterCreate = await repository.getBoard(boardId, fixtureIds.user);
+
+    expect(visibleObjects(live).map(({ id }) => id)).toEqual([highId, lowId]);
+    expect(afterCreate.objects.map(({ id }) => id)).toEqual([highId, lowId]);
+    expect(await hashBoardState(live)).toBe(await hashBoardState(stateFromSnapshot(afterCreate)));
+    const ranks = await pool.query<{
+      object_id: string;
+      created_seq: string;
+      stack_order: string;
+    }>(
+      `SELECT object_id, created_seq, stack_order
+       FROM board_objects WHERE board_id = $1 ORDER BY stack_order, object_id`,
+      [boardId],
+    );
+    expect(ranks.rows).toEqual([
+      { object_id: highId, created_seq: "1", stack_order: "1" },
+      { object_id: lowId, created_seq: "2", stack_order: "2" },
+    ]);
+
+    const beforeReplay = await durableState(boardId);
+    await expect(repository.commitOperation(fixtureIds.user, low)).resolves.toMatchObject({
+      duplicate: true,
+      operation: { opId: low.opId, seq: 2 },
+    });
+    expect(await durableState(boardId)).toEqual(beforeReplay);
+
+    const update: DurableCommand = {
+      ...high,
+      opId: crypto.randomUUID(),
+      baseSeq: 2,
+      type: "object.update",
+      payload: { fill: "#ffffff" },
+    };
+    await repository.commitOperation(fixtureIds.user, update);
+    const transform: DurableCommand = {
+      ...low,
+      opId: crypto.randomUUID(),
+      baseSeq: 3,
+      type: "object.transform",
+      payload: { x: 80, y: 90 },
+    };
+    await repository.commitOperation(fixtureIds.user, transform);
+    expect(
+      (await repository.getBoard(boardId, fixtureIds.user)).objects.map(({ id }) => id),
+    ).toEqual([highId, lowId]);
+    expect(
+      (
+        await pool.query<{ object_id: string; stack_order: string }>(
+          `SELECT object_id, stack_order FROM board_objects
+           WHERE board_id = $1 ORDER BY stack_order, object_id`,
+          [boardId],
+        )
+      ).rows,
+    ).toEqual([
+      { object_id: highId, stack_order: "1" },
+      { object_id: lowId, stack_order: "2" },
+    ]);
+
+    await expect(
+      pool.query(
+        "UPDATE board_objects SET stack_order = 1 WHERE board_id = $1 AND object_id = $2",
+        [boardId, lowId],
+      ),
+    ).rejects.toMatchObject({ code: "23505" });
+
+    const removeBottom: DurableCommand = {
+      ...high,
+      opId: crypto.randomUUID(),
+      baseSeq: 4,
+      type: "object.delete",
+      payload: {},
+    };
+    await repository.commitOperation(fixtureIds.user, removeBottom);
+    expect(
+      (await repository.getBoard(boardId, fixtureIds.user)).objects.map(({ id }) => id),
+    ).toEqual([lowId]);
+    expect(
+      (
+        await pool.query<{ object_id: string; stack_order: string }>(
+          `SELECT object_id, stack_order FROM board_objects
+           WHERE board_id = $1 ORDER BY stack_order, object_id`,
+          [boardId],
+        )
+      ).rows,
+    ).toEqual([
+      { object_id: highId, stack_order: "1" },
+      { object_id: lowId, stack_order: "2" },
+    ]);
+  });
+
   it("assigns monotonic board-local sequences", async () => {
     const boardId = await board();
     const first = await repository.commitOperation(

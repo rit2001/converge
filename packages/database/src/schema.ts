@@ -45,11 +45,13 @@ export const boardObjects = pgTable(
     objectData: jsonb("object_data").notNull(),
     fieldSeq: jsonb("field_seq").notNull(),
     createdSeq: bigint("created_seq", { mode: "number" }).notNull(),
+    stackOrder: bigint("stack_order", { mode: "number" }).notNull(),
     updatedSeq: bigint("updated_seq", { mode: "number" }).notNull(),
     deletedSeq: bigint("deleted_seq", { mode: "number" }),
   },
   (table) => [
     primaryKey({ columns: [table.boardId, table.objectId] }),
+    uniqueIndex("board_objects_stack_order_uq").on(table.boardId, table.stackOrder),
     index("board_objects_active_idx").on(table.boardId, table.deletedSeq),
   ],
 );
