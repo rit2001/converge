@@ -96,6 +96,7 @@ export function Canvas({
               y={object.y}
               width={object.width}
               height={object.height}
+              rotation={object.rotation}
               draggable={tool === "select"}
               onClick={() => onSelect(object.id)}
               onTap={() => onSelect(object.id)}
