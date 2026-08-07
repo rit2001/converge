@@ -359,6 +359,10 @@ export async function buildApp(
     let windowStarted = Date.now();
     let commandsInWindow = 0;
     socket.on("board:join", async (raw, acknowledge) => {
+      if (typeof acknowledge !== "function") {
+        app.log.warn({ socketId: socket.id }, "board join requires an acknowledgement callback");
+        return;
+      }
       try {
         const request = joinBoardRequestSchema.parse(raw);
         await deliveryCoordinator.run(request.boardId, async () => {

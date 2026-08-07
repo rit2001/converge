@@ -135,6 +135,59 @@ async function boardLockBarrier(boardId: string): Promise<void> {
 }
 
 describe("Socket.IO mutation-submission integrity", () => {
+  it("ignores a board join without an acknowledgement before room membership", async () => {
+    const boardId = await board();
+    const editor = await connect(tokens.editor);
+    const before = await durableState(boardId);
+    const serverSocket = context.io.sockets.sockets.get(editor.id ?? "");
+    if (!serverSocket) throw new Error("Expected connected server socket");
+    const originalJoin = serverSocket.join.bind(serverSocket);
+    let roomJoinCalls = 0;
+    serverSocket.join = ((rooms) => {
+      roomJoinCalls += 1;
+      return originalJoin(rooms);
+    }) as typeof serverSocket.join;
+    const unhandledRejections: unknown[] = [];
+    const recordUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    process.on("unhandledRejection", recordUnhandledRejection);
+
+    try {
+      const emitWithoutAcknowledgement = editor.emit.bind(editor) as unknown as (
+        event: "board:join",
+        request: {
+          schemaVersion: 1;
+          boardId: string;
+          clientId: string;
+          lastAppliedSeq: number;
+        },
+      ) => void;
+      emitWithoutAcknowledgement("board:join", {
+        schemaVersion: 1,
+        boardId,
+        clientId: crypto.randomUUID(),
+        lastAppliedSeq: 0,
+      });
+
+      await expect(join(editor, boardId)).resolves.toMatchObject({
+        ok: true,
+        boardId,
+        joinWatermark: 0,
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(unhandledRejections).toEqual([]);
+      expect(roomJoinCalls).toBe(1);
+      expect(serverSocket.rooms.has(`board:${boardId}`)).toBe(true);
+      expect(await durableState(boardId)).toEqual(before);
+      await expect(context.app.inject({ method: "GET", url: "/health" })).resolves.toMatchObject({
+        statusCode: 200,
+      });
+    } finally {
+      process.off("unhandledRejection", recordUnhandledRejection);
+      serverSocket.join = originalJoin;
+    }
+  });
+
   it("rejects a mutation without an acknowledgement before persistence or broadcast", async () => {
     const boardId = await board();
     const editor = await connect(tokens.editor);
