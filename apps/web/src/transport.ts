@@ -146,8 +146,13 @@ export class BoardTransport {
       setStatus: (status, message) =>
         useBoardStore.getState().setPendingStatus(this.sessionToken, status, message),
       submit: (command) => this.createSubmissionAttempt(command),
-      requestSynchronization: () => {
+      requestSynchronization: (reason) => {
         if (!this.isSessionActive()) return;
+        if (reason) {
+          const socket = this.socket;
+          if (socket) this.recoverFromIngestResult(socket, reason, "acknowledgement");
+          return;
+        }
         this.ready = false;
         this.pendingQueue.setReady(false);
         if (this.socket?.connected) this.beginSynchronization(this.socket);
@@ -304,14 +309,7 @@ export class BoardTransport {
     while (useBoardStore.getState().committed.lastSeq < watermark) {
       this.assertCurrent(socket, attempt);
       const after = useBoardStore.getState().committed.lastSeq;
-      const response = await this.fetchRange(after, watermark, socket, attempt);
-      this.assertCurrent(socket, attempt);
-      let raw: unknown;
-      try {
-        raw = await response.json();
-      } catch {
-        throw new SynchronizationError("INTERNAL_ERROR", "Catch-up response was unreadable", true);
-      }
+      const { response, raw } = await this.fetchRange(after, watermark, socket, attempt);
       this.assertCurrent(socket, attempt);
       if (!response.ok) {
         const failure = protocolErrorSchema.safeParse(raw);
@@ -413,31 +411,64 @@ export class BoardTransport {
     watermark: number,
     socket: BoardSocket,
     attempt: SynchronizationAttempt,
-  ): Promise<Response> {
+  ): Promise<{ response: Response; raw: unknown }> {
     const controller = new AbortController();
     let timedOut = false;
-    const cancel = (): void => controller.abort();
+    let rejectInterruption!: (error: SynchronizationError) => void;
+    const interruption = new Promise<never>((_resolve, reject) => {
+      rejectInterruption = reject;
+    });
+    const interrupt = (error: SynchronizationError): void => {
+      controller.abort();
+      rejectInterruption(error);
+    };
+    const cancel = (): void =>
+      interrupt(new SynchronizationError("INTERNAL_ERROR", "Catch-up attempt was cancelled", true));
     attempt.cancelers.add(cancel);
     const timeout = this.scheduler.setTimeout(() => {
       timedOut = true;
-      controller.abort();
+      interrupt(
+        new SynchronizationError("INTERNAL_ERROR", "Catch-up acknowledgement timed out", true),
+      );
     }, this.limits.acknowledgementTimeoutMs);
     try {
-      const response = await this.fetcher(
-        `${this.apiUrl}/v1/boards/${this.boardId}/operations?after=${after}&watermark=${watermark}`,
-        { signal: controller.signal },
-      );
+      let response: Response;
+      try {
+        response = await Promise.race([
+          this.fetcher(
+            `${this.apiUrl}/v1/boards/${this.boardId}/operations?after=${after}&watermark=${watermark}`,
+            { signal: controller.signal },
+          ),
+          interruption,
+        ]);
+      } catch (error) {
+        if (error instanceof SynchronizationError) throw error;
+        if (timedOut)
+          throw new SynchronizationError(
+            "INTERNAL_ERROR",
+            "Catch-up acknowledgement timed out",
+            true,
+          );
+        if (attempt.cancelled) throw error;
+        throw new SynchronizationError("INTERNAL_ERROR", "Catch-up request failed", true);
+      }
       this.assertCurrent(socket, attempt);
-      return response;
-    } catch (error) {
-      if (timedOut)
-        throw new SynchronizationError(
-          "INTERNAL_ERROR",
-          "Catch-up acknowledgement timed out",
-          true,
-        );
-      if (attempt.cancelled) throw error;
-      throw new SynchronizationError("INTERNAL_ERROR", "Catch-up request failed", true);
+      let raw: unknown;
+      try {
+        raw = await Promise.race([response.json(), interruption]);
+      } catch (error) {
+        if (error instanceof SynchronizationError) throw error;
+        if (timedOut)
+          throw new SynchronizationError(
+            "INTERNAL_ERROR",
+            "Catch-up acknowledgement timed out",
+            true,
+          );
+        if (attempt.cancelled) throw error;
+        throw new SynchronizationError("INTERNAL_ERROR", "Catch-up response was unreadable", true);
+      }
+      this.assertCurrent(socket, attempt);
+      return { response, raw };
     } finally {
       this.scheduler.clearTimeout(timeout);
       attempt.cancelers.delete(cancel);
@@ -512,14 +543,24 @@ export class BoardTransport {
     }
     if (!this.ready || this.retryTimer) return;
     const result = this.pendingQueue.observeCommitted(operation);
+    if (result === "buffered" || result === "conflict")
+      this.recoverFromIngestResult(socket, result, "live operation");
+  }
+
+  private recoverFromIngestResult(
+    socket: BoardSocket,
+    result: "buffered" | "conflict",
+    source: "acknowledgement" | "live operation",
+  ): void {
     if (result === "buffered") {
+      if (!this.ready || this.retryTimer || socket !== this.socket) return;
       this.ready = false;
       this.pendingQueue.setReady(false);
       this.beginSynchronization(socket);
-    } else if (result === "conflict") {
+    } else {
       this.failCurrentOrReady(
         socket,
-        new SynchronizationError("RESYNC_REQUIRED", "Conflicting live operation", true),
+        new SynchronizationError("RESYNC_REQUIRED", `Conflicting ${source} operation`, true),
       );
     }
   }

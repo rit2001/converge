@@ -62,6 +62,14 @@ function snapshot(lastSeq = 0): BoardSnapshot {
   return { id: boardId, name: "Recovery", lastSeq, objects: [] };
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 async function settle(): Promise<void> {
   for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
 }
@@ -102,6 +110,7 @@ class FakeSocket {
   connected = false;
   readonly joins: Array<{ request: unknown; acknowledge: (value: JoinBoardAck) => void }> = [];
   readonly submissions: DurableCommand[] = [];
+  readonly submissionAcknowledgements: Array<(value: unknown) => void> = [];
   private readonly listeners = new Map<string, Listener[]>();
   readonly io = {
     on: (event: string, listener: Listener): void => this.addListener(`io:${event}`, listener),
@@ -122,6 +131,10 @@ class FakeSocket {
       });
     } else if (event === "operation:submit") {
       this.submissions.push(values[0] as DurableCommand);
+      const acknowledge = values[1];
+      if (typeof acknowledge !== "function")
+        throw new Error("Operation acknowledgement is required");
+      this.submissionAcknowledgements.push(acknowledge as (value: unknown) => void);
     }
     return this;
   }
@@ -150,6 +163,10 @@ class FakeSocket {
 
   deliver(value: unknown): void {
     this.dispatch("operation:committed", value);
+  }
+
+  acknowledgeSubmission(index: number, value: unknown): void {
+    this.submissionAcknowledgements[index]?.(value);
   }
 
   revoke(value: unknown): void {
@@ -306,6 +323,82 @@ describe("self-healing synchronization", () => {
     expect(useBoardStore.getState()).toMatchObject({
       connection: "ready",
       committed: { lastSeq: 1 },
+    });
+  });
+
+  it("times out a stalled range body after headers and ignores its late completion", async () => {
+    const body = deferred<unknown>();
+    let rangeSignal: AbortSignal | null = null;
+    const fetcher: typeof fetch = (_input, init) => {
+      rangeSignal = init?.signal ?? null;
+      return Promise.resolve({
+        ok: true,
+        json: () => body.promise,
+      } as Response);
+    };
+    const test = harness({ fetcher });
+    succeedJoin(test.socket, 0, 1);
+    await settle();
+
+    expect(useBoardStore.getState().connection).toBe("catching-up");
+    test.scheduler.runDelay(SYNC_ACK_TIMEOUT_MS);
+    await settle();
+    expect(rangeSignal?.aborted).toBe(true);
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "retry-wait",
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: { attempt: 1, retryScheduled: true },
+    });
+
+    body.resolve({
+      boardId,
+      afterSeq: 0,
+      watermark: 1,
+      operations: [operation(1)],
+      nextSeq: 1,
+      hasMore: false,
+    });
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "retry-wait",
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: { attempt: 1, retryScheduled: true },
+    });
+    expect(test.socket.joins).toHaveLength(1);
+  });
+
+  it("consumes an ordinary timely range body before becoming READY", async () => {
+    const test = harness({
+      fetcher: () => Promise.resolve(response(0, 1, [operation(1)])),
+    });
+    succeedJoin(test.socket, 0, 1);
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "ready",
+      committed: { lastSeq: 1 },
+    });
+    expect(test.scheduler.tasks.size).toBe(0);
+  });
+
+  it("retains retry recovery for an unreadable timely range body", async () => {
+    const test = harness({
+      fetcher: () =>
+        Promise.resolve(
+          new Response("{", { status: 200, headers: { "content-type": "application/json" } }),
+        ),
+    });
+    succeedJoin(test.socket, 0, 1);
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "retry-wait",
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: {
+        retryCode: "INTERNAL_ERROR",
+        retryScheduled: true,
+        retryDelayMs: 500,
+      },
     });
   });
 
@@ -609,6 +702,78 @@ describe("bounded live buffering", () => {
 });
 
 describe("authoritative resynchronization and pending interaction", () => {
+  it("recovers a gap-revealing acknowledgement before draining the next command", async () => {
+    const first = pending(2);
+    const second = pending(3);
+    const acknowledged = { ...first, seq: 2, committedAt: "2026-08-07T12:01:02.000Z" };
+    let rangeRequests = 0;
+    const test = harness({
+      initialPending: [first, second],
+      fetcher: () => {
+        rangeRequests += 1;
+        return Promise.resolve(response(0, 2, [operation(1), acknowledged]));
+      },
+    });
+    succeedJoin(test.socket, 0, 0);
+    await settle();
+    expect(test.socket.submissions).toEqual([first]);
+
+    test.socket.acknowledgeSubmission(0, {
+      ok: true,
+      duplicate: false,
+      operation: acknowledged,
+    });
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "joining",
+      committed: { lastSeq: 0 },
+      pending: [{ opId: second.opId }],
+    });
+    expect(test.socket.joins).toHaveLength(2);
+    expect(test.socket.submissions).toEqual([first]);
+    expect(rangeRequests).toBe(0);
+    expect(test.persistence.rows.has(first.opId)).toBe(false);
+
+    succeedJoin(test.socket, 1, 2);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "ready",
+      committed: { lastSeq: 2 },
+      pending: [{ opId: second.opId }],
+    });
+    expect(rangeRequests).toBe(1);
+    expect(test.socket.submissions).toEqual([first, second]);
+  });
+
+  it("routes a conflicting acknowledgement through retry recovery", async () => {
+    const first = pending(2);
+    const second = pending(3);
+    const test = harness({ initialPending: [first, second] });
+    succeedJoin(test.socket, 0, 0);
+    await settle();
+    test.socket.deliver(operation(1));
+    test.socket.acknowledgeSubmission(0, {
+      ok: true,
+      duplicate: false,
+      operation: { ...first, seq: 1, committedAt: "2026-08-07T12:01:01.000Z" },
+    });
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "retry-wait",
+      committed: { lastSeq: 1 },
+      pending: [{ opId: second.opId }],
+      synchronizationDiagnostics: {
+        retryCode: "RESYNC_REQUIRED",
+        retryScheduled: true,
+        retryDelayMs: 500,
+      },
+    });
+    expect(test.socket.submissions).toEqual([first]);
+    expect(test.persistence.rows.has(first.opId)).toBe(false);
+    expect(test.scheduler.delays()).toEqual([500]);
+  });
+
   it("reloads the snapshot when the durable operation range is unavailable", async () => {
     let snapshotLoads = 0;
     const test = harness({

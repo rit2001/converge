@@ -96,7 +96,7 @@ export interface PendingCommandQueueDependencies {
   ingest(operation: CommittedOperation): IngestResult | "stale";
   setStatus(status: PendingRecoveryStatus, message?: string | null): void;
   submit(command: DurableCommand): SubmissionAttempt;
-  requestSynchronization(): void;
+  requestSynchronization(reason?: "buffered" | "conflict"): void;
 }
 
 const browserScheduler: RetryScheduler = {
@@ -231,7 +231,11 @@ export class PendingCommandQueue {
 
     const acknowledgement = outcome.acknowledgement;
     if (acknowledgement.ok) {
-      this.dependencies.ingest(acknowledgement.operation);
+      const result = this.dependencies.ingest(acknowledgement.operation);
+      if (result === "buffered" || result === "conflict") {
+        this.setReady(false);
+        this.dependencies.requestSynchronization(result);
+      }
       await this.finishCommand(command);
       this.drain();
       return;

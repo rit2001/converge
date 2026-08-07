@@ -430,6 +430,44 @@ describe("pending command recovery", () => {
     expect(test.persistence.rows.has(item.opId)).toBe(false);
   });
 
+  it("requests recovery and pauses draining for a conflicting successful acknowledgement", async () => {
+    const first = command(1);
+    const second = command(2);
+    const test = harness([first, second]);
+    expect(test.store.getState().ingest(token, committed(command(99), 1))).toBe("applied");
+    test.queue.setReady(true);
+    test.submissions[0]?.controlled.result.resolve({
+      kind: "ack",
+      acknowledgement: success(first, 1),
+    });
+    await settle();
+
+    expect(test.synchronizationRequests).toBe(1);
+    expect(test.submissions).toHaveLength(1);
+    expect(test.store.getState().pending.map(({ opId }) => opId)).toEqual([second.opId]);
+    expect(test.persistence.rows.has(first.opId)).toBe(false);
+  });
+
+  it("deduplicates a successful acknowledgement without starting recovery", async () => {
+    const first = command(1);
+    const second = command(2);
+    const test = harness([first, second]);
+    expect(test.store.getState().ingest(token, committed(first, 1))).toBe("applied");
+    test.queue.setReady(true);
+    test.submissions[0]?.controlled.result.resolve({
+      kind: "ack",
+      acknowledgement: success(first, 1, true),
+    });
+    await settle();
+
+    expect(test.synchronizationRequests).toBe(0);
+    expect(test.submissions).toHaveLength(2);
+    expect(test.submissions[1]?.command).toBe(second);
+    expect(test.store.getState()).toMatchObject({ committed: { lastSeq: 1 } });
+    expect(test.store.getState().pending.map(({ opId }) => opId)).toEqual([second.opId]);
+    expect(test.persistence.rows.has(first.opId)).toBe(false);
+  });
+
   it("recovers an ack-lost commit through an exact replay with one logical server mutation", async () => {
     const item = command(1);
     const test = harness();
