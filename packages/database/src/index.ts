@@ -24,6 +24,7 @@ export class RepositoryError extends Error {
       | "TARGET_NOT_FOUND"
       | "TARGET_DELETED"
       | "CONFLICT"
+      | "IDEMPOTENCY_CONFLICT"
       | "RESYNC_REQUIRED",
     message: string,
   ) {
@@ -31,12 +32,20 @@ export class RepositoryError extends Error {
   }
 }
 
+export interface BoardRepositoryHooks {
+  beforeSequenceLock?: (command: DurableCommand) => Promise<void>;
+  afterSequenceLock?: (command: DurableCommand) => Promise<void>;
+}
+
 export function createPool(databaseUrl: string): pg.Pool {
   return new pg.Pool({ connectionString: databaseUrl, max: 20 });
 }
 
 export class BoardRepository {
-  constructor(private readonly pool: pg.Pool) {}
+  constructor(
+    private readonly pool: pg.Pool,
+    private readonly hooks: BoardRepositoryHooks = {},
+  ) {}
 
   async createBoard(userId: string, name: string): Promise<BoardSnapshot> {
     const id = crypto.randomUUID();
@@ -186,21 +195,41 @@ export class BoardRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      await this.hooks.beforeSequenceLock?.(command);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         command.boardId,
       ]);
+      await this.hooks.afterSequenceLock?.(command);
       const role = await client.query<{ role: string }>(
         "SELECT role FROM board_members WHERE board_id = $1 AND user_id = $2",
         [command.boardId, userId],
       );
       if (!role.rowCount || role.rows[0]?.role === "viewer")
         throw new RepositoryError("FORBIDDEN", "Board edit permission required");
-      const duplicate = await client.query<{ command: unknown; seq: string; committed_at: Date }>(
-        "SELECT command, seq, committed_at FROM board_operations WHERE board_id = $1 AND op_id = $2",
-        [command.boardId, command.opId],
+      const board = await client.query<{ last_seq: string }>(
+        "SELECT last_seq FROM boards WHERE id = $1 FOR UPDATE",
+        [command.boardId],
+      );
+      if (!board.rowCount) throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");
+      const authoritativeLastSeq = Number(board.rows[0]?.last_seq ?? 0);
+      const duplicate = await client.query<{
+        command: unknown;
+        seq: string;
+        committed_at: Date;
+        user_id: string;
+        same_command: boolean;
+      }>(
+        `SELECT command, seq, committed_at, user_id, command = $3::jsonb AS same_command
+         FROM board_operations WHERE board_id = $1 AND op_id = $2`,
+        [command.boardId, command.opId, command],
       );
       const prior = duplicate.rows[0];
       if (prior) {
+        if (prior.user_id !== userId || !prior.same_command)
+          throw new RepositoryError(
+            "IDEMPOTENCY_CONFLICT",
+            "Operation id was already used for a different command",
+          );
         await client.query("COMMIT");
         return {
           duplicate: true,
@@ -211,11 +240,11 @@ export class BoardRepository {
           }),
         };
       }
-      const board = await client.query<{ last_seq: string }>(
-        "SELECT last_seq FROM boards WHERE id = $1 FOR UPDATE",
-        [command.boardId],
-      );
-      if (!board.rowCount) throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");
+      if (command.baseSeq > authoritativeLastSeq)
+        throw new RepositoryError(
+          "RESYNC_REQUIRED",
+          "Command base sequence exceeds authoritative board head",
+        );
       const rows = await client.query<{
         object_id: string;
         object_data: unknown;
@@ -228,7 +257,7 @@ export class BoardRepository {
         [command.boardId],
       );
       const state: BoardState = emptyBoardState();
-      state.lastSeq = Number(board.rows[0]?.last_seq ?? 0);
+      state.lastSeq = authoritativeLastSeq;
       for (const row of rows.rows) {
         const projected: ProjectedObject = {
           value: canvasObjectSchema.parse(row.object_data),

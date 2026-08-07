@@ -118,6 +118,14 @@ describe("protocol schemas", () => {
         surprise: true,
       }).success,
     ).toBe(false);
+    expect(
+      protocolErrorSchema.parse({
+        ok: false,
+        code: "IDEMPOTENCY_CONFLICT",
+        message: "Operation id was already used",
+        retryable: false,
+      }),
+    ).toMatchObject({ code: "IDEMPOTENCY_CONFLICT", retryable: false });
   });
 
   it("rejects malformed synchronization ranges", () => {

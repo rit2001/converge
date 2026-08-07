@@ -6,15 +6,23 @@ packages, and PostgreSQL as durable authority. The system intentionally begins a
 ## Durable write path
 
 1. The client applies a command optimistically and emits it with an `opId` and `baseSeq`.
-2. The API authenticates, authorizes board membership, validates size/schema, and rate-limits.
-3. A PostgreSQL transaction takes a transaction-scoped advisory lock derived from `boardId`.
-4. It returns the prior result for an existing `(boardId, opId)`, otherwise assigns `last_seq + 1`.
-5. Conflict rules are checked against per-field/object sequence metadata in the projection.
-6. The operation, updated projection, board sequence, and outbox event are committed atomically.
-7. Socket.IO acknowledges the origin and broadcasts the committed operation at least once.
+2. On the already authenticated socket, Socket.IO requires an acknowledgement callback before any
+   durable mutation is attempted, then validates size/schema and rate-limits.
+3. A PostgreSQL transaction takes a transaction-scoped advisory lock derived from `boardId`, loads
+   the authoritative board head, and reauthorizes current edit membership.
+4. An existing `(boardId, opId)` is an exact replay only when PostgreSQL JSONB equality confirms the
+   complete normalized command and stored actor are unchanged. Reuse for different intent fails with
+   `IDEMPOTENCY_CONFLICT`.
+5. A genuinely new command with `baseSeq` ahead of the locked board head fails with
+   `RESYNC_REQUIRED`; stale bases remain subject to the existing server-authoritative conflict rules.
+6. The server assigns `last_seq + 1` and checks projection conflict rules.
+7. The operation, updated projection, board sequence, and outbox event are committed atomically.
+8. After commit, Socket.IO attempts live publication before acknowledgement delivery. Exact retries
+   may republish the stored operation, which clients deduplicate.
 
 The outbox is present at Milestone 1, but its delivery worker is deferred. In-process broadcasting is
-adequate for this single-instance milestone and is not claimed to close crash-after-commit delivery.
+adequate for this single-instance milestone and is not claimed to provide exactly-once delivery or
+close the process-crash-after-database-commit window.
 
 ## Client recovery
 

@@ -146,6 +146,7 @@ export const errorCodeSchema = z.enum([
   "TARGET_NOT_FOUND",
   "TARGET_DELETED",
   "CONFLICT",
+  "IDEMPOTENCY_CONFLICT",
   "RESYNC_REQUIRED",
   "INTERNAL_ERROR",
 ]);

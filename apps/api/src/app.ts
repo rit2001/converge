@@ -10,9 +10,11 @@ import {
   durableCommandSchema,
   joinBoardAckSchema,
   joinBoardRequestSchema,
+  operationAckSchema,
   operationRangeQuerySchema,
   operationRangeResponseSchema,
   type ClientToServerEvents,
+  type CommittedOperation,
   type OperationAck,
   type ProtocolError,
   type ServerToClientEvents,
@@ -64,6 +66,51 @@ export interface AppContext {
 
 interface AuthenticatedSocketData {
   principal: AuthenticatedPrincipal;
+}
+
+type OperationDeliveryStage = "publish" | "acknowledge";
+
+function reportWithoutThrow(
+  reportFailure: (stage: OperationDeliveryStage, error: unknown) => void,
+  stage: OperationDeliveryStage,
+  error: unknown,
+): void {
+  try {
+    reportFailure(stage, error);
+  } catch {
+    // Delivery error reporting must not destabilize the socket handler.
+  }
+}
+
+function acknowledgeWithoutThrow(
+  acknowledge: (ack: OperationAck) => void,
+  ack: OperationAck,
+  reportFailure: (stage: OperationDeliveryStage, error: unknown) => void,
+): void {
+  try {
+    acknowledge(operationAckSchema.parse(ack));
+  } catch (error) {
+    reportWithoutThrow(reportFailure, "acknowledge", error);
+  }
+}
+
+export function deliverCommittedOperation(input: {
+  operation: CommittedOperation;
+  duplicate: boolean;
+  publish: (operation: CommittedOperation) => void;
+  acknowledge: (ack: OperationAck) => void;
+  reportFailure: (stage: OperationDeliveryStage, error: unknown) => void;
+}): void {
+  try {
+    input.publish(input.operation);
+  } catch (error) {
+    reportWithoutThrow(input.reportFailure, "publish", error);
+  }
+  acknowledgeWithoutThrow(
+    input.acknowledge,
+    { ok: true, duplicate: input.duplicate, operation: input.operation },
+    input.reportFailure,
+  );
 }
 
 export interface SynchronizationHooks {
@@ -217,43 +264,63 @@ export async function buildApp(
       }
     });
     socket.on("operation:submit", async (raw, acknowledge) => {
+      const reportDeliveryFailure = (stage: OperationDeliveryStage, error: unknown): void =>
+        app.log.warn(
+          { error, stage, socketId: socket.id, userId: user.id },
+          "operation delivery failed",
+        );
+      if (typeof acknowledge !== "function") {
+        app.log.warn(
+          { socketId: socket.id, userId: user.id },
+          "operation rejected because acknowledgement callback is required",
+        );
+        return;
+      }
       if (Date.now() - windowStarted >= 10_000) {
         windowStarted = Date.now();
         commandsInWindow = 0;
       }
       commandsInWindow += 1;
       if (commandsInWindow > 100) {
-        acknowledge({
-          ok: false,
-          code: "RATE_LIMITED",
-          message: "Durable command rate exceeded",
-          retryable: true,
-        });
+        acknowledgeWithoutThrow(
+          acknowledge,
+          {
+            ok: false,
+            code: "RATE_LIMITED",
+            message: "Durable command rate exceeded",
+            retryable: true,
+          },
+          reportDeliveryFailure,
+        );
         return;
       }
       try {
         if (JSON.stringify(raw).length > 64 * 1024) {
-          acknowledge({
-            ok: false,
-            code: "PAYLOAD_TOO_LARGE",
-            message: "Command exceeds 64 KiB",
-            retryable: false,
-          });
+          acknowledgeWithoutThrow(
+            acknowledge,
+            {
+              ok: false,
+              code: "PAYLOAD_TOO_LARGE",
+              message: "Command exceeds 64 KiB",
+              retryable: false,
+            },
+            reportDeliveryFailure,
+          );
           return;
         }
         const command = durableCommandSchema.parse(raw);
         const committed = await repository.commitOperation(user.id, command);
-        const ack: OperationAck = {
-          ok: true,
-          duplicate: committed.duplicate,
+        deliverCommittedOperation({
           operation: committed.operation,
-        };
-        acknowledge(ack);
-        if (!committed.duplicate)
-          io.to(`board:${command.boardId}`).emit("operation:committed", committed.operation);
+          duplicate: committed.duplicate,
+          publish: (operation) =>
+            io.to(`board:${command.boardId}`).emit("operation:committed", operation),
+          acknowledge,
+          reportFailure: reportDeliveryFailure,
+        });
       } catch (error) {
         app.log.warn({ error, userId: user.id }, "operation rejected");
-        acknowledge(failedAck(error));
+        acknowledgeWithoutThrow(acknowledge, failedAck(error), reportDeliveryFailure);
       }
     });
   });
