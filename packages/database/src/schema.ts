@@ -10,6 +10,7 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 export const boards = pgTable("boards", {
   id: uuid("id").primaryKey(),
@@ -80,7 +81,7 @@ export const outboxEvents = pgTable(
   {
     id: uuid("id").primaryKey(),
     boardId: uuid("board_id").notNull(),
-    boardSeq: bigint("board_seq", { mode: "number" }).notNull(),
+    boardSeq: bigint("board_seq", { mode: "number" }),
     eventType: text("event_type").notNull(),
     payload: jsonb("payload").notNull(),
     attempts: integer("attempts").notNull().default(0),
@@ -88,7 +89,9 @@ export const outboxEvents = pgTable(
     publishedAt: timestamp("published_at", { withTimezone: true }),
   },
   (table) => [
-    uniqueIndex("outbox_board_seq_uq").on(table.boardId, table.boardSeq),
+    uniqueIndex("outbox_operation_board_seq_uq")
+      .on(table.boardId, table.boardSeq)
+      .where(sql`${table.eventType} = 'operation.committed'`),
     index("outbox_unpublished_idx").on(table.publishedAt, table.createdAt),
   ],
 );

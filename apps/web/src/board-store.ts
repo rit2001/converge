@@ -79,6 +79,7 @@ export interface BoardStore {
     pending: DurableCommand[],
   ): boolean;
   rebaseSession(token: BoardSessionToken, snapshot: BoardSnapshot): boolean;
+  revokeSession(token: BoardSessionToken, boardId: string, message: string): boolean;
   failSession(token: BoardSessionToken, message: string): void;
   endSession(token: BoardSessionToken): void;
   setConnection(token: BoardSessionToken, status: SynchronizationStatus): void;
@@ -282,6 +283,30 @@ export function createBoardStore(
           error: null,
         });
         scheduleHash(sessionToken, snapshot.id, committed);
+        return true;
+      },
+      revokeSession(sessionToken, revokedBoardId, error) {
+        if (!isCurrent(sessionToken, revokedBoardId)) return false;
+        set({
+          name: "Access revoked",
+          committed: emptyBoardState(),
+          buffered: {},
+          appliedOpIds: {},
+          appliedSeqOpIds: {},
+          objects: [],
+          selectedId: null,
+          connection: "authorization-failed",
+          synchronizationDiagnostics: {
+            ...get().synchronizationDiagnostics,
+            retryCode: "ACCESS_REVOKED",
+            retryScheduled: false,
+            retryDelayMs: null,
+            bufferedCount: 0,
+            bufferedBytes: 0,
+          },
+          authoritativeHash: idleHash(),
+          error,
+        });
         return true;
       },
       failSession(sessionToken, error) {

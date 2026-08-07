@@ -3,9 +3,15 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { Server, type DefaultEventsMap } from "socket.io";
 import { z } from "zod";
-import { BoardRepository, RepositoryError, type DatabasePool } from "@converge/database";
+import {
+  BoardRepository,
+  RepositoryError,
+  type BoardRepositoryHooks,
+  type DatabasePool,
+} from "@converge/database";
 import {
   MAX_SYNC_BATCH_SIZE,
+  boardAccessRevokedEventSchema,
   createBoardRequestSchema,
   durableCommandSchema,
   joinBoardAckSchema,
@@ -13,6 +19,9 @@ import {
   operationAckSchema,
   operationRangeQuerySchema,
   operationRangeResponseSchema,
+  removeBoardMemberParamsSchema,
+  removeBoardMemberRequestSchema,
+  removeBoardMemberResponseSchema,
   type ClientToServerEvents,
   type CommittedOperation,
   type OperationAck,
@@ -20,6 +29,7 @@ import {
   type ServerToClientEvents,
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
+import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
 import type { Environment } from "./env.js";
 
 function errorStatus(code: RepositoryError["code"]): number {
@@ -61,12 +71,19 @@ function socketAuthenticationError(error: AuthenticationError): Error {
 
 export interface AppContext {
   app: FastifyInstance;
-  io: Server<ClientToServerEvents, ServerToClientEvents, DefaultEventsMap, AuthenticatedSocketData>;
+  io: AppIo;
 }
 
 interface AuthenticatedSocketData {
   principal: AuthenticatedPrincipal;
 }
+
+type AppIo = Server<
+  ClientToServerEvents,
+  ServerToClientEvents,
+  DefaultEventsMap,
+  AuthenticatedSocketData
+>;
 
 type OperationDeliveryStage = "publish" | "acknowledge";
 
@@ -94,6 +111,17 @@ function acknowledgeWithoutThrow(
   }
 }
 
+function publishWithoutThrow(
+  publish: () => void,
+  reportFailure: (stage: OperationDeliveryStage, error: unknown) => void,
+): void {
+  try {
+    publish();
+  } catch (error) {
+    reportWithoutThrow(reportFailure, "publish", error);
+  }
+}
+
 export function deliverCommittedOperation(input: {
   operation: CommittedOperation;
   duplicate: boolean;
@@ -101,11 +129,7 @@ export function deliverCommittedOperation(input: {
   acknowledge: (ack: OperationAck) => void;
   reportFailure: (stage: OperationDeliveryStage, error: unknown) => void;
 }): void {
-  try {
-    input.publish(input.operation);
-  } catch (error) {
-    reportWithoutThrow(input.reportFailure, "publish", error);
-  }
+  publishWithoutThrow(() => input.publish(input.operation), input.reportFailure);
   acknowledgeWithoutThrow(
     input.acknowledge,
     { ok: true, duplicate: input.duplicate, operation: input.operation },
@@ -117,9 +141,20 @@ export interface SynchronizationHooks {
   afterRoomJoin?: (context: { boardId: string; userId: string; socketId: string }) => Promise<void>;
 }
 
+export interface DeliveryHooks {
+  afterOperationCommit?: (context: {
+    boardId: string;
+    operation: CommittedOperation;
+  }) => Promise<void>;
+  afterMembershipCommit?: (context: { boardId: string; revokedUserId: string }) => Promise<void>;
+}
+
 export interface BuildAppOptions {
   synchronizationBatchSize?: number;
   synchronizationHooks?: SynchronizationHooks;
+  deliveryCoordinator?: BoardDeliveryCoordinator;
+  deliveryHooks?: DeliveryHooks;
+  repositoryHooks?: BoardRepositoryHooks;
 }
 
 export async function buildApp(
@@ -131,7 +166,8 @@ export async function buildApp(
   const app = Fastify({ logger: { level: environment.LOG_LEVEL }, bodyLimit: 64 * 1024 });
   await app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
-  const repository = new BoardRepository(pool);
+  const repository = new BoardRepository(pool, options.repositoryHooks);
+  const deliveryCoordinator = options.deliveryCoordinator ?? new BoardDeliveryCoordinator();
   const synchronizationBatchSize = z
     .number()
     .int()
@@ -217,6 +253,64 @@ export async function buildApp(
     cors: { origin: environment.WEB_ORIGIN, credentials: true },
     maxHttpBufferSize: 64 * 1024,
   });
+
+  const boardRoom = (boardId: string): string => `board:${boardId}`;
+  const evictBoardMember = async (boardId: string, revokedUserId: string): Promise<void> => {
+    const event = boardAccessRevokedEventSchema.parse({
+      schemaVersion: 1,
+      boardId,
+      code: "ACCESS_REVOKED",
+      message: "Board access was revoked",
+    });
+    const room = boardRoom(boardId);
+    const targets = [...io.sockets.sockets.values()].filter(
+      (candidate) => candidate.data.principal.id === revokedUserId && candidate.rooms.has(room),
+    );
+    await Promise.all(
+      targets.map(async (target) => {
+        target.emit("board:access-revoked", event);
+        await target.leave(room);
+      }),
+    );
+  };
+
+  app.delete<{
+    Params: { boardId: string; userId: string };
+    Querystring: Record<string, unknown>;
+  }>("/v1/boards/:boardId/members/:userId", async (request, reply) => {
+    const user = await authenticateHttp(request);
+    const params = removeBoardMemberParamsSchema.parse(request.params);
+    removeBoardMemberRequestSchema.parse(request.query);
+    removeBoardMemberRequestSchema.parse(request.body ?? {});
+    try {
+      const result = await deliveryCoordinator.run(params.boardId, async () => {
+        const removed = await repository.removeBoardMember(user.id, params.boardId, params.userId);
+        try {
+          await options.deliveryHooks?.afterMembershipCommit?.({
+            boardId: params.boardId,
+            revokedUserId: params.userId,
+          });
+        } catch (error) {
+          app.log.warn({ error, boardId: params.boardId }, "membership delivery hook failed");
+        }
+        await evictBoardMember(params.boardId, params.userId);
+        return removed;
+      });
+      return reply.send(
+        removeBoardMemberResponseSchema.parse({
+          ok: true,
+          boardId: params.boardId,
+          userId: params.userId,
+          removed: result.removed,
+          eventId: result.event?.eventId ?? null,
+        }),
+      );
+    } catch (error) {
+      if (error instanceof RepositoryError)
+        return reply.code(errorStatus(error.code)).send(failedAck(error));
+      throw error;
+    }
+  });
   io.use((socket, next) => {
     void (async () => {
       try {
@@ -238,9 +332,11 @@ export async function buildApp(
     socket.on("board:join", async (raw, acknowledge) => {
       try {
         const request = joinBoardRequestSchema.parse(raw);
-        if (!(await repository.roleFor(request.boardId, user.id)))
-          throw new RepositoryError("FORBIDDEN", "Board membership required");
-        await socket.join(`board:${request.boardId}`);
+        await deliveryCoordinator.run(request.boardId, async () => {
+          if (!(await repository.roleFor(request.boardId, user.id)))
+            throw new RepositoryError("FORBIDDEN", "Board membership required");
+          await socket.join(boardRoom(request.boardId));
+        });
         await options.synchronizationHooks?.afterRoomJoin?.({
           boardId: request.boardId,
           userId: user.id,
@@ -309,15 +405,27 @@ export async function buildApp(
           return;
         }
         const command = durableCommandSchema.parse(raw);
-        const committed = await repository.commitOperation(user.id, command);
-        deliverCommittedOperation({
-          operation: committed.operation,
-          duplicate: committed.duplicate,
-          publish: (operation) =>
-            io.to(`board:${command.boardId}`).emit("operation:committed", operation),
-          acknowledge,
-          reportFailure: reportDeliveryFailure,
+        const committed = await deliveryCoordinator.run(command.boardId, async () => {
+          const result = await repository.commitOperation(user.id, command);
+          try {
+            await options.deliveryHooks?.afterOperationCommit?.({
+              boardId: command.boardId,
+              operation: result.operation,
+            });
+          } catch (error) {
+            app.log.warn({ error, boardId: command.boardId }, "operation delivery hook failed");
+          }
+          publishWithoutThrow(
+            () => io.to(boardRoom(command.boardId)).emit("operation:committed", result.operation),
+            reportDeliveryFailure,
+          );
+          return result;
         });
+        acknowledgeWithoutThrow(
+          acknowledge,
+          { ok: true, duplicate: committed.duplicate, operation: committed.operation },
+          reportDeliveryFailure,
+        );
       } catch (error) {
         app.log.warn({ error, userId: user.id }, "operation rejected");
         acknowledgeWithoutThrow(acknowledge, failedAck(error), reportDeliveryFailure);

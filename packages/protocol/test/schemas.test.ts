@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  boardAccessRevokedEventSchema,
   boardSnapshotSchema,
   createBoardRequestSchema,
   durableCommandSchema,
@@ -9,6 +10,10 @@ import {
   operationRangeQuerySchema,
   operationRangeResponseSchema,
   protocolErrorSchema,
+  membershipRevocationOutboxPayloadSchema,
+  removeBoardMemberParamsSchema,
+  removeBoardMemberRequestSchema,
+  removeBoardMemberResponseSchema,
   SCHEMA_VERSION,
 } from "../src/index.js";
 
@@ -117,6 +122,49 @@ describe("protocol schemas", () => {
     const snapshot = { id: command.boardId, name: "Board", lastSeq: 0, objects: [] };
     expect(boardSnapshotSchema.parse(snapshot)).toEqual(snapshot);
     expect(boardSnapshotSchema.safeParse({ ...snapshot, surprise: true }).success).toBe(false);
+  });
+
+  it("validates strict membership-removal and revocation-control schemas", () => {
+    const params = { boardId: command.boardId, userId: command.clientId };
+    expect(removeBoardMemberParamsSchema.parse(params)).toEqual(params);
+    expect(removeBoardMemberParamsSchema.safeParse({ ...params, surprise: true }).success).toBe(
+      false,
+    );
+    expect(removeBoardMemberRequestSchema.safeParse({ surprise: true }).success).toBe(false);
+    expect(
+      removeBoardMemberResponseSchema.parse({
+        ok: true,
+        ...params,
+        removed: true,
+        eventId: command.opId,
+      }),
+    ).toMatchObject({ removed: true, eventId: command.opId });
+    const revoked = {
+      schemaVersion: SCHEMA_VERSION,
+      boardId: command.boardId,
+      code: "ACCESS_REVOKED",
+      message: "Board access was revoked",
+    };
+    expect(boardAccessRevokedEventSchema.parse(revoked)).toEqual(revoked);
+    expect(boardAccessRevokedEventSchema.safeParse({ ...revoked, surprise: true }).success).toBe(
+      false,
+    );
+  });
+
+  it("validates the typed membership-revocation outbox payload", () => {
+    const payload = {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.opId,
+      kind: "board.membership.revoked",
+      boardId: command.boardId,
+      revokedUserId: command.clientId,
+      initiatedByUserId: command.targetId,
+      committedAt: "2026-08-07T12:00:01.000Z",
+    };
+    expect(membershipRevocationOutboxPayloadSchema.parse(payload)).toEqual(payload);
+    expect(
+      membershipRevocationOutboxPayloadSchema.safeParse({ ...payload, boardContent: {} }).success,
+    ).toBe(false);
   });
 
   it("validates strict join acknowledgements and synchronization errors", () => {

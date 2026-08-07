@@ -85,6 +85,37 @@ sequence-labelled hash matching the canonical authoritative HTTP snapshot.
 The database still does not persist a trustworthy hash for each historical sequence, so the client
 cannot verify a server-issued hash specifically at the join watermark.
 
+## Membership revocation
+
+The supported runtime removal path is the owner-authenticated
+`DELETE /v1/boards/:boardId/members/:userId` operation. Under the same board advisory-lock family used
+for ordered canvas writes, its transaction reauthorizes the owner, protects the board owner, removes
+the target membership, and atomically records a typed `board.membership.revoked` outbox event. Removal
+of an already-absent non-owner is deliberately idempotent and returns `removed: false`; it still
+performs local eviction so a residual socket cannot retain access. Membership changes do not advance
+the canvas `last_seq`.
+
+On the current single API instance, a keyed board-delivery coordinator encloses each canvas commit
+through local publication and each membership-removal commit through targeted room eviction. Thus an
+operation that owns the board coordinator first may publish before revocation, while a revocation
+that owns it first commits deletion and evicts every matching principal socket from that board room
+before a later operation can publish. Unrelated boards proceed independently, acknowledgement
+delivery remains outside the coordinator, and the PostgreSQL advisory lock remains the durable
+sequencing authority. A failed coordinated task releases its board queue, and inactive queue keys are
+discarded.
+
+Each affected socket receives a strict, content-free `board:access-revoked` event before leaving only
+the revoked board room. The matching client session immediately enters terminal authorization
+failure, cancels synchronization and command-retry work, clears transient live state, hides the board
+projection, and preserves durable IndexedDB pending commands. Events for stale session generations or
+other boards are ignored.
+
+Direct administrative SQL changes are outside this application-owned control path and require
+explicit session invalidation or API restart. This slice guarantees ordered revocation only for
+sockets on one API instance. Milestone 2 will dispatch the durable revocation outbox event, publish it
+through the shared control plane, and have every API instance evict its matching local sockets; no
+distributed or instantaneous cross-instance revocation is claimed here.
+
 Authoritative snapshot reload cannot recover arbitrary server data loss, and preserved pending
 commands retain their original base sequences and idempotency identities; a command that remains
 incompatible is handled by the existing structured submission response rather than silently rewritten.

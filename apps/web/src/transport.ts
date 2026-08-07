@@ -1,5 +1,6 @@
 import { io, type Socket } from "socket.io-client";
 import {
+  boardAccessRevokedEventSchema,
   boardSnapshotSchema,
   committedOperationSchema,
   joinBoardAckSchema,
@@ -98,6 +99,7 @@ export class BoardTransport {
   private retryTimer: unknown = null;
   private synchronizationFailures = 0;
   private ready = false;
+  private terminal = false;
   private readonly liveBuffer = new Map<number, BufferedLiveOperation>();
   private readonly liveBufferOpSequences = new Map<string, number>();
   private liveBufferBytes = 0;
@@ -175,9 +177,10 @@ export class BoardTransport {
       this.cancelRetry();
       this.invalidateAttempt();
       this.clearLiveBuffer();
-      useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
+      if (!this.terminal) useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
     });
     socket.on("operation:committed", (raw: unknown) => this.receiveLive(socket, raw));
+    socket.on("board:access-revoked", (raw: unknown) => this.receiveAccessRevoked(socket, raw));
     socket.io.on("reconnect_attempt", () =>
       useBoardStore.getState().setConnection(this.sessionToken, "connecting"),
     );
@@ -202,7 +205,7 @@ export class BoardTransport {
     this.clearLiveBuffer();
     this.socket?.disconnect();
     this.socket = null;
-    useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
+    if (!this.terminal) useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
   }
 
   private beginSynchronization(socket: BoardSocket): void {
@@ -517,6 +520,42 @@ export class BoardTransport {
     }
   }
 
+  private receiveAccessRevoked(socket: BoardSocket, raw: unknown): void {
+    if (!this.isSessionActive() || socket !== this.socket) return;
+    const parsed = boardAccessRevokedEventSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.stopTransport(socket, () =>
+        useBoardStore
+          .getState()
+          .setSynchronizationError(
+            this.sessionToken,
+            "INVALID_COMMAND: Invalid board-access-revoked event",
+          ),
+      );
+      return;
+    }
+    if (parsed.data.boardId !== this.boardId) return;
+    this.stopTransport(socket, () =>
+      useBoardStore
+        .getState()
+        .revokeSession(this.sessionToken, this.boardId, "ACCESS_REVOKED: Board access was revoked"),
+    );
+  }
+
+  private stopTransport(socket: BoardSocket, updateState: () => void): void {
+    if (socket !== this.socket || this.terminal) return;
+    this.ready = false;
+    this.pendingQueue.cancel();
+    this.cancelRetry();
+    this.invalidateAttempt();
+    this.clearLiveBuffer();
+    this.connectionGeneration += 1;
+    this.terminal = true;
+    updateState();
+    socket.disconnect();
+    this.socket = null;
+  }
+
   private bufferLive(socket: BoardSocket, operation: CommittedOperation): void {
     const serialized = JSON.stringify(operation);
     const bytes = new TextEncoder().encode(serialized).byteLength;
@@ -717,7 +756,9 @@ export class BoardTransport {
   }
 
   private isSessionActive(): boolean {
-    return useBoardStore.getState().isCurrentSession(this.sessionToken, this.boardId);
+    return (
+      !this.terminal && useBoardStore.getState().isCurrentSession(this.sessionToken, this.boardId)
+    );
   }
 
   private createSubmissionAttempt(command: DurableCommand): SubmissionAttempt {

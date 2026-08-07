@@ -148,6 +148,8 @@ export const errorCodeSchema = z.enum([
   "CONFLICT",
   "IDEMPOTENCY_CONFLICT",
   "RESYNC_REQUIRED",
+  "CANNOT_REMOVE_OWNER",
+  "ACCESS_REVOKED",
   "INTERNAL_ERROR",
 ]);
 
@@ -177,6 +179,46 @@ export const boardSnapshotSchema = z
   .strict();
 export const createBoardRequestSchema = z
   .object({ name: z.string().trim().min(1).max(120) })
+  .strict();
+
+export const removeBoardMemberParamsSchema = z
+  .object({
+    boardId: idSchema,
+    userId: idSchema,
+  })
+  .strict();
+
+export const removeBoardMemberRequestSchema = z.object({}).strict();
+
+export const removeBoardMemberResponseSchema = z
+  .object({
+    ok: z.literal(true),
+    boardId: idSchema,
+    userId: idSchema,
+    removed: z.boolean(),
+    eventId: idSchema.nullable(),
+  })
+  .strict();
+
+export const boardAccessRevokedEventSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    code: z.literal("ACCESS_REVOKED"),
+    message: z.string().min(1).max(200),
+  })
+  .strict();
+
+export const membershipRevocationOutboxPayloadSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    eventId: idSchema,
+    kind: z.literal("board.membership.revoked"),
+    boardId: idSchema,
+    revokedUserId: idSchema,
+    initiatedByUserId: idSchema,
+    committedAt: z.string().datetime({ offset: true }),
+  })
   .strict();
 export const joinBoardRequestSchema = z
   .object({
@@ -257,6 +299,12 @@ export type JoinBoardRequest = z.infer<typeof joinBoardRequestSchema>;
 export type JoinBoardAck = z.infer<typeof joinBoardAckSchema>;
 export type OperationRangeQuery = z.infer<typeof operationRangeQuerySchema>;
 export type OperationRangeResponse = z.infer<typeof operationRangeResponseSchema>;
+export type RemoveBoardMemberParams = z.infer<typeof removeBoardMemberParamsSchema>;
+export type RemoveBoardMemberResponse = z.infer<typeof removeBoardMemberResponseSchema>;
+export type BoardAccessRevokedEvent = z.infer<typeof boardAccessRevokedEventSchema>;
+export type MembershipRevocationOutboxPayload = z.infer<
+  typeof membershipRevocationOutboxPayloadSchema
+>;
 
 export interface ClientToServerEvents {
   "board:join": (request: JoinBoardRequest, acknowledge: (ack: JoinBoardAck) => void) => void;
@@ -264,4 +312,5 @@ export interface ClientToServerEvents {
 }
 export interface ServerToClientEvents {
   "operation:committed": (operation: CommittedOperation) => void;
+  "board:access-revoked": (event: BoardAccessRevokedEvent) => void;
 }

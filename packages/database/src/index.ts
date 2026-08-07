@@ -9,9 +9,11 @@ import {
   canvasObjectSchema,
   committedOperationSchema,
   durableCommandSchema,
+  membershipRevocationOutboxPayloadSchema,
   type BoardSnapshot,
   type CommittedOperation,
   type DurableCommand,
+  type MembershipRevocationOutboxPayload,
   type OperationRangeResponse,
 } from "@converge/protocol";
 
@@ -25,7 +27,8 @@ export class RepositoryError extends Error {
       | "TARGET_DELETED"
       | "CONFLICT"
       | "IDEMPOTENCY_CONFLICT"
-      | "RESYNC_REQUIRED",
+      | "RESYNC_REQUIRED"
+      | "CANNOT_REMOVE_OWNER",
     message: string,
   ) {
     super(message);
@@ -35,6 +38,16 @@ export class RepositoryError extends Error {
 export interface BoardRepositoryHooks {
   beforeSequenceLock?: (command: DurableCommand) => Promise<void>;
   afterSequenceLock?: (command: DurableCommand) => Promise<void>;
+  afterMembershipDelete?: (context: {
+    boardId: string;
+    actorId: string;
+    targetUserId: string;
+  }) => Promise<void>;
+}
+
+export interface RemoveBoardMemberResult {
+  removed: boolean;
+  event: MembershipRevocationOutboxPayload | null;
 }
 
 export function createPool(databaseUrl: string): pg.Pool {
@@ -185,6 +198,69 @@ export class BoardRepository {
       nextSeq,
       hasMore: nextSeq < watermark,
     };
+  }
+
+  async removeBoardMember(
+    actorId: string,
+    boardId: string,
+    targetUserId: string,
+  ): Promise<RemoveBoardMemberResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
+      const board = await client.query<{ created_by: string; actor_role: string | null }>(
+        `SELECT b.created_by, m.role AS actor_role
+         FROM boards b
+         LEFT JOIN board_members m ON m.board_id = b.id AND m.user_id = $2
+         WHERE b.id = $1
+         FOR UPDATE OF b`,
+        [boardId, actorId],
+      );
+      const boardRow = board.rows[0];
+      if (!boardRow || boardRow.actor_role !== "owner")
+        throw new RepositoryError("FORBIDDEN", "Board owner permission required");
+      const target = await client.query<{ role: string }>(
+        "SELECT role FROM board_members WHERE board_id = $1 AND user_id = $2 FOR UPDATE",
+        [boardId, targetUserId],
+      );
+      const targetRole = target.rows[0]?.role;
+      if (targetUserId === boardRow.created_by || targetRole === "owner")
+        throw new RepositoryError("CANNOT_REMOVE_OWNER", "The board owner cannot be removed");
+      if (targetRole === undefined) {
+        await client.query("COMMIT");
+        return { removed: false, event: null };
+      }
+
+      await client.query("DELETE FROM board_members WHERE board_id = $1 AND user_id = $2", [
+        boardId,
+        targetUserId,
+      ]);
+      await this.hooks.afterMembershipDelete?.({ boardId, actorId, targetUserId });
+      const eventId = crypto.randomUUID();
+      const committedAt = new Date().toISOString();
+      const event = membershipRevocationOutboxPayloadSchema.parse({
+        schemaVersion: 1,
+        eventId,
+        kind: "board.membership.revoked",
+        boardId,
+        revokedUserId: targetUserId,
+        initiatedByUserId: actorId,
+        committedAt,
+      });
+      await client.query(
+        `INSERT INTO outbox_events(id, board_id, board_seq, event_type, payload, created_at)
+         VALUES ($1, $2, NULL, 'board.membership.revoked', $3, $4)`,
+        [eventId, boardId, event, committedAt],
+      );
+      await client.query("COMMIT");
+      return { removed: true, event };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async commitOperation(

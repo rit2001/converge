@@ -144,6 +144,10 @@ class FakeSocket {
     this.dispatch("operation:committed", value);
   }
 
+  revoke(value: unknown): void {
+    this.dispatch("board:access-revoked", value);
+  }
+
   disconnect(): this {
     if (this.connected) this.serverDisconnect();
     return this;
@@ -549,5 +553,67 @@ describe("authoritative resynchronization and pending interaction", () => {
     succeedJoin(test.socket, 1, 0);
     await settle();
     expect(test.socket.submissions).toEqual([first]);
+  });
+});
+
+describe("board access revocation", () => {
+  const event = {
+    schemaVersion: 1 as const,
+    boardId,
+    code: "ACCESS_REVOKED" as const,
+    message: "Board access was revoked",
+  };
+
+  it("terminates the matching session, preserves pending work, and rejects stale restoration", async () => {
+    const item = pending(1);
+    const test = harness({ initialPending: [item] });
+    test.socket.deliver(operation(2));
+    expect(useBoardStore.getState().synchronizationDiagnostics.bufferedCount).toBe(1);
+    test.socket.revoke(event);
+    expect(test.socket.connected).toBe(false);
+    expect(test.scheduler.tasks.size).toBe(0);
+    expect(useBoardStore.getState()).toMatchObject({
+      boardId,
+      connection: "authorization-failed",
+      committed: { lastSeq: 0 },
+      pending: [{ opId: item.opId }],
+      objects: [],
+      synchronizationDiagnostics: {
+        retryCode: "ACCESS_REVOKED",
+        retryScheduled: false,
+        bufferedCount: 0,
+        bufferedBytes: 0,
+      },
+      error: "ACCESS_REVOKED: Board access was revoked",
+    });
+    succeedJoin(test.socket, 0, 2);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "authorization-failed",
+      committed: { lastSeq: 0 },
+    });
+    expect(test.socket.submissions).toHaveLength(0);
+  });
+
+  it("ignores a different board or obsolete session and rejects malformed active events", () => {
+    const current = harness();
+    current.socket.revoke({ ...event, boardId: uuid("1", 99) });
+    expect(current.socket.connected).toBe(true);
+    expect(useBoardStore.getState().connection).toBe("joining");
+
+    const obsolete = current;
+    const replacement = harness();
+    obsolete.socket.revoke(event);
+    expect(useBoardStore.getState()).toMatchObject({
+      sessionToken: replacement.token,
+      connection: "joining",
+    });
+
+    replacement.socket.revoke({ ...event, surprise: true });
+    expect(replacement.socket.connected).toBe(false);
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "error",
+      error: "INVALID_COMMAND: Invalid board-access-revoked event",
+    });
   });
 });
