@@ -140,6 +140,14 @@ class FakeSocket {
     this.dispatch("disconnect", "transport close");
   }
 
+  reconnectAttempt(): void {
+    this.dispatch("io:reconnect_attempt");
+  }
+
+  reconnectFailed(): void {
+    this.dispatch("io:reconnect_failed");
+  }
+
   deliver(value: unknown): void {
     this.dispatch("operation:committed", value);
   }
@@ -379,6 +387,132 @@ describe("self-healing synchronization", () => {
       connection: "ready",
       committed: { lastSeq: 0 },
     });
+  });
+});
+
+describe("terminal synchronization failures", () => {
+  it("fences a non-retryable authentication failure through disconnect and reconnect", async () => {
+    const item = pending(1);
+    let rangeRequests = 0;
+    let snapshotLoads = 0;
+    const test = harness({
+      initialPending: [item],
+      fetcher: () => {
+        rangeRequests += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              ok: false,
+              code: "AUTHENTICATION_REQUIRED",
+              message: "Authentication required",
+              retryable: false,
+            }),
+            { status: 401, headers: { "content-type": "application/json" } },
+          ),
+        );
+      },
+      loadSnapshot: () => {
+        snapshotLoads += 1;
+        return Promise.resolve(snapshot());
+      },
+    });
+    succeedJoin(test.socket, 0, 1);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "authorization-failed",
+      pending: [{ opId: item.opId }],
+      synchronizationDiagnostics: {
+        retryCode: "AUTHENTICATION_REQUIRED",
+        retryScheduled: false,
+      },
+    });
+    expect(test.persistence.rows.has(item.opId)).toBe(true);
+    expect(test.scheduler.tasks.size).toBe(0);
+    expect(test.socket.connected).toBe(false);
+    expect(test.socket.joins).toHaveLength(1);
+    expect(test.socket.joins[0]?.request).toBeDefined();
+    expect({ rangeRequests, snapshotLoads, submissions: test.socket.submissions.length }).toEqual({
+      rangeRequests: 1,
+      snapshotLoads: 0,
+      submissions: 0,
+    });
+
+    test.socket.reconnectAttempt();
+    test.socket.reconnectFailed();
+    test.socket.serverDisconnect();
+    test.socket.serverConnect();
+    test.socket.deliver(operation(1));
+    expect(await test.transport.submit(pending(2))).toBe(false);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "authorization-failed",
+      committed: { lastSeq: 0 },
+      pending: [{ opId: item.opId }],
+      synchronizationDiagnostics: { retryCode: "AUTHENTICATION_REQUIRED" },
+    });
+    expect(test.persistence.rows.has(item.opId)).toBe(true);
+    expect(test.socket.joins).toHaveLength(1);
+    expect({ rangeRequests, snapshotLoads, submissions: test.socket.submissions.length }).toEqual({
+      rangeRequests: 1,
+      snapshotLoads: 0,
+      submissions: 0,
+    });
+  });
+
+  it("fences protocol-integrity failures and allows a replacement transport", async () => {
+    let rangeRequests = 0;
+    let snapshotLoads = 0;
+    const failed = harness({
+      fetcher: () => {
+        rangeRequests += 1;
+        return Promise.resolve(response(0, 0, []));
+      },
+      loadSnapshot: () => {
+        snapshotLoads += 1;
+        return Promise.resolve(snapshot());
+      },
+    });
+    failed.socket.deliver({ malformed: true });
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "error",
+      error: "INVALID_COMMAND: Invalid live operation",
+      synchronizationDiagnostics: {
+        retryCode: "INVALID_COMMAND",
+        retryScheduled: false,
+      },
+    });
+    expect(failed.socket.connected).toBe(false);
+
+    succeedJoin(failed.socket, 0, 9);
+    failed.socket.reconnectAttempt();
+    failed.socket.reconnectFailed();
+    failed.socket.serverConnect();
+    failed.socket.deliver(operation(1));
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "error",
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: { retryCode: "INVALID_COMMAND" },
+    });
+    expect(failed.socket.joins).toHaveLength(1);
+    expect({ rangeRequests, snapshotLoads, submissions: failed.socket.submissions.length }).toEqual(
+      {
+        rangeRequests: 0,
+        snapshotLoads: 0,
+        submissions: 0,
+      },
+    );
+
+    const replacement = harness();
+    succeedJoin(replacement.socket, 0, 0);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      sessionToken: replacement.token,
+      connection: "ready",
+      committed: { lastSeq: 0 },
+    });
+    expect(replacement.socket.joins).toHaveLength(1);
   });
 });
 

@@ -165,12 +165,14 @@ export class BoardTransport {
     const socket = this.socketFactory(this.apiUrl);
     this.socket = socket;
     socket.on("connect", () => {
+      if (!this.isSessionActive() || socket !== this.socket) return;
       this.connectionGeneration += 1;
       this.cancelRetry();
       this.invalidateAttempt();
       this.beginSynchronization(socket);
     });
     socket.on("disconnect", () => {
+      if (this.terminal || socket !== this.socket) return;
       this.ready = false;
       this.pendingQueue.setReady(false);
       this.connectionGeneration += 1;
@@ -181,14 +183,16 @@ export class BoardTransport {
     });
     socket.on("operation:committed", (raw: unknown) => this.receiveLive(socket, raw));
     socket.on("board:access-revoked", (raw: unknown) => this.receiveAccessRevoked(socket, raw));
-    socket.io.on("reconnect_attempt", () =>
-      useBoardStore.getState().setConnection(this.sessionToken, "connecting"),
-    );
-    socket.io.on("reconnect_failed", () =>
+    socket.io.on("reconnect_attempt", () => {
+      if (!this.isSessionActive() || socket !== this.socket) return;
+      useBoardStore.getState().setConnection(this.sessionToken, "connecting");
+    });
+    socket.io.on("reconnect_failed", () => {
+      if (!this.isSessionActive() || socket !== this.socket) return;
       useBoardStore
         .getState()
-        .setSynchronizationError(this.sessionToken, "Socket reconnection failed"),
-    );
+        .setSynchronizationError(this.sessionToken, "Socket reconnection failed");
+    });
     if (!socket.connected) socket.connect();
   }
 
@@ -634,7 +638,7 @@ export class BoardTransport {
     this.ready = false;
     this.pendingQueue.setReady(false);
     if (failure.retryable) this.scheduleRetry(socket, failure);
-    else this.setTerminalFailure(failure);
+    else this.setTerminalFailure(socket, failure);
   }
 
   private failAttempt(
@@ -647,7 +651,7 @@ export class BoardTransport {
     this.ready = false;
     this.pendingQueue.setReady(false);
     if (failure.retryable) this.scheduleRetry(socket, failure);
-    else this.setTerminalFailure(failure);
+    else this.setTerminalFailure(socket, failure);
   }
 
   private scheduleRetry(socket: BoardSocket, failure: SynchronizationError): void {
@@ -682,21 +686,21 @@ export class BoardTransport {
     }, delay);
   }
 
-  private setTerminalFailure(failure: SynchronizationError): void {
-    this.cancelRetry();
-    this.clearLiveBuffer();
+  private setTerminalFailure(socket: BoardSocket, failure: SynchronizationError): void {
     const authorizationFailed = terminalAuthorizationCodes.has(failure.code);
-    useBoardStore
-      .getState()
-      .setSynchronizationError(
-        this.sessionToken,
-        `${failure.code}: ${failure.message}`,
-        authorizationFailed,
-      );
-    this.updateDiagnostics({
-      retryCode: failure.code,
-      retryScheduled: false,
-      retryDelayMs: null,
+    this.stopTransport(socket, () => {
+      useBoardStore
+        .getState()
+        .setSynchronizationError(
+          this.sessionToken,
+          `${failure.code}: ${failure.message}`,
+          authorizationFailed,
+        );
+      this.updateDiagnostics({
+        retryCode: failure.code,
+        retryScheduled: false,
+        retryDelayMs: null,
+      });
     });
   }
 
