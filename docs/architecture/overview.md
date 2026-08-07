@@ -36,9 +36,21 @@ no known gap remains; a raw Socket.IO connection is not readiness.
 
 Optimistic pending commands remain intact across synchronization and are resubmitted with their
 original `opId` only after `READY`, preserving repository idempotency. Canonical serialization still
-provides a current-state diagnostic hash, but the database does not yet persist a trustworthy hash for
-each historical sequence, so the client cannot verify a server-issued hash specifically at the join
-watermark.
+provides a diagnostic hash of authoritative committed state. Each hash is labelled with its board,
+board-session generation, and committed sequence; an asynchronous result is published only while all
+three still match. Optimistic pending overlays remain visible on the canvas but do not change or
+relabel the authoritative hash.
+
+Each Workspace startup owns an opaque board-session generation, cancellation controller, and local
+transport. Snapshot and pending-command continuations recheck generation ownership before every
+store mutation or transport side effect. Supersession and cleanup abort fetches and disconnect only
+that generation's transport, while store and transport callbacks ignore obsolete tokens. This also
+keeps React Strict Mode cleanup/remount cycles from leaving an orphan socket. Browser convergence
+tests require `READY`, the expected board and sequence, the expected committed objects, and a
+sequence-labelled hash matching the canonical authoritative HTTP snapshot.
+
+The database still does not persist a trustworthy hash for each historical sequence, so the client
+cannot verify a server-issued hash specifically at the join watermark.
 
 This closes initial-load and temporary-disconnection gaps for the single API instance. Milestone 2
 still owns crash-window outbox delivery, Redis multi-instance fan-out, snapshots, compaction, and

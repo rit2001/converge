@@ -15,6 +15,7 @@ import type {
   DurableCommand,
   OperationAck,
 } from "@converge/protocol";
+import type { BoardSessionToken } from "./board-session";
 import { removePending, savePending } from "./pending-db";
 
 export type SynchronizationStatus =
@@ -26,8 +27,25 @@ export type SynchronizationStatus =
   | "authorization-failed"
   | "error";
 export type IngestResult = "applied" | "buffered" | "duplicate" | "conflict";
+export type AuthoritativeHash =
+  | {
+      status: "idle";
+      boardId: null;
+      sessionGeneration: null;
+      seq: null;
+      value: null;
+    }
+  | {
+      status: "pending" | "ready" | "error";
+      boardId: string;
+      sessionGeneration: number;
+      seq: number;
+      value: string | null;
+    };
 
-interface BoardStore {
+export interface BoardStore {
+  sessionToken: BoardSessionToken | null;
+  sessionGeneration: number | null;
   boardId: string | null;
   name: string;
   committed: BoardState;
@@ -38,15 +56,28 @@ interface BoardStore {
   objects: CanvasObject[];
   selectedId: string | null;
   connection: SynchronizationStatus;
-  hash: string;
+  authoritativeHash: AuthoritativeHash;
   error: string | null;
-  initialize(snapshot: BoardSnapshot, pending: DurableCommand[]): void;
-  setConnection(status: SynchronizationStatus): void;
-  setSynchronizationError(message: string, authorizationFailed?: boolean): void;
+  beginSession(token: BoardSessionToken, boardId: string | null): void;
+  bindSessionBoard(token: BoardSessionToken, boardId: string): boolean;
+  isCurrentSession(token: BoardSessionToken, boardId?: string): boolean;
+  initializeSession(
+    token: BoardSessionToken,
+    snapshot: BoardSnapshot,
+    pending: DurableCommand[],
+  ): boolean;
+  failSession(token: BoardSessionToken, message: string): void;
+  endSession(token: BoardSessionToken): void;
+  setConnection(token: BoardSessionToken, status: SynchronizationStatus): void;
+  setSynchronizationError(
+    token: BoardSessionToken,
+    message: string,
+    authorizationFailed?: boolean,
+  ): void;
   select(id: string | null): void;
   enqueue(command: DurableCommand): void;
-  acknowledge(opId: string, ack: OperationAck): void;
-  ingest(operation: CommittedOperation): IngestResult;
+  acknowledge(token: BoardSessionToken, opId: string, ack: OperationAck): void;
+  ingest(token: BoardSessionToken, operation: CommittedOperation): IngestResult | "stale";
 }
 
 function stateFromSnapshot(snapshot: BoardSnapshot): BoardState {
@@ -70,120 +101,263 @@ function derive(committed: BoardState, pending: DurableCommand[]): CanvasObject[
   return visibleObjects(optimisticState(committed, pending));
 }
 
-function scheduleHash(state: BoardState): void {
-  void hashBoardState(state).then((hash) => useBoardStore.setState({ hash }));
-}
-
-export const useBoardStore = create<BoardStore>((set, get) => ({
+const idleHash = (): AuthoritativeHash => ({
+  status: "idle",
   boardId: null,
-  name: "Untitled board",
-  committed: emptyBoardState(),
-  pending: [],
-  buffered: {},
-  appliedOpIds: {},
-  appliedSeqOpIds: {},
-  objects: [],
-  selectedId: null,
-  connection: "disconnected",
-  hash: "calculating…",
-  error: null,
-  initialize(snapshot, pending) {
-    const committed = stateFromSnapshot(snapshot);
-    set({
-      boardId: snapshot.id,
-      name: snapshot.name,
-      committed,
-      pending,
-      objects: derive(committed, pending),
+  sessionGeneration: null,
+  seq: null,
+  value: null,
+});
+
+export function createBoardStore(
+  calculateHash: (state: BoardState) => Promise<string> = hashBoardState,
+) {
+  const store = create<BoardStore>((set, get) => {
+    const isCurrent = (token: BoardSessionToken, boardId?: string): boolean => {
+      const current = get();
+      return (
+        current.sessionToken === token && (boardId === undefined || current.boardId === boardId)
+      );
+    };
+    const scheduleHash = (token: BoardSessionToken, boardId: string, state: BoardState): void => {
+      const seq = state.lastSeq;
+      const sessionGeneration = token.generation;
+      void calculateHash(state)
+        .then((value) => {
+          const current = get();
+          if (
+            current.sessionToken !== token ||
+            current.boardId !== boardId ||
+            current.committed.lastSeq !== seq
+          )
+            return;
+          set({
+            authoritativeHash: {
+              status: "ready",
+              boardId,
+              sessionGeneration,
+              seq,
+              value,
+            },
+          });
+        })
+        .catch(() => {
+          const current = get();
+          if (
+            current.sessionToken !== token ||
+            current.boardId !== boardId ||
+            current.committed.lastSeq !== seq
+          )
+            return;
+          set({
+            authoritativeHash: {
+              status: "error",
+              boardId,
+              sessionGeneration,
+              seq,
+              value: null,
+            },
+          });
+        });
+    };
+
+    return {
+      sessionToken: null,
+      sessionGeneration: null,
+      boardId: null,
+      name: "Untitled board",
+      committed: emptyBoardState(),
+      pending: [],
       buffered: {},
       appliedOpIds: {},
       appliedSeqOpIds: {},
+      objects: [],
+      selectedId: null,
+      connection: "disconnected",
+      authoritativeHash: idleHash(),
       error: null,
-    });
-    scheduleHash(committed);
-  },
-  setConnection(connection) {
-    set({ connection });
-  },
-  setSynchronizationError(error, authorizationFailed = false) {
-    set({
-      connection: authorizationFailed ? "authorization-failed" : "error",
-      error,
-    });
-  },
-  select(selectedId) {
-    set({ selectedId });
-  },
-  enqueue(command) {
-    const pending = [...get().pending, command];
-    set({ pending, objects: derive(get().committed, pending), error: null });
-    void savePending(command);
-  },
-  acknowledge(opId, ack) {
-    if (ack.ok) {
-      const pending = get().pending.filter((command) => command.opId !== opId);
-      set({ pending, objects: derive(get().committed, pending) });
-      void removePending(opId);
-      get().ingest(ack.operation);
-    } else if (!ack.retryable) {
-      const pending = get().pending.filter((command) => command.opId !== opId);
-      set({
-        pending,
-        objects: derive(get().committed, pending),
-        error: `${ack.code}: ${ack.message}`,
-      });
-      void removePending(opId);
-    } else set({ error: `${ack.code}: ${ack.message}` });
-  },
-  ingest(operation) {
-    const current = get();
-    const appliedOpId = current.appliedSeqOpIds[operation.seq];
-    if (appliedOpId !== undefined && appliedOpId !== operation.opId) {
-      set({ error: "Conflicting operations share an applied sequence", connection: "error" });
-      return "conflict";
-    }
-    const appliedSeq = current.appliedOpIds[operation.opId];
-    if (appliedSeq !== undefined) {
-      if (appliedSeq !== operation.seq) {
-        set({ error: "Conflicting sequence for committed operation", connection: "error" });
-        return "conflict";
-      }
-      return "duplicate";
-    }
-    if (operation.seq <= current.committed.lastSeq) return "duplicate";
-    const existing = current.buffered[operation.seq];
-    if (existing) {
-      if (existing.opId === operation.opId) return "duplicate";
-      set({ error: "Conflicting operations share a sequence", connection: "error" });
-      return "conflict";
-    }
+      beginSession(sessionToken, boardId) {
+        set({
+          sessionToken,
+          sessionGeneration: sessionToken.generation,
+          boardId,
+          name: "Untitled board",
+          committed: emptyBoardState(),
+          pending: [],
+          buffered: {},
+          appliedOpIds: {},
+          appliedSeqOpIds: {},
+          objects: [],
+          selectedId: null,
+          connection: "connecting",
+          authoritativeHash: idleHash(),
+          error: null,
+        });
+      },
+      bindSessionBoard(sessionToken, boardId) {
+        if (!isCurrent(sessionToken)) return false;
+        set({ boardId });
+        return true;
+      },
+      isCurrentSession: isCurrent,
+      initializeSession(sessionToken, snapshot, pending) {
+        if (!isCurrent(sessionToken, snapshot.id)) return false;
+        if (pending.some((command) => command.boardId !== snapshot.id)) return false;
+        const committed = stateFromSnapshot(snapshot);
+        set({
+          name: snapshot.name,
+          committed,
+          pending,
+          objects: derive(committed, pending),
+          buffered: {},
+          appliedOpIds: {},
+          appliedSeqOpIds: {},
+          authoritativeHash: {
+            status: "pending",
+            boardId: snapshot.id,
+            sessionGeneration: sessionToken.generation,
+            seq: committed.lastSeq,
+            value: null,
+          },
+          error: null,
+        });
+        scheduleHash(sessionToken, snapshot.id, committed);
+        return true;
+      },
+      failSession(sessionToken, error) {
+        if (!isCurrent(sessionToken)) return;
+        set({ connection: "error", error });
+      },
+      endSession(sessionToken) {
+        if (!isCurrent(sessionToken)) return;
+        set({
+          sessionToken: null,
+          sessionGeneration: null,
+          boardId: null,
+          name: "Untitled board",
+          committed: emptyBoardState(),
+          pending: [],
+          buffered: {},
+          appliedOpIds: {},
+          appliedSeqOpIds: {},
+          objects: [],
+          selectedId: null,
+          connection: "disconnected",
+          authoritativeHash: idleHash(),
+          error: null,
+        });
+      },
+      setConnection(sessionToken, connection) {
+        if (!isCurrent(sessionToken)) return;
+        set({ connection });
+      },
+      setSynchronizationError(sessionToken, error, authorizationFailed = false) {
+        if (!isCurrent(sessionToken)) return;
+        set({
+          connection: authorizationFailed ? "authorization-failed" : "error",
+          error,
+        });
+      },
+      select(selectedId) {
+        set({ selectedId });
+      },
+      enqueue(command) {
+        const current = get();
+        if (current.boardId !== command.boardId || current.sessionToken === null) return;
+        const pending = [...current.pending, command];
+        set({ pending, objects: derive(current.committed, pending), error: null });
+        void savePending(command);
+      },
+      acknowledge(sessionToken, opId, ack) {
+        if (!isCurrent(sessionToken)) return;
+        if (ack.ok) {
+          const pending = get().pending.filter((command) => command.opId !== opId);
+          set({ pending, objects: derive(get().committed, pending) });
+          void removePending(opId);
+          get().ingest(sessionToken, ack.operation);
+        } else if (!ack.retryable) {
+          const pending = get().pending.filter((command) => command.opId !== opId);
+          set({
+            pending,
+            objects: derive(get().committed, pending),
+            error: `${ack.code}: ${ack.message}`,
+          });
+          void removePending(opId);
+        } else set({ error: `${ack.code}: ${ack.message}` });
+      },
+      ingest(sessionToken, operation) {
+        if (!isCurrent(sessionToken)) return "stale";
+        const current = get();
+        if (operation.boardId !== current.boardId) {
+          set({ error: "Committed operation belongs to another board", connection: "error" });
+          return "conflict";
+        }
+        const appliedOpId = current.appliedSeqOpIds[operation.seq];
+        if (appliedOpId !== undefined && appliedOpId !== operation.opId) {
+          set({ error: "Conflicting operations share an applied sequence", connection: "error" });
+          return "conflict";
+        }
+        const appliedSeq = current.appliedOpIds[operation.opId];
+        if (appliedSeq !== undefined) {
+          if (appliedSeq !== operation.seq) {
+            set({ error: "Conflicting sequence for committed operation", connection: "error" });
+            return "conflict";
+          }
+          return "duplicate";
+        }
+        if (operation.seq <= current.committed.lastSeq) return "duplicate";
+        const existing = current.buffered[operation.seq];
+        if (existing) {
+          if (existing.opId === operation.opId) return "duplicate";
+          set({ error: "Conflicting operations share a sequence", connection: "error" });
+          return "conflict";
+        }
 
-    let committed = current.committed;
-    const buffered = { ...current.buffered, [operation.seq]: operation };
-    const appliedOpIds = { ...current.appliedOpIds };
-    const appliedSeqOpIds = { ...current.appliedSeqOpIds };
-    let next = buffered[committed.lastSeq + 1];
-    while (next) {
-      committed = applyCommitted(committed, next);
-      appliedOpIds[next.opId] = next.seq;
-      appliedSeqOpIds[next.seq] = next.opId;
-      delete buffered[next.seq];
-      next = buffered[committed.lastSeq + 1];
-    }
-    set({
-      committed,
-      buffered,
-      appliedOpIds,
-      appliedSeqOpIds,
-      objects: derive(committed, get().pending),
-    });
-    scheduleHash(committed);
-    return operation.seq <= committed.lastSeq ? "applied" : "buffered";
-  },
-}));
+        let committed = current.committed;
+        const buffered = { ...current.buffered, [operation.seq]: operation };
+        const appliedOpIds = { ...current.appliedOpIds };
+        const appliedSeqOpIds = { ...current.appliedSeqOpIds };
+        let next = buffered[committed.lastSeq + 1];
+        while (next) {
+          committed = applyCommitted(committed, next);
+          appliedOpIds[next.opId] = next.seq;
+          appliedSeqOpIds[next.seq] = next.opId;
+          delete buffered[next.seq];
+          next = buffered[committed.lastSeq + 1];
+        }
+        const advanced = committed.lastSeq !== current.committed.lastSeq;
+        set({
+          committed,
+          buffered,
+          appliedOpIds,
+          appliedSeqOpIds,
+          objects: derive(committed, get().pending),
+          ...(advanced && current.boardId
+            ? {
+                authoritativeHash: {
+                  status: "pending" as const,
+                  boardId: current.boardId,
+                  sessionGeneration: sessionToken.generation,
+                  seq: committed.lastSeq,
+                  value: null,
+                },
+              }
+            : {}),
+        });
+        if (advanced && current.boardId) scheduleHash(sessionToken, current.boardId, committed);
+        return operation.seq <= committed.lastSeq ? "applied" : "buffered";
+      },
+    };
+  });
+  return store;
+}
 
-export function firstBufferedGap(): { from: number; to: number } | null {
-  const { committed, buffered } = useBoardStore.getState();
+export const useBoardStore = createBoardStore();
+
+export function firstBufferedGap(token: BoardSessionToken): { from: number; to: number } | null {
+  const state = useBoardStore.getState();
+  if (!state.isCurrentSession(token)) return null;
+  const { committed, buffered } = state;
   const sequences = Object.keys(buffered)
     .map(Number)
     .sort((a, b) => a - b);

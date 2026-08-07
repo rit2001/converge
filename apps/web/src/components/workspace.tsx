@@ -2,7 +2,13 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { visibleObjects } from "@converge/canvas-engine";
 import type { BoardSnapshot, DurableCommand } from "@converge/protocol";
+import {
+  BoardSessionController,
+  type BoardSessionHandle,
+  type BoardSessionToken,
+} from "../board-session";
 import { useBoardStore } from "../board-store";
 import { loadPending } from "../pending-db";
 import { API_URL, BoardTransport } from "../transport";
@@ -24,50 +30,49 @@ function commandBase(boardId: string, clientId: string, targetId: string, lastSe
 export function Workspace(): React.JSX.Element {
   const store = useBoardStore();
   const clientId = useMemo(() => crypto.randomUUID(), []);
-  const transport = useRef<BoardTransport | null>(null);
+  const session = useRef<BoardSessionHandle | null>(null);
+  const sessions = useMemo(
+    () =>
+      new BoardSessionController({
+        store: useBoardStore.getState(),
+        createBoard: async (signal): Promise<BoardSnapshot> => {
+          const response = await fetch(`${API_URL}/v1/boards`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ name: "Product workshop" }),
+            signal,
+          });
+          if (!response.ok) throw new Error("Could not create board");
+          return (await response.json()) as BoardSnapshot;
+        },
+        loadSnapshot: async (boardId, signal): Promise<BoardSnapshot> => {
+          const response = await fetch(`${API_URL}/v1/boards/${boardId}`, { signal });
+          if (!response.ok) throw new Error("Could not load board");
+          return (await response.json()) as BoardSnapshot;
+        },
+        loadPending,
+        updateBoardLocation: (boardId) => window.history.replaceState({}, "", `?board=${boardId}`),
+        createTransport: (boardId: string, token: BoardSessionToken) =>
+          new BoardTransport(boardId, clientId, token),
+      }),
+    [clientId],
+  );
   const [tool, setTool] = useState<"select" | "pan">("select");
   const [diagnostics, setDiagnostics] = useState(true);
 
   useEffect(() => {
-    let active = true;
-    const start = async (): Promise<void> => {
-      const query = new URLSearchParams(window.location.search);
-      let boardId = query.get("board");
-      if (!boardId) {
-        const created = await fetch(`${API_URL}/v1/boards`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ name: "Product workshop" }),
-        });
-        if (!created.ok) throw new Error("Could not create board");
-        const board = (await created.json()) as BoardSnapshot;
-        boardId = board.id;
-        window.history.replaceState({}, "", `?board=${boardId}`);
-      }
-      const response = await fetch(`${API_URL}/v1/boards/${boardId}`);
-      if (!response.ok) throw new Error("Could not load board");
-      const snapshot = (await response.json()) as BoardSnapshot;
-      if (!active) return;
-      store.initialize(snapshot, await loadPending(boardId));
-      const nextTransport = new BoardTransport(boardId, clientId);
-      transport.current = nextTransport;
-      nextTransport.connect();
-    };
-    void start().catch((error: unknown) =>
-      useBoardStore.setState({
-        error: error instanceof Error ? error.message : "Startup failed",
-        connection: "error",
-      }),
-    );
+    const boardId = new URLSearchParams(window.location.search).get("board");
+    const handle = sessions.start(boardId);
+    session.current = handle;
     return () => {
-      active = false;
-      transport.current?.disconnect();
+      sessions.stop(handle);
+      if (session.current === handle) session.current = null;
     };
-  }, [clientId]);
+  }, [sessions]);
 
   const submit = (command: DurableCommand): void => {
     store.enqueue(command);
-    transport.current?.submit(command);
+    session.current?.submit(command);
   };
   const addObject = (kind: "rectangle" | "sticky"): void => {
     if (!store.boardId) return;
@@ -208,6 +213,10 @@ export function Workspace(): React.JSX.Element {
         {diagnostics && (
           <dl>
             <div>
+              <dt>Board</dt>
+              <dd data-testid="board-id">{store.boardId ?? "none"}</dd>
+            </div>
+            <div>
               <dt>Connection</dt>
               <dd>{store.connection}</dd>
             </div>
@@ -220,8 +229,32 @@ export function Workspace(): React.JSX.Element {
               <dd data-testid="pending-count">{store.pending.length}</dd>
             </div>
             <div className="hash">
-              <dt>State hash</dt>
-              <dd data-testid="state-hash">{store.hash}</dd>
+              <dt>Committed objects</dt>
+              <dd data-testid="committed-objects">
+                {JSON.stringify(visibleObjects(store.committed))}
+              </dd>
+            </div>
+            <div>
+              <dt>Hash board</dt>
+              <dd data-testid="hash-board-id">{store.authoritativeHash.boardId ?? "none"}</dd>
+            </div>
+            <div>
+              <dt>Hash sequence</dt>
+              <dd data-testid="hash-seq">{store.authoritativeHash.seq ?? "none"}</dd>
+            </div>
+            <div>
+              <dt>Hash session</dt>
+              <dd data-testid="hash-session-generation">
+                {store.authoritativeHash.sessionGeneration ?? "none"}
+              </dd>
+            </div>
+            <div>
+              <dt>Hash status</dt>
+              <dd data-testid="hash-status">{store.authoritativeHash.status}</dd>
+            </div>
+            <div className="hash">
+              <dt>Authoritative hash</dt>
+              <dd data-testid="state-hash">{store.authoritativeHash.value ?? "unavailable"}</dd>
             </div>
           </dl>
         )}

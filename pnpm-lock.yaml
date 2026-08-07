@@ -218,6 +218,12 @@ importers:
 
   tests/playwright:
     devDependencies:
+      '@converge/canvas-engine':
+        specifier: workspace:*
+        version: link:../../packages/canvas-engine
+      '@converge/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
       '@playwright/test':
         specifier: 1.55.0
         version: 1.55.0

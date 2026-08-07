@@ -10,6 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "@converge/canvas-engine": "workspace:*",
+    "@converge/protocol": "workspace:*",
     "@playwright/test": "1.55.0"
   }
 }

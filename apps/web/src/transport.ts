@@ -10,6 +10,7 @@ import {
   type OperationAck,
   type ServerToClientEvents,
 } from "@converge/protocol";
+import type { BoardSessionToken } from "./board-session";
 import { firstBufferedGap, useBoardStore } from "./board-store";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
@@ -36,10 +37,12 @@ export class BoardTransport {
   constructor(
     private readonly boardId: string,
     private readonly clientId: string,
+    private readonly sessionToken: BoardSessionToken,
   ) {}
 
   connect(): void {
-    useBoardStore.getState().setConnection("connecting");
+    if (!this.isSessionActive()) return;
+    useBoardStore.getState().setConnection(this.sessionToken, "connecting");
     const socket = io(API_URL, { auth: {}, reconnection: true });
     this.socket = socket;
     socket.on("connect", () => this.beginSynchronization(socket));
@@ -49,27 +52,32 @@ export class BoardTransport {
       this.synchronizationGeneration += 1;
       this.liveBuffer.clear();
       this.liveConflict = false;
-      useBoardStore.getState().setConnection("disconnected");
+      useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
     });
     socket.on("operation:committed", (operation: CommittedOperation) => {
+      if (!this.isSessionActive()) return;
       if (!this.ready || this.synchronizing) {
         this.bufferLive(operation);
         return;
       }
-      const result = useBoardStore.getState().ingest(operation);
+      const result = useBoardStore.getState().ingest(this.sessionToken, operation);
       if (result === "buffered") this.beginSynchronization(socket);
       if (result === "conflict") this.ready = false;
     });
-    socket.io.on("reconnect_attempt", () => useBoardStore.getState().setConnection("connecting"));
+    socket.io.on("reconnect_attempt", () =>
+      useBoardStore.getState().setConnection(this.sessionToken, "connecting"),
+    );
     socket.io.on("reconnect_failed", () =>
-      useBoardStore.getState().setSynchronizationError("Socket reconnection failed"),
+      useBoardStore
+        .getState()
+        .setSynchronizationError(this.sessionToken, "Socket reconnection failed"),
     );
   }
 
   submit(command: DurableCommand): void {
-    if (!this.socket?.connected || !this.ready) return;
+    if (!this.isSessionActive() || !this.socket?.connected || !this.ready) return;
     this.socket.emit("operation:submit", command, (ack: OperationAck) =>
-      useBoardStore.getState().acknowledge(command.opId, ack),
+      useBoardStore.getState().acknowledge(this.sessionToken, command.opId, ack),
     );
   }
 
@@ -81,17 +89,17 @@ export class BoardTransport {
     this.liveConflict = false;
     this.socket?.disconnect();
     this.socket = null;
-    useBoardStore.getState().setConnection("disconnected");
+    useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
   }
 
   private beginSynchronization(socket: Socket<ServerToClientEvents, ClientToServerEvents>): void {
-    if (!socket.connected || this.synchronizing) return;
+    if (!this.isSessionActive() || !socket.connected || this.synchronizing) return;
     this.ready = false;
     this.synchronizing = true;
     const generation = ++this.synchronizationGeneration;
     void this.synchronize(socket, generation)
       .catch((error: unknown) => {
-        if (generation !== this.synchronizationGeneration) return;
+        if (generation !== this.synchronizationGeneration || !this.isSessionActive()) return;
         const failure =
           error instanceof SynchronizationError
             ? error
@@ -102,7 +110,11 @@ export class BoardTransport {
           failure.code === "AUTHENTICATION_REQUIRED";
         useBoardStore
           .getState()
-          .setSynchronizationError(`${failure.code}: ${failure.message}`, authorizationFailed);
+          .setSynchronizationError(
+            this.sessionToken,
+            `${failure.code}: ${failure.message}`,
+            authorizationFailed,
+          );
       })
       .finally(() => {
         if (generation === this.synchronizationGeneration) this.synchronizing = false;
@@ -115,7 +127,7 @@ export class BoardTransport {
   ): Promise<void> {
     while (this.isCurrent(socket, generation)) {
       const store = useBoardStore.getState();
-      store.setConnection("joining");
+      store.setConnection(this.sessionToken, "joining");
       const acknowledgement = await this.requestJoin(socket);
       this.assertCurrent(socket, generation);
       if (!acknowledgement.ok)
@@ -135,12 +147,12 @@ export class BoardTransport {
           true,
         );
       if (localSequence < acknowledgement.joinWatermark) {
-        useBoardStore.getState().setConnection("catching-up");
+        useBoardStore.getState().setConnection(this.sessionToken, "catching-up");
         await this.catchUp(acknowledgement.joinWatermark, socket, generation);
       }
 
       this.drainLiveBuffer();
-      if (firstBufferedGap()) continue;
+      if (firstBufferedGap(this.sessionToken)) continue;
       if (useBoardStore.getState().committed.lastSeq < acknowledgement.joinWatermark)
         throw new SynchronizationError(
           "RESYNC_REQUIRED",
@@ -149,7 +161,7 @@ export class BoardTransport {
         );
 
       this.ready = true;
-      useBoardStore.getState().setConnection("ready");
+      useBoardStore.getState().setConnection(this.sessionToken, "ready");
       for (const command of useBoardStore.getState().pending) this.submit(command);
       return;
     }
@@ -187,7 +199,7 @@ export class BoardTransport {
       )
         throw new SynchronizationError("RESYNC_REQUIRED", "Catch-up response mismatch", true);
       for (const operation of batch.operations) {
-        const result = useBoardStore.getState().ingest(operation);
+        const result = useBoardStore.getState().ingest(this.sessionToken, operation);
         if (result === "conflict")
           throw new SynchronizationError("RESYNC_REQUIRED", "Conflicting operation delivery", true);
       }
@@ -240,7 +252,7 @@ export class BoardTransport {
       this.liveConflict = true;
       useBoardStore
         .getState()
-        .setSynchronizationError("RESYNC_REQUIRED: Conflicting live operations");
+        .setSynchronizationError(this.sessionToken, "RESYNC_REQUIRED: Conflicting live operations");
       return;
     }
     this.liveBuffer.set(operation.seq, operation);
@@ -254,7 +266,7 @@ export class BoardTransport {
     const operations = [...this.liveBuffer.values()].sort((left, right) => left.seq - right.seq);
     this.liveBuffer.clear();
     for (const operation of operations) {
-      const result = useBoardStore.getState().ingest(operation);
+      const result = useBoardStore.getState().ingest(this.sessionToken, operation);
       if (result === "conflict")
         throw new SynchronizationError("RESYNC_REQUIRED", "Conflicting operation delivery", true);
     }
@@ -264,7 +276,9 @@ export class BoardTransport {
     socket: Socket<ServerToClientEvents, ClientToServerEvents>,
     generation: number,
   ): boolean {
-    return socket.connected && generation === this.synchronizationGeneration;
+    return (
+      socket.connected && generation === this.synchronizationGeneration && this.isSessionActive()
+    );
   }
 
   private assertCurrent(
@@ -273,6 +287,10 @@ export class BoardTransport {
   ): void {
     if (!this.isCurrent(socket, generation))
       throw new SynchronizationError("INTERNAL_ERROR", "Synchronization interrupted", true);
+  }
+
+  private isSessionActive(): boolean {
+    return useBoardStore.getState().isCurrentSession(this.sessionToken, this.boardId);
   }
 }
 
