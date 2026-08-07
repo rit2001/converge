@@ -167,12 +167,14 @@ export const operationAckSchema = z.discriminatedUnion("ok", [
   protocolErrorSchema,
 ]);
 
-export const boardSnapshotSchema = z.object({
-  id: idSchema,
-  name: z.string().min(1).max(120),
-  lastSeq: sequenceSchema,
-  objects: z.array(canvasObjectSchema),
-});
+export const boardSnapshotSchema = z
+  .object({
+    id: idSchema,
+    name: z.string().min(1).max(120),
+    lastSeq: sequenceSchema,
+    objects: z.array(canvasObjectSchema),
+  })
+  .strict();
 export const createBoardRequestSchema = z
   .object({ name: z.string().trim().min(1).max(120) })
   .strict();

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  boardSnapshotSchema,
   createBoardRequestSchema,
   durableCommandSchema,
   ephemeralEventTypeSchema,
@@ -110,6 +111,12 @@ describe("protocol schemas", () => {
     expect(
       operationRangeQuerySchema.safeParse({ after: "0", watermark: "2", surprise: true }).success,
     ).toBe(false);
+  });
+
+  it("keeps authoritative snapshot responses strict", () => {
+    const snapshot = { id: command.boardId, name: "Board", lastSeq: 0, objects: [] };
+    expect(boardSnapshotSchema.parse(snapshot)).toEqual(snapshot);
+    expect(boardSnapshotSchema.safeParse({ ...snapshot, surprise: true }).success).toBe(false);
   });
 
   it("validates strict join acknowledgements and synchronization errors", () => {

@@ -1,5 +1,5 @@
 import type { AddressInfo } from "node:net";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { buildApp, type AppContext, type SynchronizationHooks } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
 import type { Environment } from "@converge/api/env";
@@ -18,6 +18,11 @@ import {
   TestAuthAdapter,
   testAuthorizationHeaders,
 } from "@converge/testkit";
+import type { BoardSessionToken } from "../../apps/web/src/board-session";
+import { useBoardStore } from "../../apps/web/src/board-store";
+import type { RetryScheduler } from "../../apps/web/src/pending-command-queue";
+import type { PendingLoadResult, PendingOperationStore } from "../../apps/web/src/pending-db";
+import { BoardTransport, SYNC_ACK_TIMEOUT_MS } from "../../apps/web/src/transport";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:5432/converge";
@@ -177,7 +182,107 @@ async function persistedState(boardId: string) {
   return result.rows[0];
 }
 
+class IntegrationScheduler implements RetryScheduler {
+  private nextId = 1;
+  private readonly tasks = new Map<number, { delay: number; callback: () => void }>();
+
+  setTimeout(callback: () => void, delay: number): number {
+    const id = this.nextId++;
+    this.tasks.set(id, { delay, callback });
+    return id;
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.tasks.delete(handle as number);
+  }
+
+  random(): number {
+    return 0;
+  }
+
+  runDelay(delay: number): void {
+    const entry = [...this.tasks].find(([, task]) => task.delay === delay);
+    if (!entry) throw new Error(`No integration task scheduled for ${delay}ms`);
+    this.tasks.delete(entry[0]);
+    entry[1].callback();
+  }
+}
+
+class IntegrationPendingStore implements PendingOperationStore {
+  load(): Promise<PendingLoadResult> {
+    return Promise.resolve({ commands: [], corruptCount: 0 });
+  }
+
+  put(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  delete(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
 describe("join watermark catch-up", () => {
+  it("self-heals a delayed real Socket.IO join acknowledgement without reconnecting", async () => {
+    const synchronizedBoardId = await board();
+    let releaseFirstJoin!: () => void;
+    let markFirstJoinEntered!: () => void;
+    const firstJoinEntered = new Promise<void>((resolve) => {
+      markFirstJoinEntered = resolve;
+    });
+    const firstJoinReleased = new Promise<void>((resolve) => {
+      releaseFirstJoin = resolve;
+    });
+    let joinCalls = 0;
+    activeJoinHook = async () => {
+      joinCalls += 1;
+      if (joinCalls !== 1) return;
+      markFirstJoinEntered();
+      await firstJoinReleased;
+    };
+
+    const token: BoardSessionToken = { generation: 70_001, nonce: Symbol("integration-sync") };
+    useBoardStore.getState().beginSession(token, synchronizedBoardId);
+    useBoardStore
+      .getState()
+      .initializeSession(
+        token,
+        { id: synchronizedBoardId, name: "retry integration", lastSeq: 0, objects: [] },
+        [],
+      );
+    const scheduler = new IntegrationScheduler();
+    const transport = new BoardTransport(synchronizedBoardId, crypto.randomUUID(), token, {
+      apiUrl: serverUrl,
+      scheduler,
+      pendingStore: new IntegrationPendingStore(),
+      socketFactory: () => {
+        const socket = createTestSocket(serverUrl, tokens.owner);
+        sockets.add(socket);
+        return socket as never;
+      },
+    });
+    transport.connect();
+    await firstJoinEntered;
+    scheduler.runDelay(SYNC_ACK_TIMEOUT_MS);
+    await vi.waitFor(() => expect(useBoardStore.getState().connection).toBe("retry-wait"));
+    scheduler.runDelay(500);
+    await vi.waitFor(() => {
+      expect(joinCalls).toBe(2);
+      expect(useBoardStore.getState().connection).toBe("ready");
+    });
+
+    releaseFirstJoin();
+    await vi.waitFor(() => expect(useBoardStore.getState().connection).toBe("ready"));
+    expect(useBoardStore.getState()).toMatchObject({
+      boardId: synchronizedBoardId,
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: { attempt: 2, retryScheduled: false },
+    });
+    transport.disconnect();
+    useBoardStore.getState().endSession(token);
+    activeJoinHook = undefined;
+  });
+
   it("closes an initial snapshot gap without requiring a later operation", async () => {
     const boardId = await board();
     const snapshot = boardSnapshotSchema.parse(

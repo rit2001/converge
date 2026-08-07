@@ -22,10 +22,21 @@ export type SynchronizationStatus =
   | "connecting"
   | "joining"
   | "catching-up"
+  | "retry-wait"
   | "ready"
   | "authorization-failed"
   | "error";
 export type IngestResult = "applied" | "buffered" | "duplicate" | "conflict";
+export interface SynchronizationDiagnostics {
+  attempt: number;
+  retryCode: string | null;
+  retryScheduled: boolean;
+  retryDelayMs: number | null;
+  bufferedCount: number;
+  bufferedBytes: number;
+  bufferCountLimit: number;
+  bufferByteLimit: number;
+}
 export type AuthoritativeHash =
   | {
       status: "idle";
@@ -56,6 +67,7 @@ export interface BoardStore {
   selectedId: string | null;
   connection: SynchronizationStatus;
   pendingStatus: PendingRecoveryStatus;
+  synchronizationDiagnostics: SynchronizationDiagnostics;
   authoritativeHash: AuthoritativeHash;
   error: string | null;
   beginSession(token: BoardSessionToken, boardId: string | null): void;
@@ -66,6 +78,7 @@ export interface BoardStore {
     snapshot: BoardSnapshot,
     pending: DurableCommand[],
   ): boolean;
+  rebaseSession(token: BoardSessionToken, snapshot: BoardSnapshot): boolean;
   failSession(token: BoardSessionToken, message: string): void;
   endSession(token: BoardSessionToken): void;
   setConnection(token: BoardSessionToken, status: SynchronizationStatus): void;
@@ -73,6 +86,10 @@ export interface BoardStore {
     token: BoardSessionToken,
     message: string,
     authorizationFailed?: boolean,
+  ): void;
+  setSynchronizationDiagnostics(
+    token: BoardSessionToken,
+    diagnostics: Partial<SynchronizationDiagnostics>,
   ): void;
   setPendingStatus(
     token: BoardSessionToken,
@@ -112,6 +129,17 @@ const idleHash = (): AuthoritativeHash => ({
   sessionGeneration: null,
   seq: null,
   value: null,
+});
+
+const idleSynchronizationDiagnostics = (): SynchronizationDiagnostics => ({
+  attempt: 0,
+  retryCode: null,
+  retryScheduled: false,
+  retryDelayMs: null,
+  bufferedCount: 0,
+  bufferedBytes: 0,
+  bufferCountLimit: 0,
+  bufferByteLimit: 0,
 });
 
 export function createBoardStore(
@@ -180,6 +208,7 @@ export function createBoardStore(
       selectedId: null,
       connection: "disconnected",
       pendingStatus: "idle",
+      synchronizationDiagnostics: idleSynchronizationDiagnostics(),
       authoritativeHash: idleHash(),
       error: null,
       beginSession(sessionToken, boardId) {
@@ -197,6 +226,7 @@ export function createBoardStore(
           selectedId: null,
           connection: "connecting",
           pendingStatus: "idle",
+          synchronizationDiagnostics: idleSynchronizationDiagnostics(),
           authoritativeHash: idleHash(),
           error: null,
         });
@@ -216,6 +246,29 @@ export function createBoardStore(
           committed,
           pending,
           objects: derive(committed, pending),
+          buffered: {},
+          appliedOpIds: {},
+          appliedSeqOpIds: {},
+          authoritativeHash: {
+            status: "pending",
+            boardId: snapshot.id,
+            sessionGeneration: sessionToken.generation,
+            seq: committed.lastSeq,
+            value: null,
+          },
+          error: null,
+        });
+        scheduleHash(sessionToken, snapshot.id, committed);
+        return true;
+      },
+      rebaseSession(sessionToken, snapshot) {
+        if (!isCurrent(sessionToken, snapshot.id)) return false;
+        const current = get();
+        const committed = stateFromSnapshot(snapshot);
+        set({
+          name: snapshot.name,
+          committed,
+          objects: derive(committed, current.pending),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -251,6 +304,7 @@ export function createBoardStore(
           selectedId: null,
           connection: "disconnected",
           pendingStatus: "idle",
+          synchronizationDiagnostics: idleSynchronizationDiagnostics(),
           authoritativeHash: idleHash(),
           error: null,
         });
@@ -264,6 +318,15 @@ export function createBoardStore(
         set({
           connection: authorizationFailed ? "authorization-failed" : "error",
           error,
+        });
+      },
+      setSynchronizationDiagnostics(sessionToken, diagnostics) {
+        if (!isCurrent(sessionToken)) return;
+        set({
+          synchronizationDiagnostics: {
+            ...get().synchronizationDiagnostics,
+            ...diagnostics,
+          },
         });
       },
       setPendingStatus(sessionToken, pendingStatus, message) {

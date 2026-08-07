@@ -3,7 +3,12 @@
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { visibleObjects } from "@converge/canvas-engine";
-import type { BoardSnapshot, DurableCommand } from "@converge/protocol";
+import {
+  boardSnapshotSchema,
+  protocolErrorSchema,
+  type BoardSnapshot,
+  type DurableCommand,
+} from "@converge/protocol";
 import {
   BoardSessionController,
   type BoardSessionHandle,
@@ -11,7 +16,7 @@ import {
 } from "../board-session";
 import { useBoardStore } from "../board-store";
 import { indexedDbPendingOperationStore } from "../pending-db";
-import { API_URL, BoardTransport } from "../transport";
+import { API_URL, BoardTransport, SynchronizationError } from "../transport";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
 
@@ -31,40 +36,58 @@ export function Workspace(): React.JSX.Element {
   const store = useBoardStore();
   const clientId = useMemo(() => crypto.randomUUID(), []);
   const session = useRef<BoardSessionHandle | null>(null);
-  const sessions = useMemo(
-    () =>
-      new BoardSessionController({
-        store: useBoardStore.getState(),
-        createBoard: async (signal): Promise<BoardSnapshot> => {
-          const response = await fetch(`${API_URL}/v1/boards`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ name: "Product workshop" }),
-            signal,
-          });
-          if (!response.ok) throw new Error("Could not create board");
-          return (await response.json()) as BoardSnapshot;
-        },
-        loadSnapshot: async (boardId, signal): Promise<BoardSnapshot> => {
-          const response = await fetch(`${API_URL}/v1/boards/${boardId}`, { signal });
-          if (!response.ok) throw new Error("Could not load board");
-          return (await response.json()) as BoardSnapshot;
-        },
-        loadPending: async (boardId) => {
-          try {
-            return await indexedDbPendingOperationStore.load(boardId);
-          } catch {
-            throw new Error("LOCAL_PERSISTENCE_ERROR: Pending storage is unavailable");
-          }
-        },
-        updateBoardLocation: (boardId) => window.history.replaceState({}, "", `?board=${boardId}`),
-        createTransport: (boardId: string, token: BoardSessionToken) =>
-          new BoardTransport(boardId, clientId, token, {
-            pendingStore: indexedDbPendingOperationStore,
-          }),
-      }),
-    [clientId],
-  );
+  const sessions = useMemo(() => {
+    const loadSnapshot = async (boardId: string, signal: AbortSignal): Promise<BoardSnapshot> => {
+      const response = await fetch(`${API_URL}/v1/boards/${boardId}`, { signal });
+      const raw: unknown = await response.json();
+      if (!response.ok) {
+        const failure = protocolErrorSchema.safeParse(raw);
+        if (failure.success)
+          throw new SynchronizationError(
+            failure.data.code,
+            failure.data.message,
+            failure.data.retryable,
+          );
+        if (response.status === 401)
+          throw new SynchronizationError(
+            "AUTHENTICATION_REQUIRED",
+            "Authentication required",
+            false,
+          );
+        if (response.status === 403 || response.status === 404)
+          throw new SynchronizationError("FORBIDDEN", "Board is not available", false);
+        throw new Error("Could not load board");
+      }
+      return boardSnapshotSchema.parse(raw);
+    };
+    return new BoardSessionController({
+      store: useBoardStore.getState(),
+      createBoard: async (signal): Promise<BoardSnapshot> => {
+        const response = await fetch(`${API_URL}/v1/boards`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "Product workshop" }),
+          signal,
+        });
+        if (!response.ok) throw new Error("Could not create board");
+        return (await response.json()) as BoardSnapshot;
+      },
+      loadSnapshot,
+      loadPending: async (boardId) => {
+        try {
+          return await indexedDbPendingOperationStore.load(boardId);
+        } catch {
+          throw new Error("LOCAL_PERSISTENCE_ERROR: Pending storage is unavailable");
+        }
+      },
+      updateBoardLocation: (boardId) => window.history.replaceState({}, "", `?board=${boardId}`),
+      createTransport: (boardId: string, token: BoardSessionToken) =>
+        new BoardTransport(boardId, clientId, token, {
+          pendingStore: indexedDbPendingOperationStore,
+          loadSnapshot,
+        }),
+    });
+  }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
   const [diagnostics, setDiagnostics] = useState(true);
 
@@ -241,6 +264,27 @@ export function Workspace(): React.JSX.Element {
             <div>
               <dt>Pending recovery</dt>
               <dd data-testid="pending-status">{store.pendingStatus}</dd>
+            </div>
+            <div>
+              <dt>Sync attempt</dt>
+              <dd data-testid="sync-attempt">{store.synchronizationDiagnostics.attempt}</dd>
+            </div>
+            <div>
+              <dt>Sync retry</dt>
+              <dd data-testid="sync-retry-code">
+                {store.synchronizationDiagnostics.retryScheduled
+                  ? `${store.synchronizationDiagnostics.retryCode ?? "retry"} (${store.synchronizationDiagnostics.retryDelayMs ?? 0}ms)`
+                  : "none"}
+              </dd>
+            </div>
+            <div>
+              <dt>Sync buffer</dt>
+              <dd data-testid="sync-buffer">
+                {store.synchronizationDiagnostics.bufferedCount}/
+                {store.synchronizationDiagnostics.bufferCountLimit} operations,{" "}
+                {store.synchronizationDiagnostics.bufferedBytes}/
+                {store.synchronizationDiagnostics.bufferByteLimit} bytes
+              </dd>
             </div>
             <div className="hash">
               <dt>Committed objects</dt>

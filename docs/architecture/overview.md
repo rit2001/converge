@@ -35,6 +35,24 @@ or catching up are buffered, deduplicated by operation identity and sequence, an
 strict sequence order. `READY` means every operation through the join watermark has been applied and
 no known gap remains; a raw Socket.IO connection is not readiness.
 
+Each synchronization attempt has an identity scoped to the active board session and socket
+connection. Join acknowledgements and operation-range fetches time out after 10 seconds. Retryable
+failures enter `RETRY_WAIT` and retry automatically from the current committed sequence with
+exponential backoff starting at 500 ms, capped at 10 seconds, and bounded production jitter. Only one
+attempt and one retry timer may exist; stale acknowledgements, disconnects, and superseded sessions
+cannot resume an obsolete attempt. Authorization and protocol-integrity failures are terminal. A
+client sequence ahead of the authoritative head triggers a strictly validated HTTP snapshot reload,
+preserving durable pending commands, before a new join.
+
+Live events received during an active join/catch-up attempt are strictly validated and temporarily
+buffered up to 1,000 unique operations or 2 MiB, whichever is reached first. Duplicates are charged
+once. The next event that would cross either limit is discarded, the attempt buffer is cleared, and
+bounded recovery starts from the durable operation log. Live events are intentionally discarded
+during `RETRY_WAIT`; the next fixed-watermark catch-up retrieves them. Repeated overflow therefore
+keeps memory bounded and remains outside `READY` rather than claiming convergence. Pending command
+submission stays paused until a current attempt reaches `READY`, then its single ordered drain loop
+resumes with the original command identities.
+
 Pending persistence mutations are serialized per board. New records carry a monotonic enqueue
 ordinal; legacy records remain loadable using a deterministic timestamp/operation-ID fallback.
 Invalid stored rows are reported and skipped without clearing valid work. The transport drains one
@@ -66,6 +84,10 @@ sequence-labelled hash matching the canonical authoritative HTTP snapshot.
 
 The database still does not persist a trustworthy hash for each historical sequence, so the client
 cannot verify a server-issued hash specifically at the join watermark.
+
+Authoritative snapshot reload cannot recover arbitrary server data loss, and preserved pending
+commands retain their original base sequences and idempotency identities; a command that remains
+incompatible is handled by the existing structured submission response rather than silently rewritten.
 
 This closes initial-load and temporary-disconnection gaps for the single API instance. Milestone 2
 still owns crash-window outbox delivery, Redis multi-instance fan-out, snapshots, compaction, and

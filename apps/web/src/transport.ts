@@ -1,8 +1,11 @@
 import { io, type Socket } from "socket.io-client";
 import {
+  boardSnapshotSchema,
+  committedOperationSchema,
   joinBoardAckSchema,
   operationRangeResponseSchema,
   protocolErrorSchema,
+  type BoardSnapshot,
   type ClientToServerEvents,
   type CommittedOperation,
   type DurableCommand,
@@ -21,19 +24,56 @@ import {
 import { indexedDbPendingOperationStore, type PendingOperationStore } from "./pending-db";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
-const ACK_TIMEOUT_MS = 10_000;
+export const SYNC_ACK_TIMEOUT_MS = 10_000;
+export const SYNC_RETRY_BASE_MS = 500;
+export const SYNC_RETRY_CAP_MS = 10_000;
+export const LIVE_BUFFER_MAX_COUNT = 1_000;
+export const LIVE_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
+
+type BoardSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
+
 const transportScheduler: RetryScheduler = {
   setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
   clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
   random: () => Math.random(),
 };
 
+interface SynchronizationAttempt {
+  id: number;
+  connectionGeneration: number;
+  startingSeq: number;
+  retryNumber: number;
+  joinWatermark: number | null;
+  cancelled: boolean;
+  readonly abortController: AbortController;
+  readonly cancelers: Set<() => void>;
+}
+
+interface BufferedLiveOperation {
+  operation: CommittedOperation;
+  serialized: string;
+  bytes: number;
+}
+
+export interface SynchronizationLimits {
+  acknowledgementTimeoutMs: number;
+  retryBaseMs: number;
+  retryCapMs: number;
+  liveBufferMaxCount: number;
+  liveBufferMaxBytes: number;
+}
+
 export interface BoardTransportOptions {
   pendingStore?: PendingOperationStore;
   scheduler?: RetryScheduler;
+  apiUrl?: string;
+  socketFactory?: (apiUrl: string) => BoardSocket;
+  fetcher?: typeof fetch;
+  loadSnapshot?: (boardId: string, signal: AbortSignal) => Promise<unknown>;
+  synchronization?: Partial<SynchronizationLimits>;
 }
 
-class SynchronizationError extends Error {
+export class SynchronizationError extends Error {
   constructor(
     readonly code: string,
     message: string,
@@ -43,15 +83,31 @@ class SynchronizationError extends Error {
   }
 }
 
+const terminalAuthorizationCodes = new Set([
+  "AUTHENTICATION_REQUIRED",
+  "INVALID_AUTH_INPUT",
+  "FORBIDDEN",
+  "BOARD_NOT_FOUND",
+]);
+
 export class BoardTransport {
-  private socket: Socket<ServerToClientEvents, ClientToServerEvents> | null = null;
-  private synchronizationGeneration = 0;
-  private synchronizing = false;
+  private socket: BoardSocket | null = null;
+  private connectionGeneration = 0;
+  private nextAttemptId = 0;
+  private activeAttempt: SynchronizationAttempt | null = null;
+  private retryTimer: unknown = null;
+  private synchronizationFailures = 0;
   private ready = false;
-  private liveConflict = false;
-  private readonly liveBuffer = new Map<number, CommittedOperation>();
+  private readonly liveBuffer = new Map<number, BufferedLiveOperation>();
+  private readonly liveBufferOpSequences = new Map<string, number>();
+  private liveBufferBytes = 0;
   private readonly scheduler: RetryScheduler;
   private readonly pendingQueue: PendingCommandQueue;
+  private readonly apiUrl: string;
+  private readonly socketFactory: (apiUrl: string) => BoardSocket;
+  private readonly fetcher: typeof fetch;
+  private readonly loadSnapshot: (boardId: string, signal: AbortSignal) => Promise<unknown>;
+  private readonly limits: SynchronizationLimits;
 
   constructor(
     private readonly boardId: string,
@@ -60,6 +116,19 @@ export class BoardTransport {
     options: BoardTransportOptions = {},
   ) {
     this.scheduler = options.scheduler ?? transportScheduler;
+    this.apiUrl = options.apiUrl ?? API_URL;
+    this.socketFactory =
+      options.socketFactory ?? ((url) => io(url, { auth: {}, reconnection: true }));
+    this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
+    this.loadSnapshot = options.loadSnapshot ?? ((id, signal) => this.fetchSnapshot(id, signal));
+    this.limits = {
+      acknowledgementTimeoutMs: SYNC_ACK_TIMEOUT_MS,
+      retryBaseMs: SYNC_RETRY_BASE_MS,
+      retryCapMs: SYNC_RETRY_CAP_MS,
+      liveBufferMaxCount: LIVE_BUFFER_MAX_COUNT,
+      liveBufferMaxBytes: LIVE_BUFFER_MAX_BYTES,
+      ...options.synchronization,
+    };
     const state = useBoardStore.getState();
     this.pendingQueue = new PendingCommandQueue({
       boardId,
@@ -82,33 +151,33 @@ export class BoardTransport {
         if (this.socket?.connected) this.beginSynchronization(this.socket);
       },
     });
+    this.updateDiagnostics({
+      bufferCountLimit: this.limits.liveBufferMaxCount,
+      bufferByteLimit: this.limits.liveBufferMaxBytes,
+    });
   }
 
   connect(): void {
     if (!this.isSessionActive()) return;
     useBoardStore.getState().setConnection(this.sessionToken, "connecting");
-    const socket = io(API_URL, { auth: {}, reconnection: true });
+    const socket = this.socketFactory(this.apiUrl);
     this.socket = socket;
-    socket.on("connect", () => this.beginSynchronization(socket));
+    socket.on("connect", () => {
+      this.connectionGeneration += 1;
+      this.cancelRetry();
+      this.invalidateAttempt();
+      this.beginSynchronization(socket);
+    });
     socket.on("disconnect", () => {
       this.ready = false;
       this.pendingQueue.setReady(false);
-      this.synchronizing = false;
-      this.synchronizationGeneration += 1;
-      this.liveBuffer.clear();
-      this.liveConflict = false;
+      this.connectionGeneration += 1;
+      this.cancelRetry();
+      this.invalidateAttempt();
+      this.clearLiveBuffer();
       useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
     });
-    socket.on("operation:committed", (operation: CommittedOperation) => {
-      if (!this.isSessionActive()) return;
-      if (!this.ready || this.synchronizing) {
-        this.bufferLive(operation);
-        return;
-      }
-      const result = this.pendingQueue.observeCommitted(operation);
-      if (result === "buffered") this.beginSynchronization(socket);
-      if (result === "conflict") this.ready = false;
-    });
+    socket.on("operation:committed", (raw: unknown) => this.receiveLive(socket, raw));
     socket.io.on("reconnect_attempt", () =>
       useBoardStore.getState().setConnection(this.sessionToken, "connecting"),
     );
@@ -117,6 +186,7 @@ export class BoardTransport {
         .getState()
         .setSynchronizationError(this.sessionToken, "Socket reconnection failed"),
     );
+    if (!socket.connected) socket.connect();
   }
 
   submit(command: DurableCommand): Promise<boolean> {
@@ -126,116 +196,139 @@ export class BoardTransport {
   disconnect(): void {
     this.ready = false;
     this.pendingQueue.cancel();
-    this.synchronizing = false;
-    this.synchronizationGeneration += 1;
-    this.liveBuffer.clear();
-    this.liveConflict = false;
+    this.connectionGeneration += 1;
+    this.cancelRetry();
+    this.invalidateAttempt();
+    this.clearLiveBuffer();
     this.socket?.disconnect();
     this.socket = null;
     useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
   }
 
-  private beginSynchronization(socket: Socket<ServerToClientEvents, ClientToServerEvents>): void {
-    if (!this.isSessionActive() || !socket.connected || this.synchronizing) return;
+  private beginSynchronization(socket: BoardSocket): void {
+    if (!this.isSessionActive() || !socket.connected || this.activeAttempt || this.retryTimer)
+      return;
     this.ready = false;
     this.pendingQueue.setReady(false);
-    this.synchronizing = true;
-    const generation = ++this.synchronizationGeneration;
-    void this.synchronize(socket, generation)
-      .catch((error: unknown) => {
-        if (generation !== this.synchronizationGeneration || !this.isSessionActive()) return;
-        const failure =
-          error instanceof SynchronizationError
-            ? error
-            : new SynchronizationError("INTERNAL_ERROR", "Board synchronization failed", true);
-        const authorizationFailed =
-          failure.code === "FORBIDDEN" ||
-          failure.code === "BOARD_NOT_FOUND" ||
-          failure.code === "AUTHENTICATION_REQUIRED";
-        useBoardStore
-          .getState()
-          .setSynchronizationError(
-            this.sessionToken,
-            `${failure.code}: ${failure.message}`,
-            authorizationFailed,
-          );
-      })
-      .finally(() => {
-        if (generation === this.synchronizationGeneration) this.synchronizing = false;
-      });
+    this.clearLiveBuffer();
+    const attempt: SynchronizationAttempt = {
+      id: ++this.nextAttemptId,
+      connectionGeneration: this.connectionGeneration,
+      startingSeq: useBoardStore.getState().committed.lastSeq,
+      retryNumber: this.synchronizationFailures,
+      joinWatermark: null,
+      cancelled: false,
+      abortController: new AbortController(),
+      cancelers: new Set(),
+    };
+    this.activeAttempt = attempt;
+    this.updateDiagnostics({
+      attempt: attempt.id,
+      retryCode: null,
+      retryScheduled: false,
+      retryDelayMs: null,
+    });
+    void this.synchronize(socket, attempt).catch((error: unknown) => {
+      if (!this.isCurrentAttempt(socket, attempt)) return;
+      const failure =
+        error instanceof SynchronizationError
+          ? error
+          : new SynchronizationError("INTERNAL_ERROR", "Board synchronization failed", true);
+      this.failAttempt(socket, attempt, failure);
+    });
   }
 
-  private async synchronize(
-    socket: Socket<ServerToClientEvents, ClientToServerEvents>,
-    generation: number,
-  ): Promise<void> {
-    while (this.isCurrent(socket, generation)) {
-      const store = useBoardStore.getState();
-      store.setConnection(this.sessionToken, "joining");
-      const acknowledgement = await this.requestJoin(socket);
-      this.assertCurrent(socket, generation);
-      if (!acknowledgement.ok)
-        throw new SynchronizationError(
-          acknowledgement.code,
-          acknowledgement.message,
-          acknowledgement.retryable,
-        );
-      if (acknowledgement.boardId !== this.boardId)
-        throw new SynchronizationError("RESYNC_REQUIRED", "Join board mismatch", true);
-
-      const localSequence = useBoardStore.getState().committed.lastSeq;
-      if (localSequence > acknowledgement.joinWatermark)
+  private async synchronize(socket: BoardSocket, attempt: SynchronizationAttempt): Promise<void> {
+    useBoardStore.getState().setConnection(this.sessionToken, "joining");
+    const acknowledgement = await this.requestJoin(socket, attempt);
+    this.assertCurrent(socket, attempt);
+    if (!acknowledgement.ok) {
+      if (acknowledgement.code === "RESYNC_REQUIRED") {
+        await this.rebaseFromSnapshot(socket, attempt);
         throw new SynchronizationError(
           "RESYNC_REQUIRED",
-          "Local sequence exceeds join watermark",
+          "Authoritative snapshot reloaded; joining again",
           true,
         );
-      if (localSequence < acknowledgement.joinWatermark) {
-        useBoardStore.getState().setConnection(this.sessionToken, "catching-up");
-        await this.catchUp(acknowledgement.joinWatermark, socket, generation);
       }
-
-      this.drainLiveBuffer();
-      if (firstBufferedGap(this.sessionToken)) continue;
-      if (useBoardStore.getState().committed.lastSeq < acknowledgement.joinWatermark)
-        throw new SynchronizationError(
-          "RESYNC_REQUIRED",
-          "Catch-up did not reach the join watermark",
-          true,
-        );
-
-      this.ready = true;
-      useBoardStore.getState().setConnection(this.sessionToken, "ready");
-      this.pendingQueue.setReady(true);
-      return;
+      throw new SynchronizationError(
+        acknowledgement.code,
+        acknowledgement.message,
+        acknowledgement.retryable,
+      );
     }
+    if (acknowledgement.boardId !== this.boardId)
+      throw new SynchronizationError("INVALID_COMMAND", "Join board mismatch", false);
+    attempt.joinWatermark = acknowledgement.joinWatermark;
+
+    const localSequence = useBoardStore.getState().committed.lastSeq;
+    if (localSequence > acknowledgement.joinWatermark) {
+      await this.rebaseFromSnapshot(socket, attempt);
+      throw new SynchronizationError(
+        "RESYNC_REQUIRED",
+        "Local sequence exceeded the join watermark; joining again",
+        true,
+      );
+    }
+    if (localSequence < acknowledgement.joinWatermark) {
+      useBoardStore.getState().setConnection(this.sessionToken, "catching-up");
+      await this.catchUp(acknowledgement.joinWatermark, socket, attempt);
+    }
+
+    this.assertCurrent(socket, attempt);
+    this.drainLiveBuffer();
+    if (firstBufferedGap(this.sessionToken))
+      throw new SynchronizationError("RESYNC_REQUIRED", "A live sequence gap remains", true);
+    if (useBoardStore.getState().committed.lastSeq < acknowledgement.joinWatermark)
+      throw new SynchronizationError(
+        "RESYNC_REQUIRED",
+        "Catch-up did not reach the join watermark",
+        true,
+      );
+
+    this.completeAttempt(socket, attempt);
   }
 
   private async catchUp(
     watermark: number,
-    socket: Socket<ServerToClientEvents, ClientToServerEvents>,
-    generation: number,
+    socket: BoardSocket,
+    attempt: SynchronizationAttempt,
   ): Promise<void> {
     while (useBoardStore.getState().committed.lastSeq < watermark) {
-      this.assertCurrent(socket, generation);
+      this.assertCurrent(socket, attempt);
       const after = useBoardStore.getState().committed.lastSeq;
-      const response = await fetch(
-        `${API_URL}/v1/boards/${this.boardId}/operations?after=${after}&watermark=${watermark}`,
-      );
-      this.assertCurrent(socket, generation);
-      const raw: unknown = await response.json();
-      this.assertCurrent(socket, generation);
+      const response = await this.fetchRange(after, watermark, socket, attempt);
+      this.assertCurrent(socket, attempt);
+      let raw: unknown;
+      try {
+        raw = await response.json();
+      } catch {
+        throw new SynchronizationError("INTERNAL_ERROR", "Catch-up response was unreadable", true);
+      }
+      this.assertCurrent(socket, attempt);
       if (!response.ok) {
         const failure = protocolErrorSchema.safeParse(raw);
-        if (failure.success)
+        if (failure.success) {
+          if (failure.data.code === "RESYNC_REQUIRED") {
+            await this.rebaseFromSnapshot(socket, attempt);
+            throw new SynchronizationError(
+              "RESYNC_REQUIRED",
+              "Operation range was unavailable; authoritative snapshot reloaded",
+              true,
+            );
+          }
           throw new SynchronizationError(
             failure.data.code,
             failure.data.message,
             failure.data.retryable,
           );
+        }
         throw new SynchronizationError("INTERNAL_ERROR", "Catch-up request failed", true);
       }
-      const batch = operationRangeResponseSchema.parse(raw);
+      const parsed = operationRangeResponseSchema.safeParse(raw);
+      if (!parsed.success)
+        throw new SynchronizationError("INVALID_COMMAND", "Invalid catch-up response", false);
+      const batch = parsed.data;
       if (
         batch.boardId !== this.boardId ||
         batch.afterSeq !== after ||
@@ -243,28 +336,46 @@ export class BoardTransport {
       )
         throw new SynchronizationError("RESYNC_REQUIRED", "Catch-up response mismatch", true);
       for (const operation of batch.operations) {
+        this.assertCurrent(socket, attempt);
         const result = this.pendingQueue.observeCommitted(operation);
         if (result === "conflict")
           throw new SynchronizationError("RESYNC_REQUIRED", "Conflicting operation delivery", true);
       }
-      if (useBoardStore.getState().committed.lastSeq <= after)
+      if (useBoardStore.getState().committed.lastSeq <= after) {
+        await this.rebaseFromSnapshot(socket, attempt);
         throw new SynchronizationError("RESYNC_REQUIRED", "Catch-up made no progress", true);
-      if (!batch.hasMore && useBoardStore.getState().committed.lastSeq < watermark)
+      }
+      if (!batch.hasMore && useBoardStore.getState().committed.lastSeq < watermark) {
+        await this.rebaseFromSnapshot(socket, attempt);
         throw new SynchronizationError("RESYNC_REQUIRED", "Catch-up ended before watermark", true);
+      }
     }
   }
 
-  private requestJoin(
-    socket: Socket<ServerToClientEvents, ClientToServerEvents>,
-  ): Promise<JoinBoardAck> {
+  private requestJoin(socket: BoardSocket, attempt: SynchronizationAttempt): Promise<JoinBoardAck> {
     return new Promise((resolve, reject) => {
-      const timeout = globalThis.setTimeout(
+      let settled = false;
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        this.scheduler.clearTimeout(timeout);
+        attempt.cancelers.delete(cancel);
+        callback();
+      };
+      const cancel = (): void =>
+        finish(() =>
+          reject(new SynchronizationError("INTERNAL_ERROR", "Join attempt was cancelled", true)),
+        );
+      const timeout = this.scheduler.setTimeout(
         () =>
-          reject(
-            new SynchronizationError("INTERNAL_ERROR", "Join acknowledgement timed out", true),
+          finish(() =>
+            reject(
+              new SynchronizationError("INTERNAL_ERROR", "Join acknowledgement timed out", true),
+            ),
           ),
-        ACK_TIMEOUT_MS,
+        this.limits.acknowledgementTimeoutMs,
       );
+      attempt.cancelers.add(cancel);
       const state = useBoardStore.getState();
       socket.emit(
         "board:join",
@@ -274,40 +385,183 @@ export class BoardTransport {
           clientId: this.clientId,
           lastAppliedSeq: state.committed.lastSeq,
         },
-        (raw) => {
-          globalThis.clearTimeout(timeout);
-          const acknowledgement = joinBoardAckSchema.safeParse(raw);
-          if (!acknowledgement.success) {
-            reject(
-              new SynchronizationError("INTERNAL_ERROR", "Invalid join acknowledgement", true),
-            );
-            return;
-          }
-          resolve(acknowledgement.data);
-        },
+        (raw) =>
+          finish(() => {
+            if (!this.isCurrentAttempt(socket, attempt)) return;
+            const acknowledgement = joinBoardAckSchema.safeParse(raw);
+            if (!acknowledgement.success) {
+              reject(
+                new SynchronizationError("INVALID_COMMAND", "Invalid join acknowledgement", false),
+              );
+              return;
+            }
+            resolve(acknowledgement.data);
+          }),
       );
     });
   }
 
-  private bufferLive(operation: CommittedOperation): void {
-    const existing = this.liveBuffer.get(operation.seq);
-    if (existing && existing.opId !== operation.opId) {
-      this.liveConflict = true;
-      useBoardStore
-        .getState()
-        .setSynchronizationError(this.sessionToken, "RESYNC_REQUIRED: Conflicting live operations");
+  private async fetchRange(
+    after: number,
+    watermark: number,
+    socket: BoardSocket,
+    attempt: SynchronizationAttempt,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    let timedOut = false;
+    const cancel = (): void => controller.abort();
+    attempt.cancelers.add(cancel);
+    const timeout = this.scheduler.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.limits.acknowledgementTimeoutMs);
+    try {
+      const response = await this.fetcher(
+        `${this.apiUrl}/v1/boards/${this.boardId}/operations?after=${after}&watermark=${watermark}`,
+        { signal: controller.signal },
+      );
+      this.assertCurrent(socket, attempt);
+      return response;
+    } catch (error) {
+      if (timedOut)
+        throw new SynchronizationError(
+          "INTERNAL_ERROR",
+          "Catch-up acknowledgement timed out",
+          true,
+        );
+      if (attempt.cancelled) throw error;
+      throw new SynchronizationError("INTERNAL_ERROR", "Catch-up request failed", true);
+    } finally {
+      this.scheduler.clearTimeout(timeout);
+      attempt.cancelers.delete(cancel);
+    }
+  }
+
+  private async rebaseFromSnapshot(
+    socket: BoardSocket,
+    attempt: SynchronizationAttempt,
+  ): Promise<void> {
+    let raw: unknown;
+    try {
+      raw = await this.loadSnapshot(this.boardId, attempt.abortController.signal);
+    } catch (error) {
+      if (error instanceof SynchronizationError) throw error;
+      throw new SynchronizationError(
+        "INTERNAL_ERROR",
+        "Authoritative snapshot reload failed",
+        true,
+      );
+    }
+    this.assertCurrent(socket, attempt);
+    const parsed = boardSnapshotSchema.safeParse(raw);
+    if (!parsed.success || parsed.data.id !== this.boardId)
+      throw new SynchronizationError("INVALID_COMMAND", "Invalid authoritative snapshot", false);
+    if (!useBoardStore.getState().rebaseSession(this.sessionToken, parsed.data))
+      throw new SynchronizationError("INTERNAL_ERROR", "Snapshot session was superseded", true);
+  }
+
+  private async fetchSnapshot(boardId: string, signal: AbortSignal): Promise<BoardSnapshot> {
+    const response = await this.fetcher(`${this.apiUrl}/v1/boards/${boardId}`, { signal });
+    let raw: unknown;
+    try {
+      raw = await response.json();
+    } catch {
+      throw new SynchronizationError("INTERNAL_ERROR", "Snapshot response was unreadable", true);
+    }
+    if (!response.ok) {
+      const failure = protocolErrorSchema.safeParse(raw);
+      if (failure.success)
+        throw new SynchronizationError(
+          failure.data.code,
+          failure.data.message,
+          failure.data.retryable,
+        );
+      throw new SynchronizationError("INTERNAL_ERROR", "Snapshot reload failed", true);
+    }
+    return boardSnapshotSchema.parse(raw);
+  }
+
+  private receiveLive(socket: BoardSocket, raw: unknown): void {
+    if (!this.isSessionActive() || socket !== this.socket) return;
+    const parsed = committedOperationSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.failCurrentOrReady(
+        socket,
+        new SynchronizationError("INVALID_COMMAND", "Invalid live operation", false),
+      );
       return;
     }
-    this.liveBuffer.set(operation.seq, operation);
+    const operation = parsed.data;
+    if (operation.boardId !== this.boardId) {
+      this.failCurrentOrReady(
+        socket,
+        new SynchronizationError("INVALID_COMMAND", "Live operation board mismatch", false),
+      );
+      return;
+    }
+    if (this.activeAttempt) {
+      this.bufferLive(socket, operation);
+      return;
+    }
+    if (!this.ready || this.retryTimer) return;
+    const result = this.pendingQueue.observeCommitted(operation);
+    if (result === "buffered") {
+      this.ready = false;
+      this.pendingQueue.setReady(false);
+      this.beginSynchronization(socket);
+    } else if (result === "conflict") {
+      this.failCurrentOrReady(
+        socket,
+        new SynchronizationError("RESYNC_REQUIRED", "Conflicting live operation", true),
+      );
+    }
+  }
+
+  private bufferLive(socket: BoardSocket, operation: CommittedOperation): void {
+    const serialized = JSON.stringify(operation);
+    const bytes = new TextEncoder().encode(serialized).byteLength;
+    const existing = this.liveBuffer.get(operation.seq);
+    if (existing) {
+      if (existing.serialized !== serialized)
+        this.failCurrentOrReady(
+          socket,
+          new SynchronizationError("RESYNC_REQUIRED", "Conflicting live operations", true),
+        );
+      return;
+    }
+    const existingSequence = this.liveBufferOpSequences.get(operation.opId);
+    if (existingSequence !== undefined && existingSequence !== operation.seq) {
+      this.failCurrentOrReady(
+        socket,
+        new SynchronizationError("RESYNC_REQUIRED", "Conflicting live operation identity", true),
+      );
+      return;
+    }
+    if (
+      this.liveBuffer.size + 1 > this.limits.liveBufferMaxCount ||
+      this.liveBufferBytes + bytes > this.limits.liveBufferMaxBytes
+    ) {
+      this.failCurrentOrReady(
+        socket,
+        new SynchronizationError(
+          "BUFFER_LIMIT_EXCEEDED",
+          "Live synchronization buffer limit exceeded",
+          true,
+        ),
+      );
+      return;
+    }
+    this.liveBuffer.set(operation.seq, { operation, serialized, bytes });
+    this.liveBufferOpSequences.set(operation.opId, operation.seq);
+    this.liveBufferBytes += bytes;
+    this.updateBufferDiagnostics();
   }
 
   private drainLiveBuffer(): void {
-    if (this.liveConflict) {
-      this.liveConflict = false;
-      throw new SynchronizationError("RESYNC_REQUIRED", "Conflicting live operations", true);
-    }
-    const operations = [...this.liveBuffer.values()].sort((left, right) => left.seq - right.seq);
-    this.liveBuffer.clear();
+    const operations = [...this.liveBuffer.values()]
+      .map(({ operation }) => operation)
+      .sort((left, right) => left.seq - right.seq);
+    this.clearLiveBuffer();
     for (const operation of operations) {
       const result = this.pendingQueue.observeCommitted(operation);
       if (result === "conflict")
@@ -315,20 +569,150 @@ export class BoardTransport {
     }
   }
 
-  private isCurrent(
-    socket: Socket<ServerToClientEvents, ClientToServerEvents>,
-    generation: number,
-  ): boolean {
+  private completeAttempt(socket: BoardSocket, attempt: SynchronizationAttempt): void {
+    this.assertCurrent(socket, attempt);
+    attempt.cancelled = true;
+    attempt.cancelers.clear();
+    this.activeAttempt = null;
+    this.synchronizationFailures = 0;
+    this.ready = true;
+    this.updateDiagnostics({
+      retryCode: null,
+      retryScheduled: false,
+      retryDelayMs: null,
+    });
+    useBoardStore.getState().setConnection(this.sessionToken, "ready");
+    this.pendingQueue.setReady(true);
+  }
+
+  private failCurrentOrReady(socket: BoardSocket, failure: SynchronizationError): void {
+    const attempt = this.activeAttempt;
+    if (attempt) {
+      this.failAttempt(socket, attempt, failure);
+      return;
+    }
+    if (!this.ready || socket !== this.socket) return;
+    this.ready = false;
+    this.pendingQueue.setReady(false);
+    if (failure.retryable) this.scheduleRetry(socket, failure);
+    else this.setTerminalFailure(failure);
+  }
+
+  private failAttempt(
+    socket: BoardSocket,
+    attempt: SynchronizationAttempt,
+    failure: SynchronizationError,
+  ): void {
+    if (!this.isCurrentAttempt(socket, attempt)) return;
+    this.invalidateAttempt();
+    this.ready = false;
+    this.pendingQueue.setReady(false);
+    if (failure.retryable) this.scheduleRetry(socket, failure);
+    else this.setTerminalFailure(failure);
+  }
+
+  private scheduleRetry(socket: BoardSocket, failure: SynchronizationError): void {
+    if (!this.isSessionActive() || !socket.connected || socket !== this.socket || this.retryTimer)
+      return;
+    this.clearLiveBuffer();
+    this.synchronizationFailures += 1;
+    const exponent = Math.min(this.synchronizationFailures - 1, 20);
+    const baseDelay = Math.min(this.limits.retryCapMs, this.limits.retryBaseMs * 2 ** exponent);
+    const delay = Math.min(
+      this.limits.retryCapMs,
+      Math.round(baseDelay * (1 + this.scheduler.random() * 0.2)),
+    );
+    useBoardStore.getState().setConnection(this.sessionToken, "retry-wait");
+    this.updateDiagnostics({
+      retryCode: failure.code,
+      retryScheduled: true,
+      retryDelayMs: delay,
+    });
+    const connectionGeneration = this.connectionGeneration;
+    this.retryTimer = this.scheduler.setTimeout(() => {
+      this.retryTimer = null;
+      if (
+        !this.isSessionActive() ||
+        socket !== this.socket ||
+        !socket.connected ||
+        connectionGeneration !== this.connectionGeneration
+      )
+        return;
+      this.updateDiagnostics({ retryScheduled: false, retryDelayMs: null });
+      this.beginSynchronization(socket);
+    }, delay);
+  }
+
+  private setTerminalFailure(failure: SynchronizationError): void {
+    this.cancelRetry();
+    this.clearLiveBuffer();
+    const authorizationFailed = terminalAuthorizationCodes.has(failure.code);
+    useBoardStore
+      .getState()
+      .setSynchronizationError(
+        this.sessionToken,
+        `${failure.code}: ${failure.message}`,
+        authorizationFailed,
+      );
+    this.updateDiagnostics({
+      retryCode: failure.code,
+      retryScheduled: false,
+      retryDelayMs: null,
+    });
+  }
+
+  private invalidateAttempt(): void {
+    const attempt = this.activeAttempt;
+    if (!attempt) return;
+    this.activeAttempt = null;
+    attempt.cancelled = true;
+    attempt.abortController.abort();
+    for (const cancel of [...attempt.cancelers]) cancel();
+    attempt.cancelers.clear();
+    this.clearLiveBuffer();
+  }
+
+  private cancelRetry(): void {
+    if (this.retryTimer !== null) this.scheduler.clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.updateDiagnostics({ retryScheduled: false, retryDelayMs: null });
+  }
+
+  private clearLiveBuffer(): void {
+    this.liveBuffer.clear();
+    this.liveBufferOpSequences.clear();
+    this.liveBufferBytes = 0;
+    this.updateBufferDiagnostics();
+  }
+
+  private updateBufferDiagnostics(): void {
+    this.updateDiagnostics({
+      bufferedCount: this.liveBuffer.size,
+      bufferedBytes: this.liveBufferBytes,
+    });
+  }
+
+  private updateDiagnostics(
+    diagnostics: Parameters<
+      ReturnType<typeof useBoardStore.getState>["setSynchronizationDiagnostics"]
+    >[1],
+  ): void {
+    useBoardStore.getState().setSynchronizationDiagnostics(this.sessionToken, diagnostics);
+  }
+
+  private isCurrentAttempt(socket: BoardSocket, attempt: SynchronizationAttempt): boolean {
     return (
-      socket.connected && generation === this.synchronizationGeneration && this.isSessionActive()
+      !attempt.cancelled &&
+      socket.connected &&
+      socket === this.socket &&
+      attempt === this.activeAttempt &&
+      attempt.connectionGeneration === this.connectionGeneration &&
+      this.isSessionActive()
     );
   }
 
-  private assertCurrent(
-    socket: Socket<ServerToClientEvents, ClientToServerEvents>,
-    generation: number,
-  ): void {
-    if (!this.isCurrent(socket, generation))
+  private assertCurrent(socket: BoardSocket, attempt: SynchronizationAttempt): void {
+    if (!this.isCurrentAttempt(socket, attempt))
       throw new SynchronizationError("INTERNAL_ERROR", "Synchronization interrupted", true);
   }
 
@@ -339,7 +723,7 @@ export class BoardTransport {
   private createSubmissionAttempt(command: DurableCommand): SubmissionAttempt {
     if (!this.isSessionActive() || !this.socket?.connected || !this.ready)
       return retryableSubmission("Operation transport is not ready");
-    return timedSubmission(this.scheduler, ACK_TIMEOUT_MS, (acknowledge) =>
+    return timedSubmission(this.scheduler, SYNC_ACK_TIMEOUT_MS, (acknowledge) =>
       this.socket?.emit("operation:submit", command, acknowledge),
     );
   }
