@@ -19,6 +19,7 @@ export class RepositoryError extends Error {
     public readonly code:
       | "BOARD_NOT_FOUND"
       | "FORBIDDEN"
+      | "INVALID_COMMAND"
       | "TARGET_NOT_FOUND"
       | "TARGET_DELETED"
       | "CONFLICT",

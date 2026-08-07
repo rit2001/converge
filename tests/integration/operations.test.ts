@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BoardRepository, createPool } from "@converge/database";
 import { createRectangleCommand, fixtureIds } from "@converge/testkit";
-import type { DurableCommand } from "@converge/protocol";
+import { boardSnapshotSchema, type DurableCommand } from "@converge/protocol";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:5432/converge";
@@ -89,5 +89,64 @@ describe("authoritative operation transactions", () => {
     await repository.commitOperation(fixtureIds.user, createRectangleCommand(boardId));
     const operations = await repository.getOperations(boardId, fixtureIds.user, 2, 3);
     expect(operations.map((operation) => operation.seq)).toEqual([2, 3]);
+  });
+
+  it("rolls back a kind-incompatible patch and accepts the next valid mutation", async () => {
+    const boardId = await board();
+    const create = createRectangleCommand(boardId);
+    await repository.commitOperation(fixtureIds.user, create);
+
+    const persistedState = async () => {
+      const result = await pool.query<{
+        last_seq: string;
+        operation_count: string;
+        object_data: unknown;
+        outbox_count: string;
+      }>(
+        `SELECT b.last_seq,
+                (SELECT count(*) FROM board_operations WHERE board_id = b.id) operation_count,
+                o.object_data,
+                (SELECT count(*) FROM outbox_events WHERE board_id = b.id) outbox_count
+         FROM boards b
+         JOIN board_objects o ON o.board_id = b.id AND o.object_id = $2
+         WHERE b.id = $1`,
+        [boardId, create.targetId],
+      );
+      return result.rows[0];
+    };
+
+    const before = await persistedState();
+    expect(before).toBeDefined();
+    const invalid: DurableCommand = {
+      ...create,
+      opId: crypto.randomUUID(),
+      baseSeq: 1,
+      type: "object.update",
+      payload: { text: "rectangle poisoning" },
+      clientTimestamp: new Date().toISOString(),
+    };
+    await expect(repository.commitOperation(fixtureIds.user, invalid)).rejects.toMatchObject({
+      code: "INVALID_COMMAND",
+    });
+
+    expect(await persistedState()).toEqual(before);
+    expect(boardSnapshotSchema.parse(await repository.getBoard(boardId, fixtureIds.user))).toEqual(
+      expect.objectContaining({ lastSeq: 1, objects: [before?.object_data] }),
+    );
+
+    const valid: DurableCommand = {
+      ...invalid,
+      opId: crypto.randomUUID(),
+      payload: { fill: "#ffffff" },
+    };
+    const committed = await repository.commitOperation(fixtureIds.user, valid);
+    expect(committed.operation.seq).toBe(2);
+    const retrieved = boardSnapshotSchema.parse(
+      await repository.getBoard(boardId, fixtureIds.user),
+    );
+    expect(retrieved).toMatchObject({
+      lastSeq: 2,
+      objects: [{ id: create.targetId, kind: "rectangle", fill: "#ffffff", text: "" }],
+    });
   });
 });

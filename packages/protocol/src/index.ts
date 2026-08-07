@@ -8,29 +8,33 @@ const boundedText = z.string().max(10_000);
 const finiteNumber = z.number().finite().min(-1_000_000).max(1_000_000);
 const positiveSize = z.number().finite().min(8).max(100_000);
 
-export const rectangleObjectSchema = z.object({
-  id: idSchema,
-  kind: z.literal("rectangle"),
-  x: finiteNumber,
-  y: finiteNumber,
-  width: positiveSize,
-  height: positiveSize,
-  rotation: finiteNumber,
-  fill: z.string().regex(/^#[0-9a-fA-F]{6}$/),
-  text: z.literal(""),
-});
+export const rectangleObjectSchema = z
+  .object({
+    id: idSchema,
+    kind: z.literal("rectangle"),
+    x: finiteNumber,
+    y: finiteNumber,
+    width: positiveSize,
+    height: positiveSize,
+    rotation: finiteNumber,
+    fill: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+    text: z.literal(""),
+  })
+  .strict();
 
-export const stickyObjectSchema = z.object({
-  id: idSchema,
-  kind: z.literal("sticky"),
-  x: finiteNumber,
-  y: finiteNumber,
-  width: positiveSize,
-  height: positiveSize,
-  rotation: finiteNumber,
-  fill: z.string().regex(/^#[0-9a-fA-F]{6}$/),
-  text: boundedText,
-});
+export const stickyObjectSchema = z
+  .object({
+    id: idSchema,
+    kind: z.literal("sticky"),
+    x: finiteNumber,
+    y: finiteNumber,
+    width: positiveSize,
+    height: positiveSize,
+    rotation: finiteNumber,
+    fill: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+    text: boundedText,
+  })
+  .strict();
 
 export const canvasObjectSchema = z.discriminatedUnion("kind", [
   rectangleObjectSchema,
@@ -59,15 +63,17 @@ export const transformPatchSchema = z
   .strict()
   .refine((patch) => Object.keys(patch).length > 0, "Transform must contain a field");
 
-const commandBaseSchema = z.object({
-  schemaVersion: z.literal(SCHEMA_VERSION),
-  opId: idSchema,
-  boardId: idSchema,
-  clientId: idSchema,
-  baseSeq: sequenceSchema,
-  targetId: idSchema,
-  clientTimestamp: z.string().datetime({ offset: true }),
-});
+const commandBaseSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    opId: idSchema,
+    boardId: idSchema,
+    clientId: idSchema,
+    baseSeq: sequenceSchema,
+    targetId: idSchema,
+    clientTimestamp: z.string().datetime({ offset: true }),
+  })
+  .strict();
 
 export const objectCreateCommandSchema = commandBaseSchema.extend({
   type: z.literal("object.create"),
@@ -116,9 +122,17 @@ export const ephemeralEventTypeSchema = z.enum([
   "text.preview",
 ]);
 
-export const committedOperationSchema = durableCommandSchema.and(
-  z.object({ seq: sequenceSchema.positive(), committedAt: z.string().datetime({ offset: true }) }),
-);
+const committedFields = {
+  seq: sequenceSchema.positive(),
+  committedAt: z.string().datetime({ offset: true }),
+};
+
+export const committedOperationSchema = z.discriminatedUnion("type", [
+  objectCreateCommandSchema.extend(committedFields),
+  objectUpdateCommandSchema.extend(committedFields),
+  objectTransformCommandSchema.extend(committedFields),
+  objectDeleteCommandSchema.extend(committedFields),
+]);
 
 export const errorCodeSchema = z.enum([
   "AUTHENTICATION_REQUIRED",
@@ -152,18 +166,21 @@ export const boardSnapshotSchema = z.object({
 export const createBoardRequestSchema = z
   .object({ name: z.string().trim().min(1).max(120) })
   .strict();
-export const joinBoardRequestSchema = z.object({
-  schemaVersion: z.literal(SCHEMA_VERSION),
-  boardId: idSchema,
-  clientId: idSchema,
-  lastAppliedSeq: sequenceSchema,
-  pendingOpIds: z.array(idSchema).max(1_000),
-});
+export const joinBoardRequestSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    clientId: idSchema,
+    lastAppliedSeq: sequenceSchema,
+    pendingOpIds: z.array(idSchema).max(1_000),
+  })
+  .strict();
 export const operationRangeQuerySchema = z
   .object({
     from: z.coerce.number().int().positive(),
     to: z.coerce.number().int().positive(),
   })
+  .strict()
   .refine(
     ({ from, to }) => to >= from && to - from < 1_000,
     "Range must contain at most 1,000 operations",

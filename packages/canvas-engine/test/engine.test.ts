@@ -32,6 +32,15 @@ const create: DurableCommand = {
   },
 };
 
+const createRectangle: DurableCommand = {
+  ...create,
+  payload: {
+    ...create.payload,
+    kind: "rectangle",
+    text: "",
+  },
+};
+
 describe("canvas engine", () => {
   it("merges patches to independent fields", () => {
     const created = reduceCommand(emptyBoardState(), create, 1);
@@ -65,6 +74,46 @@ describe("canvas engine", () => {
     });
   });
 
+  it("accepts valid rectangle updates", () => {
+    const created = reduceCommand(emptyBoardState(), createRectangle, 1);
+    if (!created.ok) throw new Error("fixture failed");
+    const updated = reduceCommand(
+      created.state,
+      {
+        ...base,
+        opId: "40000000-0000-4000-8000-000000000006",
+        type: "object.update",
+        payload: { fill: "#ffffff" },
+      },
+      2,
+    );
+    expect(updated.ok && updated.state.objects[ids.object]?.value).toMatchObject({
+      kind: "rectangle",
+      fill: "#ffffff",
+      text: "",
+    });
+  });
+
+  it("rejects rectangle text poisoning without returning or applying a partial state", () => {
+    const created = reduceCommand(emptyBoardState(), createRectangle, 1);
+    if (!created.ok) throw new Error("fixture failed");
+    const before = canonicalBoard(created.state);
+    const poisoned = reduceCommand(
+      created.state,
+      {
+        ...base,
+        opId: "40000000-0000-4000-8000-000000000007",
+        type: "object.update",
+        payload: { text: "poisoned" },
+      },
+      2,
+    );
+    expect(poisoned).toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    expect("state" in poisoned).toBe(false);
+    expect(canonicalBoard(created.state)).toBe(before);
+    expect(created.state.objects[ids.object]?.value.text).toBe("");
+  });
+
   it("makes delete win over stale updates", () => {
     const created = reduceCommand(emptyBoardState(), create, 1);
     if (!created.ok) throw new Error("fixture failed");
@@ -95,5 +144,30 @@ describe("canvas engine", () => {
     );
     expect(await hashBoardState(created.state)).toMatch(/^[a-f0-9]{64}$/);
     expect(await hashBoardState(created.state)).toBe(await hashBoardState(created.state));
+  });
+
+  it("keeps canonical hashing unchanged for equivalent valid objects", async () => {
+    const original = reduceCommand(emptyBoardState(), create, 1);
+    const reordered = reduceCommand(
+      emptyBoardState(),
+      {
+        ...create,
+        payload: {
+          text: "hello",
+          fill: "#fde68a",
+          rotation: 0,
+          height: 140,
+          width: 180,
+          y: 2,
+          x: 1,
+          kind: "sticky",
+          id: ids.object,
+        },
+      },
+      1,
+    );
+    if (!original.ok || !reordered.ok) throw new Error("fixture failed");
+    expect(canonicalBoard(reordered.state)).toBe(canonicalBoard(original.state));
+    expect(await hashBoardState(reordered.state)).toBe(await hashBoardState(original.state));
   });
 });

@@ -1,4 +1,9 @@
-import type { CanvasObject, CommittedOperation, DurableCommand } from "@converge/protocol";
+import {
+  canvasObjectSchema,
+  type CanvasObject,
+  type CommittedOperation,
+  type DurableCommand,
+} from "@converge/protocol";
 
 export interface ProjectedObject {
   value: CanvasObject;
@@ -16,7 +21,11 @@ export interface BoardState {
 
 export type ReductionResult =
   | { ok: true; state: BoardState }
-  | { ok: false; code: "TARGET_NOT_FOUND" | "TARGET_DELETED" | "CONFLICT"; message: string };
+  | {
+      ok: false;
+      code: "INVALID_COMMAND" | "TARGET_NOT_FOUND" | "TARGET_DELETED" | "CONFLICT";
+      message: string;
+    };
 
 export const emptyBoardState = (): BoardState => ({ lastSeq: 0, objects: {}, order: [] });
 
@@ -25,17 +34,17 @@ function activeObject(state: BoardState, targetId: string): ProjectedObject | un
   return projected?.deletedSeq === null ? projected : undefined;
 }
 
-function updateFields(projected: ProjectedObject, payload: object, seq: number): ProjectedObject {
-  const value = { ...projected.value } as CanvasObject;
+function updateFields(
+  projected: ProjectedObject,
+  payload: object,
+  seq: number,
+): ProjectedObject | undefined {
+  const candidate = { ...projected.value, ...payload };
+  const parsed = canvasObjectSchema.safeParse(candidate);
+  if (!parsed.success) return undefined;
   const fieldSeq = { ...projected.fieldSeq };
-  const entries = Object.entries(payload) as [string, unknown][];
-  for (const [field, next] of entries) {
-    if (typeof next !== "string" && typeof next !== "number") continue;
-    const patch: Record<string, string | number> = { [field]: next };
-    Object.assign(value, patch);
-    fieldSeq[field] = seq;
-  }
-  return { ...projected, value, fieldSeq, updatedSeq: seq };
+  for (const field of Object.keys(payload)) fieldSeq[field] = seq;
+  return { ...projected, value: parsed.data, fieldSeq, updatedSeq: seq };
 }
 
 export function reduceCommand(
@@ -49,7 +58,15 @@ export function reduceCommand(
     if (command.payload.id !== command.targetId) {
       return { ok: false, code: "CONFLICT", message: "Payload id must match target id" };
     }
-    const fieldSeq = Object.fromEntries(Object.keys(command.payload).map((field) => [field, seq]));
+    const parsed = canvasObjectSchema.safeParse(command.payload);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        code: "INVALID_COMMAND",
+        message: "Object does not satisfy its kind invariant",
+      };
+    }
+    const fieldSeq = Object.fromEntries(Object.keys(parsed.data).map((field) => [field, seq]));
     return {
       ok: true,
       state: {
@@ -57,7 +74,7 @@ export function reduceCommand(
         objects: {
           ...state.objects,
           [command.targetId]: {
-            value: command.payload,
+            value: parsed.data,
             createdSeq: seq,
             updatedSeq: seq,
             deletedSeq: null,
@@ -82,13 +99,26 @@ export function reduceCommand(
   if (!projected) return { ok: false, code: "TARGET_DELETED", message: "Target is deleted" };
 
   if (command.type === "object.delete") {
+    const parsed = canvasObjectSchema.safeParse(projected.value);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        code: "INVALID_COMMAND",
+        message: "Object does not satisfy its kind invariant",
+      };
+    }
     return {
       ok: true,
       state: {
         lastSeq: seq,
         objects: {
           ...state.objects,
-          [command.targetId]: { ...projected, deletedSeq: seq, updatedSeq: seq },
+          [command.targetId]: {
+            ...projected,
+            value: parsed.data,
+            deletedSeq: seq,
+            updatedSeq: seq,
+          },
         },
         order: state.order.filter((id) => id !== command.targetId),
       },
@@ -96,6 +126,13 @@ export function reduceCommand(
   }
 
   const next = updateFields(projected, command.payload, seq);
+  if (!next) {
+    return {
+      ok: false,
+      code: "INVALID_COMMAND",
+      message: `Patch is incompatible with ${projected.value.kind} object`,
+    };
+  }
   return {
     ok: true,
     state: { ...state, lastSeq: seq, objects: { ...state.objects, [command.targetId]: next } },
