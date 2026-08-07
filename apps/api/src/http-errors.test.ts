@@ -169,7 +169,12 @@ describe("HTTP error sanitization", () => {
         url: "/v1/boards/00000000-0000-4000-8000-000000000099",
       });
       expect(enumeration.statusCode).toBe(404);
-      expect(enumeration.json()).toEqual({ code: "BOARD_NOT_FOUND", message: "Board not found" });
+      expect(enumeration.json()).toEqual({
+        ok: false,
+        code: "BOARD_NOT_FOUND",
+        message: "Board not found",
+        retryable: false,
+      });
     } finally {
       await Promise.all([
         authenticationContext.io.close(),

@@ -21,6 +21,7 @@ import {
   operationAckSchema,
   operationRangeQuerySchema,
   operationRangeResponseSchema,
+  protocolErrorSchema,
   removeBoardMemberParamsSchema,
   removeBoardMemberRequestSchema,
   removeBoardMemberResponseSchema,
@@ -239,7 +240,7 @@ export async function buildApp(
       if (error instanceof RepositoryError)
         return reply
           .code(errorStatus(error.code))
-          .send({ code: error.code, message: error.message });
+          .send(protocolErrorSchema.parse(failedAck(error)));
       throw error;
     }
   });
@@ -263,11 +264,9 @@ export async function buildApp(
         };
       } catch (error) {
         if (error instanceof RepositoryError)
-          return reply.code(errorStatus(error.code)).send({
-            code: error.code,
-            message: error.message,
-            retryable: error.code === "RESYNC_REQUIRED",
-          });
+          return reply
+            .code(errorStatus(error.code))
+            .send(protocolErrorSchema.parse(failedAck(error)));
         throw error;
       }
     },

@@ -7,6 +7,7 @@ import { BoardRepository, createPool } from "@converge/database";
 import {
   boardSnapshotSchema,
   operationRangeResponseSchema,
+  protocolErrorSchema,
   type CommittedOperation,
   type DurableCommand,
   type JoinBoardAck,
@@ -390,6 +391,68 @@ describe("join watermark catch-up", () => {
     expect(await persistedState(boardId)).toEqual(before);
   });
 
+  it("returns protocol errors for unavailable ranges and lets the transport rebase", async () => {
+    const boardId = await board();
+    const staleSnapshot = boardSnapshotSchema.parse(
+      await repository.getBoard(boardId, identities.owner.id),
+    );
+    await repository.commitOperation(identities.owner.id, createRectangleCommand(boardId));
+    await pool.query("DELETE FROM board_operations WHERE board_id = $1", [boardId]);
+
+    const unavailable = await range(boardId, tokens.owner, 0, 1);
+    expect(unavailable.statusCode).toBe(409);
+    expect(protocolErrorSchema.parse(unavailable.json())).toEqual({
+      ok: false,
+      code: "RESYNC_REQUIRED",
+      message: "Operation range is unavailable",
+      retryable: true,
+    });
+
+    const token: BoardSessionToken = { generation: 70_002, nonce: Symbol("range-rebase") };
+    useBoardStore.getState().beginSession(token, boardId);
+    useBoardStore.getState().initializeSession(token, staleSnapshot, []);
+    const scheduler = new IntegrationScheduler();
+    const requestedUrls: string[] = [];
+    const transport = new BoardTransport(boardId, crypto.randomUUID(), token, {
+      apiUrl: serverUrl,
+      scheduler,
+      pendingStore: new IntegrationPendingStore(),
+      socketFactory: () => {
+        const socket = createTestSocket(serverUrl, tokens.owner);
+        sockets.add(socket);
+        return socket as never;
+      },
+      fetcher: (input, init) => {
+        requestedUrls.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        );
+        return fetch(input, {
+          ...init,
+          headers: testAuthorizationHeaders(tokens.owner),
+        });
+      },
+    });
+    try {
+      transport.connect();
+      await vi.waitFor(() => {
+        expect(useBoardStore.getState()).toMatchObject({
+          connection: "retry-wait",
+          committed: { lastSeq: 1 },
+          synchronizationDiagnostics: { retryCode: "RESYNC_REQUIRED" },
+        });
+      });
+      expect(requestedUrls.filter((url) => url.includes("/operations?"))).toHaveLength(1);
+      expect(requestedUrls.filter((url) => !url.includes("/operations?"))).toHaveLength(1);
+
+      scheduler.runDelay(500);
+      await vi.waitFor(() => expect(useBoardStore.getState().connection).toBe("ready"));
+      expect(requestedUrls.filter((url) => url.includes("/operations?"))).toHaveLength(1);
+    } finally {
+      transport.disconnect();
+      useBoardStore.getState().endSession(token);
+    }
+  });
+
   it("rejects a client sequence ahead of the board head without writes", async () => {
     const boardId = await board();
     const before = await persistedState(boardId);
@@ -438,6 +501,39 @@ describe("join watermark catch-up", () => {
 });
 
 describe("catch-up authorization", () => {
+  it("returns the shared protocol error for inaccessible board snapshots", async () => {
+    const boardId = await board();
+    const successful = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}`,
+      headers: testAuthorizationHeaders(tokens.owner),
+    });
+    expect(successful.statusCode).toBe(200);
+    expect(boardSnapshotSchema.parse(successful.json())).toMatchObject({ id: boardId, lastSeq: 0 });
+
+    const inaccessible = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}`,
+      headers: testAuthorizationHeaders(tokens.outsider),
+    });
+    const nonexistent = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${crypto.randomUUID()}`,
+      headers: testAuthorizationHeaders(tokens.outsider),
+    });
+    expect(inaccessible.statusCode).toBe(404);
+    expect(protocolErrorSchema.parse(inaccessible.json())).toEqual({
+      ok: false,
+      code: "BOARD_NOT_FOUND",
+      message: "Board not found",
+      retryable: false,
+    });
+    expect({ status: nonexistent.statusCode, body: nonexistent.json<unknown>() }).toEqual({
+      status: inaccessible.statusCode,
+      body: inaccessible.json<unknown>(),
+    });
+  });
+
   it("allows members and denies outsider or unauthenticated range access", async () => {
     const boardId = await board(true);
     await repository.commitOperation(identities.owner.id, createRectangleCommand(boardId));

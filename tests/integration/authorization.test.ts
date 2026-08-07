@@ -345,7 +345,12 @@ describe("HTTP and Socket.IO authorization matrix", () => {
       body: missingBody,
     });
     expect(existing.statusCode).toBe(404);
-    expect(existingBody).toEqual({ code: "BOARD_NOT_FOUND", message: "Board not found" });
+    expect(existingBody).toEqual({
+      ok: false,
+      code: "BOARD_NOT_FOUND",
+      message: "Board not found",
+      retryable: false,
+    });
 
     const socket = await connectSocket(tokens.outsider);
     const existingJoin = await joinBoard(socket, boardId);
