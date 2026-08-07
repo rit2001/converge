@@ -136,6 +136,7 @@ export const committedOperationSchema = z.discriminatedUnion("type", [
 
 export const errorCodeSchema = z.enum([
   "AUTHENTICATION_REQUIRED",
+  "INVALID_AUTH_INPUT",
   "BOARD_NOT_FOUND",
   "FORBIDDEN",
   "INVALID_COMMAND",

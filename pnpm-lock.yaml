@@ -169,6 +169,9 @@ importers:
 
   packages/testkit:
     dependencies:
+      '@converge/api':
+        specifier: workspace:*
+        version: link:../../apps/api
       '@converge/protocol':
         specifier: workspace:*
         version: link:../protocol
@@ -188,6 +191,9 @@ importers:
 
   tests/integration:
     dependencies:
+      '@converge/api':
+        specifier: workspace:*
+        version: link:../../apps/api
       '@converge/database':
         specifier: workspace:*
         version: link:../../packages/database

@@ -82,11 +82,7 @@ export class BoardRepository {
       [boardId, userId],
     );
     if (!result.rowCount) {
-      const exists = await this.pool.query("SELECT 1 FROM boards WHERE id = $1", [boardId]);
-      throw new RepositoryError(
-        exists.rowCount ? "FORBIDDEN" : "BOARD_NOT_FOUND",
-        exists.rowCount ? "Board membership required" : "Board not found",
-      );
+      throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");
     }
     const first = result.rows[0];
     if (!first) throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");

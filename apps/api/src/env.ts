@@ -8,7 +8,7 @@ const environmentSchema = z.object({
   DATABASE_URL: z.string().url(),
   REDIS_URL: z.string().url().default("redis://localhost:6379"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
-  DEV_AUTH_USER_ID: z.string().uuid(),
+  DEV_AUTH_USER_ID: z.string().uuid().optional(),
   DEV_AUTH_USER_NAME: z.string().min(1).max(100).default("Local Developer"),
 });
 

@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
-import { Server } from "socket.io";
+import { Server, type DefaultEventsMap } from "socket.io";
 import { z } from "zod";
 import { BoardRepository, RepositoryError, type DatabasePool } from "@converge/database";
 import {
@@ -13,7 +13,7 @@ import {
   type OperationAck,
   type ServerToClientEvents,
 } from "@converge/protocol";
-import type { AuthenticationAdapter } from "./auth.js";
+import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
 import type { Environment } from "./env.js";
 
 function errorStatus(code: RepositoryError["code"]): number {
@@ -23,6 +23,8 @@ function errorStatus(code: RepositoryError["code"]): number {
 }
 
 function failedAck(error: unknown): OperationAck {
+  if (error instanceof AuthenticationError)
+    return { ok: false, code: error.code, message: error.message, retryable: false };
   if (error instanceof RepositoryError)
     return { ok: false, code: error.code, message: error.message, retryable: false };
   if (error instanceof z.ZodError)
@@ -40,31 +42,60 @@ function failedAck(error: unknown): OperationAck {
   };
 }
 
+function socketAuthenticationError(error: AuthenticationError): Error {
+  return Object.assign(new Error(error.message), {
+    data: { code: error.code, message: error.message, retryable: false },
+  });
+}
+
 export interface AppContext {
   app: FastifyInstance;
-  io: Server<ClientToServerEvents, ServerToClientEvents>;
+  io: Server<ClientToServerEvents, ServerToClientEvents, DefaultEventsMap, AuthenticatedSocketData>;
+}
+
+interface AuthenticatedSocketData {
+  principal: AuthenticatedPrincipal;
 }
 
 export async function buildApp(
   environment: Environment,
   pool: DatabasePool,
-  auth: AuthenticationAdapter,
+  auth: AuthAdapter,
 ): Promise<AppContext> {
   const app = Fastify({ logger: { level: environment.LOG_LEVEL }, bodyLimit: 64 * 1024 });
   await app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   const repository = new BoardRepository(pool);
 
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof AuthenticationError)
+      return reply
+        .code(error.code === "AUTHENTICATION_REQUIRED" ? 401 : 400)
+        .send({ code: error.code, message: error.message, retryable: false });
+    if (error instanceof z.ZodError)
+      return reply.code(400).send({
+        code: "INVALID_COMMAND",
+        message: "Request validation failed",
+        retryable: false,
+      });
+    return reply.send(error);
+  });
+
+  const authenticateHttp = async (request: Parameters<AuthAdapter["authenticateHttp"]>[0]) => {
+    const principal = await auth.authenticateHttp(request);
+    if (!principal)
+      throw new AuthenticationError("AUTHENTICATION_REQUIRED", "Authentication required");
+    return principal;
+  };
+
   app.get("/health", () => ({ ok: true }));
   app.post("/v1/boards", async (request, reply) => {
-    const user = await auth.authenticateHttp(request);
-    if (!user) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
+    const user = await authenticateHttp(request);
     const body = createBoardRequestSchema.parse(request.body);
     return reply.code(201).send(await repository.createBoard(user.id, body.name));
   });
   app.get<{ Params: { boardId: string } }>("/v1/boards/:boardId", async (request, reply) => {
-    const user = await auth.authenticateHttp(request);
-    if (!user) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
+    const user = await authenticateHttp(request);
     try {
       return await repository.getBoard(z.string().uuid().parse(request.params.boardId), user.id);
     } catch (error) {
@@ -78,8 +109,7 @@ export async function buildApp(
   app.get<{ Params: { boardId: string }; Querystring: { from: string; to: string } }>(
     "/v1/boards/:boardId/operations",
     async (request, reply) => {
-      const user = await auth.authenticateHttp(request);
-      if (!user) return reply.code(401).send({ code: "AUTHENTICATION_REQUIRED" });
+      const user = await authenticateHttp(request);
       const boardId = z.string().uuid().parse(request.params.boardId);
       const range = operationRangeQuerySchema.parse(request.query);
       try {
@@ -96,16 +126,31 @@ export async function buildApp(
     },
   );
 
-  const io = new Server<ClientToServerEvents, ServerToClientEvents>(app.server, {
+  const io = new Server<
+    ClientToServerEvents,
+    ServerToClientEvents,
+    DefaultEventsMap,
+    AuthenticatedSocketData
+  >(app.server, {
     cors: { origin: environment.WEB_ORIGIN, credentials: true },
     maxHttpBufferSize: 64 * 1024,
   });
-  io.on("connection", async (socket) => {
-    const user = await auth.authenticateSocket(socket);
-    if (!user) {
-      socket.disconnect(true);
-      return;
-    }
+  io.use((socket, next) => {
+    void (async () => {
+      try {
+        const principal = await auth.authenticateSocket(socket);
+        if (!principal)
+          throw new AuthenticationError("AUTHENTICATION_REQUIRED", "Authentication required");
+        socket.data.principal = principal;
+        next();
+      } catch (error) {
+        if (error instanceof AuthenticationError) next(socketAuthenticationError(error));
+        else next(new Error("Authentication failed"));
+      }
+    })();
+  });
+  io.on("connection", (socket) => {
+    const user = socket.data.principal;
     let windowStarted = Date.now();
     let commandsInWindow = 0;
     socket.on("board:join", async (raw, acknowledge) => {

@@ -13,6 +13,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@converge/api": "workspace:*",
     "@converge/protocol": "workspace:*",
     "socket.io-client": "4.8.1"
   },
