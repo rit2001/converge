@@ -13,6 +13,22 @@ const environmentSchema = z.object({
 });
 
 export type Environment = z.infer<typeof environmentSchema>;
+
+export class EnvironmentConfigurationError extends Error {
+  constructor(public readonly fields: string[]) {
+    super(`Invalid environment configuration: ${fields.join(", ")}`);
+  }
+}
+
 export function parseEnvironment(source: NodeJS.ProcessEnv): Environment {
-  return environmentSchema.parse(source);
+  const result = environmentSchema.safeParse(source);
+  if (result.success) return result.data;
+  const fields = [
+    ...new Set(
+      result.error.issues.map((issue) =>
+        typeof issue.path[0] === "string" ? issue.path[0] : "environment",
+      ),
+    ),
+  ].sort();
+  throw new EnvironmentConfigurationError(fields);
 }

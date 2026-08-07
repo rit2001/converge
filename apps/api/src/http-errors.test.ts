@@ -1,0 +1,186 @@
+import { Writable } from "node:stream";
+import { describe, expect, it } from "vitest";
+import { RepositoryError, type DatabasePool } from "@converge/database";
+import { httpInternalErrorResponseSchema } from "@converge/protocol";
+import { buildApp } from "./app.js";
+import type { AuthAdapter, AuthenticatedPrincipal } from "./auth.js";
+import type { Environment } from "./env.js";
+
+const principal: AuthenticatedPrincipal = {
+  id: "00000000-0000-4000-8000-000000000091",
+  displayName: "HTTP Error Tester",
+};
+
+const authenticated: AuthAdapter = {
+  authenticateHttp: () => Promise.resolve(principal),
+  authenticateSocket: () => Promise.resolve(principal),
+};
+
+const unauthenticated: AuthAdapter = {
+  authenticateHttp: () => Promise.resolve(null),
+  authenticateSocket: () => Promise.resolve(null),
+};
+
+function environment(
+  nodeEnvironment: Environment["NODE_ENV"],
+  logLevel: Environment["LOG_LEVEL"] = "silent",
+): Environment {
+  return {
+    NODE_ENV: nodeEnvironment,
+    HOST: "127.0.0.1",
+    API_PORT: 4000,
+    WEB_ORIGIN: "http://127.0.0.1:3000",
+    DATABASE_URL: "postgresql://localhost/converge",
+    REDIS_URL: "redis://localhost:6379",
+    LOG_LEVEL: logLevel,
+    DEV_AUTH_USER_NAME: "Unused",
+  };
+}
+
+function failingPool(error: Error): DatabasePool {
+  return { connect: () => Promise.reject(error) } as unknown as DatabasePool;
+}
+
+function queryPool(rows: unknown[] = []): DatabasePool {
+  return {
+    query: () => Promise.resolve({ rowCount: rows.length, rows }),
+  } as unknown as DatabasePool;
+}
+
+function captureLogs(): { entries: Record<string, unknown>[]; stream: Writable } {
+  const entries: Record<string, unknown>[] = [];
+  let pending = "";
+  const stream = new Writable({
+    write(chunk, _encoding, callback) {
+      pending += String(chunk);
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) if (line) entries.push(JSON.parse(line) as Record<string, unknown>);
+      callback();
+    },
+  });
+  return { entries, stream };
+}
+
+describe("HTTP error sanitization", () => {
+  it.each(["development", "production"] as const)(
+    "returns the same sanitized 500 contract in %s and keeps bounded server evidence",
+    async (nodeEnvironment) => {
+      const distinctive =
+        "SELECT password FROM private_accounts at /srv/converge/internal/repository.ts";
+      const logs = captureLogs();
+      const context = await buildApp(
+        environment(nodeEnvironment, "info"),
+        failingPool(new Error(distinctive)),
+        authenticated,
+        { loggerStream: logs.stream },
+      );
+      try {
+        const response = await context.app.inject({
+          method: "POST",
+          url: "/v1/boards",
+          headers: { authorization: "Bearer caller-secret" },
+          payload: { name: "sensitive-request-body" },
+        });
+        expect(response.statusCode).toBe(500);
+        const body = httpInternalErrorResponseSchema.parse(response.json());
+        expect(body).toMatchObject({
+          ok: false,
+          code: "INTERNAL_ERROR",
+          message: "An internal server error occurred.",
+          retryable: true,
+        });
+        const publicResponse = response.body;
+        for (const forbidden of [
+          distinctive,
+          "SELECT",
+          "private_accounts",
+          "/srv/converge",
+          "password",
+          "caller-secret",
+          "sensitive-request-body",
+        ])
+          expect(publicResponse).not.toContain(forbidden);
+
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const logged = logs.entries.find(
+          (entry) => entry.msg === "unexpected HTTP request failure",
+        );
+        expect(logged).toMatchObject({ requestId: body.requestId });
+        expect(JSON.stringify(logged)).toContain(distinctive);
+        const allLogs = JSON.stringify(logs.entries);
+        expect(allLogs).not.toContain("caller-secret");
+        expect(allLogs).not.toContain("sensitive-request-body");
+      } finally {
+        await context.io.close();
+        await context.app.close();
+      }
+    },
+  );
+
+  it("preserves known authentication, validation, domain, and enumeration responses", async () => {
+    const authenticationContext = await buildApp(environment("test"), queryPool(), unauthenticated);
+    const validationContext = await buildApp(environment("test"), queryPool(), authenticated);
+    const domainContext = await buildApp(
+      environment("test"),
+      failingPool(new RepositoryError("CONFLICT", "Known board conflict")),
+      authenticated,
+    );
+    try {
+      const authentication = await authenticationContext.app.inject({
+        method: "POST",
+        url: "/v1/boards",
+        payload: { name: "Board" },
+      });
+      expect(authentication.statusCode).toBe(401);
+      expect(authentication.json()).toEqual({
+        code: "AUTHENTICATION_REQUIRED",
+        message: "Authentication required",
+        retryable: false,
+      });
+
+      const validation = await validationContext.app.inject({
+        method: "POST",
+        url: "/v1/boards",
+        payload: { name: "", unknown: true },
+      });
+      expect(validation.statusCode).toBe(400);
+      expect(validation.json()).toEqual({
+        code: "INVALID_COMMAND",
+        message: "Request validation failed",
+        retryable: false,
+      });
+
+      const domain = await domainContext.app.inject({
+        method: "POST",
+        url: "/v1/boards",
+        payload: { name: "Board" },
+      });
+      expect(domain.statusCode).toBe(409);
+      expect(domain.json()).toEqual({
+        ok: false,
+        code: "CONFLICT",
+        message: "Known board conflict",
+        retryable: false,
+      });
+
+      const enumeration = await validationContext.app.inject({
+        method: "GET",
+        url: "/v1/boards/00000000-0000-4000-8000-000000000099",
+      });
+      expect(enumeration.statusCode).toBe(404);
+      expect(enumeration.json()).toEqual({ code: "BOARD_NOT_FOUND", message: "Board not found" });
+    } finally {
+      await Promise.all([
+        authenticationContext.io.close(),
+        validationContext.io.close(),
+        domainContext.io.close(),
+      ]);
+      await Promise.all([
+        authenticationContext.app.close(),
+        validationContext.app.close(),
+        domainContext.app.close(),
+      ]);
+    }
+  });
+});

@@ -1,7 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
 const databaseUrl =
-  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:5432/converge";
+  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
 export default defineConfig({
   testDir: ".",
   testMatch: "*.spec.ts",

@@ -24,7 +24,7 @@ import {
 } from "@converge/testkit";
 
 const databaseUrl =
-  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:5432/converge";
+  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
 const pool = createPool(databaseUrl);
 
 const identities = {

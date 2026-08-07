@@ -162,6 +162,16 @@ export const protocolErrorSchema = z
   })
   .strict();
 
+export const httpInternalErrorResponseSchema = z
+  .object({
+    ok: z.literal(false),
+    code: z.literal("INTERNAL_ERROR"),
+    message: z.literal("An internal server error occurred."),
+    retryable: z.literal(true),
+    requestId: z.string().min(1).max(128),
+  })
+  .strict();
+
 export const operationAckSchema = z.discriminatedUnion("ok", [
   z
     .object({ ok: z.literal(true), duplicate: z.boolean(), operation: committedOperationSchema })
@@ -294,6 +304,7 @@ export type DurableCommand = z.infer<typeof durableCommandSchema>;
 export type CommittedOperation = z.infer<typeof committedOperationSchema>;
 export type OperationAck = z.infer<typeof operationAckSchema>;
 export type ProtocolError = z.infer<typeof protocolErrorSchema>;
+export type HttpInternalErrorResponse = z.infer<typeof httpInternalErrorResponseSchema>;
 export type BoardSnapshot = z.infer<typeof boardSnapshotSchema>;
 export type JoinBoardRequest = z.infer<typeof joinBoardRequestSchema>;
 export type JoinBoardAck = z.infer<typeof joinBoardAckSchema>;

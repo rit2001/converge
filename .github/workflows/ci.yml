@@ -2,9 +2,18 @@ name: CI
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17.6-alpine
@@ -14,9 +23,13 @@ jobs:
           --health-cmd "pg_isready -U converge -d converge_test"
           --health-interval 2s --health-timeout 3s --health-retries 20
     env:
+      NODE_ENV: test
       DATABASE_URL: postgresql://converge:converge@localhost:5432/converge_test
       WEB_ORIGIN: http://localhost:3000
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:4000
       DEV_AUTH_USER_ID: 00000000-0000-4000-8000-000000000001
+      DEV_AUTH_USER_NAME: CI Developer
+      LOG_LEVEL: warn
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -26,8 +39,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
+      - run: pnpm format:check
       - run: pnpm test
-      - run: pnpm --filter @converge/database migrate
+      - run: pnpm migrate
       - run: pnpm test:integration
       - run: pnpm --filter @converge/playwright exec playwright install --with-deps chromium
       - run: pnpm test:playwright
+      - run: pnpm build

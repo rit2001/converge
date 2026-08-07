@@ -9,13 +9,15 @@
   },
   "scripts": {
     "build": "turbo build",
-    "dev": "turbo dev --parallel",
+    "dev": "node scripts/root-environment.mjs pnpm run dev:workspace",
+    "dev:workspace": "turbo dev --parallel",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "lint": "turbo lint",
-    "test": "turbo test --filter=!@converge/integration --filter=!@converge/playwright --filter=!@converge/k6 --filter=!@converge/failure",
-    "test:integration": "pnpm --filter @converge/integration test",
-    "test:playwright": "pnpm --filter @converge/playwright test",
+    "lint": "eslint scripts && turbo lint",
+    "migrate": "node scripts/root-environment.mjs pnpm --filter @converge/database migrate",
+    "test": "node --test scripts/root-environment.test.mjs && turbo test --filter=!@converge/integration --filter=!@converge/playwright --filter=!@converge/k6 --filter=!@converge/failure",
+    "test:integration": "node scripts/root-environment.mjs pnpm --filter @converge/integration test",
+    "test:playwright": "node scripts/root-environment.mjs pnpm --filter @converge/playwright test",
     "typecheck": "turbo typecheck"
   },
   "devDependencies": {

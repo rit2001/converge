@@ -25,7 +25,7 @@ import type { PendingLoadResult, PendingOperationStore } from "../../apps/web/sr
 import { BoardTransport, SYNC_ACK_TIMEOUT_MS } from "../../apps/web/src/transport";
 
 const databaseUrl =
-  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:5432/converge";
+  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
 const pool = createPool(databaseUrl);
 const repository = new BoardRepository(pool);
 

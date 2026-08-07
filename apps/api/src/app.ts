@@ -1,3 +1,4 @@
+import type { Writable } from "node:stream";
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
@@ -14,6 +15,7 @@ import {
   boardAccessRevokedEventSchema,
   createBoardRequestSchema,
   durableCommandSchema,
+  httpInternalErrorResponseSchema,
   joinBoardAckSchema,
   joinBoardRequestSchema,
   operationAckSchema,
@@ -155,6 +157,7 @@ export interface BuildAppOptions {
   deliveryCoordinator?: BoardDeliveryCoordinator;
   deliveryHooks?: DeliveryHooks;
   repositoryHooks?: BoardRepositoryHooks;
+  loggerStream?: Writable;
 }
 
 export async function buildApp(
@@ -163,7 +166,13 @@ export async function buildApp(
   auth: AuthAdapter,
   options: BuildAppOptions = {},
 ): Promise<AppContext> {
-  const app = Fastify({ logger: { level: environment.LOG_LEVEL }, bodyLimit: 64 * 1024 });
+  const app = Fastify({
+    logger:
+      options.loggerStream === undefined
+        ? { level: environment.LOG_LEVEL }
+        : { level: environment.LOG_LEVEL, stream: options.loggerStream },
+    bodyLimit: 64 * 1024,
+  });
   await app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   const repository = new BoardRepository(pool, options.repositoryHooks);
@@ -175,18 +184,38 @@ export async function buildApp(
     .max(MAX_SYNC_BATCH_SIZE)
     .parse(options.synchronizationBatchSize ?? MAX_SYNC_BATCH_SIZE);
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
+    if (reply.sent) return;
     if (error instanceof AuthenticationError)
       return reply
         .code(error.code === "AUTHENTICATION_REQUIRED" ? 401 : 400)
         .send({ code: error.code, message: error.message, retryable: false });
+    if (error instanceof RepositoryError)
+      return reply.code(errorStatus(error.code)).send(failedAck(error));
     if (error instanceof z.ZodError)
       return reply.code(400).send({
         code: "INVALID_COMMAND",
         message: "Request validation failed",
         retryable: false,
       });
-    return reply.send(error);
+    if (error.statusCode === 429)
+      return reply.code(429).send({
+        ok: false,
+        code: "RATE_LIMITED",
+        message: "Request rate exceeded",
+        retryable: true,
+      });
+    const requestId = String(request.id).slice(0, 128) || "unknown";
+    request.log.error({ err: error, requestId }, "unexpected HTTP request failure");
+    return reply.code(500).send(
+      httpInternalErrorResponseSchema.parse({
+        ok: false,
+        code: "INTERNAL_ERROR",
+        message: "An internal server error occurred.",
+        retryable: true,
+        requestId,
+      }),
+    );
   });
 
   const authenticateHttp = async (request: Parameters<AuthAdapter["authenticateHttp"]>[0]) => {

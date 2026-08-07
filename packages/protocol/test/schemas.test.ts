@@ -5,6 +5,7 @@ import {
   createBoardRequestSchema,
   durableCommandSchema,
   ephemeralEventTypeSchema,
+  httpInternalErrorResponseSchema,
   joinBoardAckSchema,
   joinBoardRequestSchema,
   operationRangeQuerySchema,
@@ -200,6 +201,20 @@ describe("protocol schemas", () => {
         retryable: false,
       }),
     ).toMatchObject({ code: "IDEMPOTENCY_CONFLICT", retryable: false });
+  });
+
+  it("validates the strict generic HTTP internal-error envelope", () => {
+    const response = {
+      ok: false,
+      code: "INTERNAL_ERROR",
+      message: "An internal server error occurred.",
+      retryable: true,
+      requestId: "req-1",
+    } as const;
+    expect(httpInternalErrorResponseSchema.parse(response)).toEqual(response);
+    expect(
+      httpInternalErrorResponseSchema.safeParse({ ...response, detail: "SELECT secret" }).success,
+    ).toBe(false);
   });
 
   it("rejects malformed synchronization ranges", () => {

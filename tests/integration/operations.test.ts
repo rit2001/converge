@@ -4,7 +4,7 @@ import { createRectangleCommand, fixtureIds } from "@converge/testkit";
 import { boardSnapshotSchema, type DurableCommand } from "@converge/protocol";
 
 const databaseUrl =
-  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:5432/converge";
+  process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
 const pool = createPool(databaseUrl);
 const repository = new BoardRepository(pool);
 

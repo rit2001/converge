@@ -13,6 +13,10 @@ export default tseslint.config(
     languageOptions: { globals: { __ENV: "readonly" } },
   },
   {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: { globals: globals.node },
+  },
+  {
     files: ["apps/web/**/*.ts", "apps/web/**/*.tsx"],
     plugins: { "@next/next": nextPlugin },
     rules: {
