@@ -328,9 +328,11 @@ describe("self-healing synchronization", () => {
 
   it("times out a stalled range body after headers and ignores its late completion", async () => {
     const body = deferred<unknown>();
-    let rangeSignal: AbortSignal | null = null;
+    const rangeCapture: { signal: AbortSignal | null } = {
+      signal: null,
+    };
     const fetcher: typeof fetch = (_input, init) => {
-      rangeSignal = init?.signal ?? null;
+      rangeCapture.signal = init?.signal ?? null;
       return Promise.resolve({
         ok: true,
         json: () => body.promise,
@@ -343,7 +345,7 @@ describe("self-healing synchronization", () => {
     expect(useBoardStore.getState().connection).toBe("catching-up");
     test.scheduler.runDelay(SYNC_ACK_TIMEOUT_MS);
     await settle();
-    expect(rangeSignal?.aborted).toBe(true);
+    expect(rangeCapture.signal?.aborted).toBe(true);
     expect(useBoardStore.getState()).toMatchObject({
       connection: "retry-wait",
       committed: { lastSeq: 0 },
