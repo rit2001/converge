@@ -247,7 +247,8 @@ describe("HTTP error sanitization", () => {
         payload: { name: "", unknown: true },
       });
       expect(validation.statusCode).toBe(400);
-      expect(validation.json()).toEqual({
+      expect(protocolErrorSchema.parse(validation.json())).toEqual({
+        ok: false,
         code: "INVALID_COMMAND",
         message: "Request validation failed",
         retryable: false,

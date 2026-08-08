@@ -488,14 +488,33 @@ describe("join watermark catch-up", () => {
       headers: testAuthorizationHeaders(tokens.owner),
     });
     expect(unknownRange.statusCode).toBe(400);
-    expect(unknownRange.json()).toMatchObject({ code: "INVALID_COMMAND", retryable: false });
     const malformedRange = await context.app.inject({
       method: "GET",
       url: `/v1/boards/${boardId}/operations?after=-1&watermark=0`,
       headers: testAuthorizationHeaders(tokens.owner),
     });
     expect(malformedRange.statusCode).toBe(400);
-    expect(malformedRange.json()).toMatchObject({ code: "INVALID_COMMAND", retryable: false });
+    const expectedValidationError = {
+      ok: false as const,
+      code: "INVALID_COMMAND" as const,
+      message: "Request validation failed",
+      retryable: false,
+    };
+    for (const response of [unknownRange, malformedRange]) {
+      expect(protocolErrorSchema.parse(response.json())).toEqual(expectedValidationError);
+      for (const forbidden of [
+        "ZodError",
+        "issues",
+        "path",
+        "too_small",
+        "unrecognized_keys",
+        "surprise",
+        "-1",
+        "/Users/",
+        "node_modules",
+      ])
+        expect(response.body).not.toContain(forbidden);
+    }
     expect(await persistedState(boardId)).toEqual(before);
   });
 });

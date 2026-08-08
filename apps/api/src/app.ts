@@ -234,11 +234,14 @@ export async function buildApp(
     if (error instanceof RepositoryError)
       return reply.code(errorStatus(error.code)).send(failedAck(error));
     if (error instanceof z.ZodError)
-      return reply.code(400).send({
-        code: "INVALID_COMMAND",
-        message: "Request validation failed",
-        retryable: false,
-      });
+      return reply.code(400).send(
+        protocolErrorSchema.parse({
+          ok: false,
+          code: "INVALID_COMMAND",
+          message: "Request validation failed",
+          retryable: false,
+        }),
+      );
     const clientError = fastifyClientError(error);
     if (clientError)
       return reply.code(clientError.status).send(protocolErrorSchema.parse(clientError.response));
