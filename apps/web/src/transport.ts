@@ -176,6 +176,7 @@ export class BoardTransport {
       this.invalidateAttempt();
       this.beginSynchronization(socket);
     });
+    socket.on("connect_error", (error: unknown) => this.receiveConnectionError(socket, error));
     socket.on("disconnect", () => {
       if (this.terminal || socket !== this.socket) return;
       this.ready = false;
@@ -584,6 +585,22 @@ export class BoardTransport {
       useBoardStore
         .getState()
         .revokeSession(this.sessionToken, this.boardId, "ACCESS_REVOKED: Board access was revoked"),
+    );
+  }
+
+  private receiveConnectionError(socket: BoardSocket, error: unknown): void {
+    if (!this.isSessionActive() || socket !== this.socket) return;
+    if (error === null || typeof error !== "object" || !Object.hasOwn(error, "data")) return;
+    const failure = protocolErrorSchema.safeParse((error as { data: unknown }).data);
+    if (
+      !failure.success ||
+      failure.data.retryable ||
+      !terminalAuthorizationCodes.has(failure.data.code)
+    )
+      return;
+    this.setTerminalFailure(
+      socket,
+      new SynchronizationError(failure.data.code, failure.data.message, failure.data.retryable),
     );
   }
 

@@ -108,6 +108,8 @@ type Listener = (...values: unknown[]) => void;
 
 class FakeSocket {
   connected = false;
+  connectCalls = 0;
+  disconnectCalls = 0;
   readonly joins: Array<{ request: unknown; acknowledge: (value: JoinBoardAck) => void }> = [];
   readonly submissions: DurableCommand[] = [];
   readonly submissionAcknowledgements: Array<(value: unknown) => void> = [];
@@ -145,7 +147,12 @@ class FakeSocket {
   }
 
   connect(): this {
+    this.connectCalls += 1;
     return this;
+  }
+
+  rejectConnection(data: unknown, message = "Socket connection rejected"): void {
+    this.dispatch("connect_error", Object.assign(new Error(message), { data }));
   }
 
   serverDisconnect(): void {
@@ -174,6 +181,7 @@ class FakeSocket {
   }
 
   disconnect(): this {
+    this.disconnectCalls += 1;
     if (this.connected) this.serverDisconnect();
     return this;
   }
@@ -231,6 +239,7 @@ function harness(
     countLimit?: number;
     byteLimit?: number;
     retryCapMs?: number;
+    connectSocket?: boolean;
   } = {},
 ) {
   generation += 1;
@@ -256,7 +265,7 @@ function harness(
     },
   });
   transport.connect();
-  socket.serverConnect();
+  if (options.connectSocket !== false) socket.serverConnect();
   return { transport, socket, scheduler, persistence, token };
 }
 
@@ -486,6 +495,123 @@ describe("self-healing synchronization", () => {
 });
 
 describe("terminal synchronization failures", () => {
+  it("terminally fences an initial Socket.IO authentication rejection and preserves pending", async () => {
+    const item = pending(1);
+    let rangeRequests = 0;
+    let snapshotLoads = 0;
+    const failed = harness({
+      initialPending: [item],
+      connectSocket: false,
+      fetcher: () => {
+        rangeRequests += 1;
+        return Promise.resolve(response(0, 0, []));
+      },
+      loadSnapshot: () => {
+        snapshotLoads += 1;
+        return Promise.resolve(snapshot());
+      },
+    });
+
+    failed.socket.rejectConnection({
+      ok: false,
+      code: "AUTHENTICATION_REQUIRED",
+      message: "Authentication required",
+      retryable: false,
+    });
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "authorization-failed",
+      pending: [{ opId: item.opId }],
+      synchronizationDiagnostics: {
+        retryCode: "AUTHENTICATION_REQUIRED",
+        retryScheduled: false,
+        bufferedCount: 0,
+        bufferedBytes: 0,
+      },
+      error: "AUTHENTICATION_REQUIRED: Authentication required",
+    });
+    expect(failed.persistence.rows.has(item.opId)).toBe(true);
+    expect(failed.scheduler.tasks.size).toBe(0);
+    expect(failed.socket).toMatchObject({
+      connected: false,
+      connectCalls: 1,
+      disconnectCalls: 1,
+      joins: [],
+      submissions: [],
+    });
+    expect({ rangeRequests, snapshotLoads }).toEqual({ rangeRequests: 0, snapshotLoads: 0 });
+
+    failed.transport.connect();
+    failed.socket.reconnectAttempt();
+    failed.socket.reconnectFailed();
+    failed.socket.serverDisconnect();
+    failed.socket.serverConnect();
+    failed.socket.deliver(operation(1));
+    failed.socket.revoke({
+      schemaVersion: 1,
+      boardId,
+      code: "ACCESS_REVOKED",
+      message: "Board access was revoked",
+    });
+    const lateCommand = pending(2);
+    expect(await failed.transport.submit(lateCommand)).toBe(false);
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "authorization-failed",
+      committed: { lastSeq: 0 },
+      pending: [{ opId: item.opId }],
+      synchronizationDiagnostics: { retryCode: "AUTHENTICATION_REQUIRED" },
+    });
+    expect(failed.persistence.rows.has(item.opId)).toBe(true);
+    expect(failed.persistence.rows.has(lateCommand.opId)).toBe(false);
+    expect(failed.socket).toMatchObject({ connectCalls: 1, disconnectCalls: 1, joins: [] });
+    expect({
+      rangeRequests,
+      snapshotLoads,
+      submissions: failed.socket.submissions.length,
+    }).toEqual({ rangeRequests: 0, snapshotLoads: 0, submissions: 0 });
+
+    const replacement = harness();
+    succeedJoin(replacement.socket, 0, 0);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      sessionToken: replacement.token,
+      connection: "ready",
+      committed: { lastSeq: 0 },
+    });
+  });
+
+  it("does not trust malformed Socket.IO connection-error data", async () => {
+    const test = harness({ connectSocket: false });
+    test.socket.rejectConnection(
+      {
+        code: "AUTHENTICATION_REQUIRED",
+        message: "Forged authentication failure",
+        retryable: false,
+      },
+      "Authentication required",
+    );
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "connecting",
+      error: null,
+      synchronizationDiagnostics: { retryCode: null, retryScheduled: false },
+    });
+    expect(test.socket.disconnectCalls).toBe(0);
+    expect(test.scheduler.tasks.size).toBe(0);
+
+    test.socket.serverConnect();
+    succeedJoin(test.socket, 0, 0);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "ready",
+      committed: { lastSeq: 0 },
+    });
+  });
+
   it("fences a non-retryable authentication failure through disconnect and reconnect", async () => {
     const item = pending(1);
     let rangeRequests = 0;

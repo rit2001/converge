@@ -108,7 +108,7 @@ function fastifyClientError(
 
 function socketAuthenticationError(error: AuthenticationError): Error {
   return Object.assign(new Error(error.message), {
-    data: { code: error.code, message: error.message, retryable: false },
+    data: protocolErrorSchema.parse(failedAck(error)),
   });
 }
 
