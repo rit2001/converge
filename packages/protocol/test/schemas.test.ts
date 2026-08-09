@@ -3,8 +3,11 @@ import {
   boardAccessRevokedEventSchema,
   boardSnapshotSchema,
   createBoardRequestSchema,
+  decodeDeliveryStreamFields,
   deliveryEnvelopeSchema,
+  deliveryStreamFieldsSchema,
   durableCommandSchema,
+  encodeDeliveryStreamFields,
   ephemeralEventTypeSchema,
   httpInternalErrorResponseSchema,
   joinBoardAckSchema,
@@ -15,6 +18,7 @@ import {
   removeBoardMemberParamsSchema,
   removeBoardMemberRequestSchema,
   removeBoardMemberResponseSchema,
+  redisStreamEntryIdSchema,
   SCHEMA_VERSION,
 } from "../src/index.js";
 
@@ -228,6 +232,46 @@ describe("protocol schemas", () => {
       }).success,
     ).toBe(false);
     expect(deliveryEnvelopeSchema.safeParse({ ...envelope, schemaVersion: 2 }).success).toBe(false);
+  });
+
+  it("round-trips strict explicit Redis stream fields without trusting redundant metadata", () => {
+    const operation = {
+      ...command,
+      seq: 1,
+      committedAt: "2026-08-07T12:00:01.000Z",
+    };
+    const envelope = deliveryEnvelopeSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.opId,
+      boardId: command.boardId,
+      deliverySeq: 1,
+      eventType: "operation.committed",
+      occurredAt: operation.committedAt,
+      payload: { operation },
+    });
+    const fields = encodeDeliveryStreamFields(envelope);
+    const reorderedEnvelope = {
+      payload: envelope.payload,
+      occurredAt: envelope.occurredAt,
+      eventType: envelope.eventType,
+      deliverySeq: envelope.deliverySeq,
+      boardId: envelope.boardId,
+      eventId: envelope.eventId,
+      schemaVersion: envelope.schemaVersion,
+    };
+    expect(deliveryStreamFieldsSchema.parse(fields)).toEqual(fields);
+    expect(decodeDeliveryStreamFields(fields)).toEqual(envelope);
+    expect(encodeDeliveryStreamFields(deliveryEnvelopeSchema.parse(reorderedEnvelope)).event).toBe(
+      fields.event,
+    );
+    expect(
+      deliveryStreamFieldsSchema.safeParse({ ...fields, boardId: command.targetId }).success,
+    ).toBe(false);
+    expect(deliveryStreamFieldsSchema.safeParse({ ...fields, surprise: true }).success).toBe(false);
+    expect(redisStreamEntryIdSchema.safeParse("1730000000000-7").success).toBe(true);
+    expect(redisStreamEntryIdSchema.safeParse("0-0").success).toBe(false);
+    expect(redisStreamEntryIdSchema.safeParse("not-an-id").success).toBe(false);
+    expect(redisStreamEntryIdSchema.safeParse("18446744073709551616-0").success).toBe(false);
   });
 
   it("prevents callers from supplying server-owned delivery metadata", () => {

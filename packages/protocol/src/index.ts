@@ -283,6 +283,98 @@ export const deliveryEnvelopeSchema = z
     membershipRevokedDeliveryEnvelopeObjectSchema,
   ])
   .superRefine(validateDeliveryEnvelopeIdentity);
+
+export const redisStreamEntryIdSchema = z
+  .string()
+  .regex(/^(0|[1-9]\d*)-(0|[1-9]\d*)$/)
+  .superRefine((value, context) => {
+    const match = /^(0|[1-9]\d*)-(0|[1-9]\d*)$/.exec(value);
+    if (!match) return;
+    const milliseconds = match[1];
+    const sequence = match[2];
+    const maximum = 18_446_744_073_709_551_615n;
+    if (
+      value === "0-0" ||
+      milliseconds === undefined ||
+      sequence === undefined ||
+      BigInt(milliseconds) > maximum ||
+      BigInt(sequence) > maximum
+    )
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Redis stream entry ID must be a positive uint64 pair",
+      });
+  });
+
+export const deliveryStreamFieldsSchema = z
+  .object({
+    schemaVersion: z.literal(String(SCHEMA_VERSION)),
+    eventId: idSchema,
+    boardId: idSchema,
+    deliverySeq: z.string().regex(/^[1-9]\d*$/),
+    eventType: deliveryEventTypeSchema,
+    event: z.string().min(2),
+  })
+  .strict()
+  .superRefine((fields, context) => {
+    const deliverySeq = Number(fields.deliverySeq);
+    if (!Number.isSafeInteger(deliverySeq)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["deliverySeq"],
+        message: "Delivery sequence must be a safe integer",
+      });
+      return;
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(fields.event);
+    } catch {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["event"],
+        message: "Serialized delivery envelope must be JSON",
+      });
+      return;
+    }
+    const envelope = deliveryEnvelopeSchema.safeParse(decoded);
+    if (!envelope.success) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["event"],
+        message: "Serialized delivery envelope is invalid",
+      });
+      return;
+    }
+    if (
+      fields.schemaVersion !== String(envelope.data.schemaVersion) ||
+      fields.eventId !== envelope.data.eventId ||
+      fields.boardId !== envelope.data.boardId ||
+      deliverySeq !== envelope.data.deliverySeq ||
+      fields.eventType !== envelope.data.eventType
+    )
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Redis stream fields must match the serialized delivery envelope",
+      });
+  });
+
+export function encodeDeliveryStreamFields(input: DeliveryEnvelope): DeliveryStreamFields {
+  const envelope = deliveryEnvelopeSchema.parse(input);
+  return deliveryStreamFieldsSchema.parse({
+    schemaVersion: String(envelope.schemaVersion),
+    eventId: envelope.eventId,
+    boardId: envelope.boardId,
+    deliverySeq: String(envelope.deliverySeq),
+    eventType: envelope.eventType,
+    event: JSON.stringify(envelope),
+  });
+}
+
+export function decodeDeliveryStreamFields(input: unknown): DeliveryEnvelope {
+  const fields = deliveryStreamFieldsSchema.parse(input);
+  return deliveryEnvelopeSchema.parse(JSON.parse(fields.event));
+}
 export const joinBoardRequestSchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION),
@@ -374,6 +466,7 @@ export type MembershipRevokedDeliveryEnvelope = z.infer<
   typeof membershipRevokedDeliveryEnvelopeSchema
 >;
 export type DeliveryEnvelope = z.infer<typeof deliveryEnvelopeSchema>;
+export type DeliveryStreamFields = z.infer<typeof deliveryStreamFieldsSchema>;
 
 export interface ClientToServerEvents {
   "board:join": (request: JoinBoardRequest, acknowledge: (ack: JoinBoardAck) => void) => void;
