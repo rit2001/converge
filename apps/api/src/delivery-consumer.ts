@@ -31,7 +31,7 @@ export interface DeliveryStreamMetadata {
 
 export interface DeliveryConsumerTransport {
   connect(): Promise<void>;
-  inspect(): Promise<DeliveryStreamMetadata>;
+  inspect(input: { signal: AbortSignal }): Promise<DeliveryStreamMetadata>;
   readAfter(input: {
     cursor: string;
     count: typeof REDIS_DELIVERY_READ_COUNT;
@@ -197,6 +197,8 @@ class CursorLossError extends Error {
   }
 }
 
+class StaleGenerationError extends Error {}
+
 function parseStreamId(value: string, allowZero: boolean): readonly [bigint, bigint] {
   const match = STREAM_ID_PATTERN.exec(value);
   const milliseconds = match?.[1];
@@ -314,6 +316,7 @@ export class RedisDeliveryConsumer {
   private startPromise: Promise<void> | undefined;
   private stopPromise: Promise<void> | undefined;
   private stopping = false;
+  private generation = 0;
 
   constructor(
     private readonly transport: DeliveryConsumerTransport,
@@ -366,12 +369,14 @@ export class RedisDeliveryConsumer {
   }
 
   private async startOnce(): Promise<void> {
+    const generation = ++this.generation;
     try {
       validateConfiguration(this.configuration);
       await this.notifyLifecycle({ state: "starting" });
       await this.transport.connect();
-      const metadata = await this.inspectStrict();
-      this.cursor = metadata.lastEntryId ?? ZERO_STREAM_ID;
+      this.assertGeneration(generation);
+      const metadata = await this.inspectStrict(generation);
+      this.cursor = metadata.lastGeneratedId;
       this.witness = {
         metadata,
         observedStream: metadata.exists,
@@ -379,7 +384,7 @@ export class RedisDeliveryConsumer {
       };
 
       const established = deferred<void>();
-      this.loopPromise = this.run(metadata.lastEntryId ?? ZERO_STREAM_ID, established);
+      this.loopPromise = this.run(metadata.lastGeneratedId, established, generation);
       void this.loopPromise.catch(() => undefined);
       await established.promise;
     } catch (error) {
@@ -398,11 +403,13 @@ export class RedisDeliveryConsumer {
   private async run(
     initialTail: string,
     established: ReturnType<typeof deferred<void>>,
+    initialGeneration: number,
   ): Promise<void> {
+    let generation = initialGeneration;
     let firstRead = true;
     while (!this.stopping) {
       try {
-        const entries = await this.issueRead(async () => {
+        const entries = await this.issueRead(generation, async () => {
           if (!firstRead) return;
           firstRead = false;
           await this.notifyLifecycle({
@@ -413,9 +420,11 @@ export class RedisDeliveryConsumer {
           established.resolve();
         });
         if (this.stopping) return;
-        await this.processBatch(entries);
+        const metadata = await this.inspectStrict(generation);
+        this.validateReadContinuity(metadata, entries);
+        await this.processBatch(entries, generation);
       } catch (error) {
-        if (this.stopping) return;
+        if (this.stopping || error instanceof StaleGenerationError) return;
         if (error instanceof FatalConsumerError) {
           await this.notifyLifecycle({
             state: "error",
@@ -426,16 +435,26 @@ export class RedisDeliveryConsumer {
           established.reject(error);
           return;
         }
+        if (error instanceof CursorLossError) {
+          await this.notifyLifecycle({
+            state: "cursor_lost",
+            cursor: this.cursor,
+            reason: error.reason,
+          });
+          established.reject(error);
+          return;
+        }
         await this.notifyLifecycle({
           state: "unavailable",
           cursor: this.cursor,
           code: "REDIS_UNAVAILABLE",
         });
+        generation = ++this.generation;
         await this.transport.cancelRead().catch(() => undefined);
         try {
-          await this.recover();
+          await this.recover(generation);
         } catch (recoveryError) {
-          if (this.stopping) return;
+          if (this.stopping || recoveryError instanceof StaleGenerationError) return;
           if (recoveryError instanceof FatalConsumerError) {
             await this.notifyLifecycle({
               state: "error",
@@ -455,18 +474,17 @@ export class RedisDeliveryConsumer {
             established.reject(recoveryError);
             return;
           }
-          await this.scheduler.wait(
-            this.configuration.reconnectDelayMs,
-            this.abortController.signal,
-          );
+          throw recoveryError;
         }
       }
     }
   }
 
   private async issueRead(
+    generation: number,
     onIssued: () => Promise<void>,
   ): Promise<readonly RawDeliveryStreamEntry[]> {
+    this.assertGeneration(generation);
     const issued = deferred<void>();
     const result = this.transport.readAfter({
       cursor: this.cursor,
@@ -474,7 +492,18 @@ export class RedisDeliveryConsumer {
       blockMs: REDIS_DELIVERY_BLOCK_MS,
       signal: this.abortController.signal,
       onIssued: () => {
-        void onIssued().then(issued.resolve, issued.reject);
+        if (!this.isActiveGeneration(generation)) {
+          issued.reject(new StaleGenerationError());
+          return;
+        }
+        void onIssued().then(() => {
+          try {
+            this.assertGeneration(generation);
+            issued.resolve();
+          } catch (error) {
+            issued.reject(error);
+          }
+        }, issued.reject);
       },
     });
     await Promise.race([
@@ -485,32 +514,53 @@ export class RedisDeliveryConsumer {
           Promise.reject(error instanceof Error ? error : new Error("Redis XREAD failed")),
       ),
     ]);
-    return result;
+    const entries = await result;
+    this.assertGeneration(generation);
+    return entries;
   }
 
-  private async recover(): Promise<void> {
+  private async recover(generation: number): Promise<void> {
     await this.notifyLifecycle({ state: "recovering", cursor: this.cursor });
-    await this.transport.connect();
-    const metadata = await this.inspectStrict();
-    this.validateContinuity(metadata);
-    const recoveryTail = metadata.lastEntryId ?? ZERO_STREAM_ID;
-    while (!this.stopping && compareRedisStreamIds(this.cursor, recoveryTail) < 0) {
-      const entries = await this.issueRead(() => Promise.resolve());
-      if (entries.length === 0) throw new CursorLossError("CONTINUITY_UNCERTAIN");
-      await this.processBatch(entries, recoveryTail);
+    while (this.isActiveGeneration(generation)) {
+      try {
+        await this.transport.connect();
+        this.assertGeneration(generation);
+        const metadata = await this.inspectStrict(generation);
+        this.validateContinuity(metadata);
+        const recoveryTail = metadata.lastGeneratedId;
+        while (
+          this.isActiveGeneration(generation) &&
+          compareRedisStreamIds(this.cursor, recoveryTail) < 0
+        ) {
+          const entries = await this.issueRead(generation, () => Promise.resolve());
+          const readMetadata = await this.inspectStrict(generation);
+          this.validateReadContinuity(readMetadata, entries);
+          if (entries.length === 0) throw new CursorLossError("CONTINUITY_UNCERTAIN");
+          await this.processBatch(entries, generation, recoveryTail);
+        }
+        this.assertGeneration(generation);
+        const pendingRead = this.issueRead(generation, () =>
+          Promise.resolve(
+            this.notifyLifecycle({ state: "recovered", cursor: this.cursor, recoveryTail }),
+          ),
+        );
+        const entries = await pendingRead;
+        const liveMetadata = await this.inspectStrict(generation);
+        this.validateReadContinuity(liveMetadata, entries);
+        await this.processBatch(entries, generation);
+        return;
+      } catch (error) {
+        if (this.stopping || error instanceof StaleGenerationError) return;
+        if (error instanceof FatalConsumerError || error instanceof CursorLossError) throw error;
+        await this.transport.cancelRead().catch(() => undefined);
+        await this.scheduler.wait(this.configuration.reconnectDelayMs, this.abortController.signal);
+      }
     }
-    if (this.stopping) return;
-    const pendingRead = this.issueRead(() =>
-      Promise.resolve(
-        this.notifyLifecycle({ state: "recovered", cursor: this.cursor, recoveryTail }),
-      ),
-    );
-    const entries = await pendingRead;
-    if (!this.stopping) await this.processBatch(entries);
   }
 
-  private async inspectStrict(): Promise<DeliveryStreamMetadata> {
-    const metadata = await this.transport.inspect();
+  private async inspectStrict(generation: number): Promise<DeliveryStreamMetadata> {
+    const metadata = await this.transport.inspect({ signal: this.abortController.signal });
+    this.assertGeneration(generation);
     try {
       validateMetadata(metadata);
       return metadata;
@@ -529,11 +579,7 @@ export class RedisDeliveryConsumer {
         throw new CursorLossError("STREAM_MISSING");
       return;
     }
-    if (
-      compareRedisStreamIds(metadata.lastGeneratedId, this.cursor) < 0 ||
-      (metadata.lastEntryId !== null &&
-        compareRedisStreamIds(metadata.lastEntryId, this.cursor) < 0)
-    )
+    if (compareRedisStreamIds(metadata.lastGeneratedId, this.cursor) < 0)
       throw new CursorLossError("STREAM_BEHIND_CURSOR");
     if (compareRedisStreamIds(metadata.maxDeletedEntryId, this.cursor) > 0)
       throw new CursorLossError("TRIMMED_BEYOND_CURSOR");
@@ -544,13 +590,35 @@ export class RedisDeliveryConsumer {
       metadata.firstEntryId !== null &&
       compareRedisStreamIds(metadata.firstEntryId, this.cursor) > 0 &&
       metadata.maxDeletedEntryId === ZERO_STREAM_ID
-    )
+    ) {
+      if (parseCounter(metadata.entriesAdded) > witness.minimumEntriesAdded)
+        throw new CursorLossError("TRIMMED_BEYOND_CURSOR");
       throw new CursorLossError("STREAM_RECREATED");
+    }
     this.witness = { ...witness, metadata, observedStream: true };
+  }
+
+  private validateReadContinuity(
+    metadata: DeliveryStreamMetadata,
+    entries: readonly RawDeliveryStreamEntry[],
+  ): void {
+    this.validateContinuity(metadata);
+    const lastReturnedId = entries.at(-1)?.id;
+    if (lastReturnedId === undefined) return;
+    if (!redisStreamEntryIdSchema.safeParse(lastReturnedId).success) return;
+    if (!metadata.exists) throw new CursorLossError("STREAM_MISSING");
+    if (compareRedisStreamIds(metadata.lastGeneratedId, lastReturnedId) < 0)
+      throw new CursorLossError("CONTINUITY_UNCERTAIN");
+    if (
+      metadata.lastEntryId === null ||
+      compareRedisStreamIds(metadata.lastEntryId, lastReturnedId) < 0
+    )
+      throw new CursorLossError("TRIMMED_BEYOND_CURSOR");
   }
 
   private async processBatch(
     entries: readonly RawDeliveryStreamEntry[],
+    generation: number,
     stopAt?: string,
   ): Promise<void> {
     if (entries.length > this.configuration.globalQueueMaximumEvents)
@@ -564,9 +632,13 @@ export class RedisDeliveryConsumer {
 
     let previousId = this.cursor;
     for (const entry of entries) {
-      if (this.stopping || (stopAt !== undefined && compareRedisStreamIds(previousId, stopAt) >= 0))
+      if (
+        !this.isActiveGeneration(generation) ||
+        (stopAt !== undefined && compareRedisStreamIds(previousId, stopAt) >= 0)
+      )
         return;
       await this.hooks.beforeEntryValidation?.(entry.id);
+      this.assertGeneration(generation);
       if (!redisStreamEntryIdSchema.safeParse(entry.id).success)
         throw new FatalConsumerError("INVALID_REDIS_ENTRY_ID", entry.id);
       if (compareRedisStreamIds(entry.id, previousId) <= 0)
@@ -583,8 +655,9 @@ export class RedisDeliveryConsumer {
         throw new FatalConsumerError("INVALID_STREAM_ENTRY", entry.id);
       }
       await this.handleBoardEntry(entry, envelope);
+      this.assertGeneration(generation);
       await this.hooks.beforeCursorAdvance?.(entry.id);
-      if (this.stopping) return;
+      this.assertGeneration(generation);
       this.cursor = entry.id;
       if (this.witness) this.witness.minimumEntriesAdded += 1n;
       await this.hooks.afterCursorAdvance?.(entry.id);
@@ -725,9 +798,17 @@ export class RedisDeliveryConsumer {
     await this.notifyLifecycle({ state: "stopping", cursor: this.cursor });
     this.abortController.abort();
     await this.transport.cancelRead().catch(() => undefined);
-    await this.loopPromise?.catch(() => undefined);
     await this.transport.close();
+    await this.loopPromise?.catch(() => undefined);
     await this.notifyLifecycle({ state: "stopped", cursor: this.cursor });
+  }
+
+  private isActiveGeneration(generation: number): boolean {
+    return !this.stopping && generation === this.generation;
+  }
+
+  private assertGeneration(generation: number): void {
+    if (!this.isActiveGeneration(generation)) throw new StaleGenerationError();
   }
 
   private async notifyLifecycle(event: DeliveryConsumerLifecycleEvent): Promise<void> {

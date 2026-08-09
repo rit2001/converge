@@ -111,14 +111,20 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
     return this.connectPromise;
   }
 
-  async inspect(): Promise<DeliveryStreamMetadata> {
+  async inspect(input: { signal: AbortSignal }): Promise<DeliveryStreamMetadata> {
     const control = this.requireControl();
-    const incarnation = parseRunId(await control.sendCommand(["INFO", "SERVER"]));
+    const incarnation = parseRunId(
+      await control.sendCommand(["INFO", "SERVER"], { abortSignal: input.signal }),
+    );
     let response: unknown;
     try {
-      response = await control.sendCommand(["XINFO", "STREAM", this.streamKey]);
+      response = await control.sendCommand(["XINFO", "STREAM", this.streamKey], {
+        abortSignal: input.signal,
+      });
     } catch (error) {
-      const exists = await control.sendCommand(["EXISTS", this.streamKey]);
+      const exists = await control.sendCommand(["EXISTS", this.streamKey], {
+        abortSignal: input.signal,
+      });
       if (asString(exists, "Redis EXISTS returned an invalid response") === "0")
         return absentMetadata(incarnation);
       throw error;

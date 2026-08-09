@@ -9,9 +9,11 @@ import {
   REDIS_DELIVERY_BLOCK_MS,
   REDIS_DELIVERY_READ_COUNT,
   RedisDeliveryConsumer,
+  compareRedisStreamIds,
   defaultDeliveryConsumerConfiguration,
   type DeliveryConsumerCallbacks,
   type DeliveryConsumerLifecycleEvent,
+  type DeliveryConsumerScheduler,
   type DeliveryConsumerTransport,
   type DeliveryStreamMetadata,
   type RawDeliveryStreamEntry,
@@ -93,16 +95,21 @@ function emptyMetadata(): DeliveryStreamMetadata {
 
 class FakeTransport implements DeliveryConsumerTransport {
   readonly readCalls: { cursor: string; count: number; blockMs: number }[] = [];
-  readonly inspections: DeliveryStreamMetadata[] = [];
+  readonly inspections: (DeliveryStreamMetadata | Error)[] = [];
   connectCalls = 0;
+  inspectCalls = 0;
   cancelCalls = 0;
   closeCalls = 0;
+  activeReads = 0;
+  maximumActiveReads = 0;
   onRead: ((cursor: string) => void) | undefined;
   private readonly pendingReads: ReturnType<typeof deferred<readonly RawDeliveryStreamEntry[]>>[] =
     [];
   private inspectIndex = 0;
+  private lastMetadata: DeliveryStreamMetadata | undefined;
+  private resolvedEntries: readonly RawDeliveryStreamEntry[] = [];
 
-  constructor(...metadataValues: DeliveryStreamMetadata[]) {
+  constructor(...metadataValues: (DeliveryStreamMetadata | Error)[]) {
     this.inspections.push(...metadataValues);
   }
 
@@ -112,10 +119,45 @@ class FakeTransport implements DeliveryConsumerTransport {
   }
 
   inspect(): Promise<DeliveryStreamMetadata> {
-    const value = this.inspections[Math.min(this.inspectIndex, this.inspections.length - 1)];
+    this.inspectCalls += 1;
+    const value = this.inspections[this.inspectIndex];
     this.inspectIndex += 1;
-    if (!value) return Promise.reject(new Error("missing fake metadata"));
-    return Promise.resolve(value);
+    if (value instanceof Error) return Promise.reject(value);
+    if (value) {
+      this.lastMetadata = value;
+      this.resolvedEntries = [];
+      return Promise.resolve(value);
+    }
+    const previous = this.lastMetadata;
+    if (!previous) return Promise.reject(new Error("missing fake metadata"));
+    const appended = this.resolvedEntries.filter(({ id }) => {
+      try {
+        return compareRedisStreamIds(id, previous.lastGeneratedId) > 0;
+      } catch {
+        return false;
+      }
+    });
+    this.resolvedEntries = [];
+    if (appended.length === 0) return Promise.resolve(previous);
+    const firstAppendedId = appended.reduce(
+      (first, { id }) => (compareRedisStreamIds(id, first) < 0 ? id : first),
+      appended[0]!.id,
+    );
+    const lastId = appended.reduce(
+      (last, { id }) => (compareRedisStreamIds(id, last) > 0 ? id : last),
+      appended[0]!.id,
+    );
+    const derived: DeliveryStreamMetadata = {
+      ...previous,
+      exists: true,
+      length: String(BigInt(previous.length) + BigInt(appended.length)),
+      firstEntryId: previous.firstEntryId ?? firstAppendedId,
+      lastEntryId: lastId,
+      lastGeneratedId: lastId,
+      entriesAdded: String(BigInt(previous.entriesAdded) + BigInt(appended.length)),
+    };
+    this.lastMetadata = derived;
+    return Promise.resolve(derived);
   }
 
   readAfter(input: {
@@ -128,17 +170,22 @@ class FakeTransport implements DeliveryConsumerTransport {
     this.readCalls.push({ cursor: input.cursor, count: input.count, blockMs: input.blockMs });
     const pending = deferred<readonly RawDeliveryStreamEntry[]>();
     this.pendingReads.push(pending);
+    this.activeReads += 1;
+    this.maximumActiveReads = Math.max(this.maximumActiveReads, this.activeReads);
     input.signal.addEventListener("abort", () => pending.reject(new Error("aborted")), {
       once: true,
     });
     input.onIssued();
     this.onRead?.(input.cursor);
-    return pending.promise;
+    return pending.promise.finally(() => {
+      this.activeReads -= 1;
+    });
   }
 
   resolveRead(entries: readonly RawDeliveryStreamEntry[]): void {
     const read = this.pendingReads.shift();
     if (!read) throw new Error("No pending XREAD");
+    this.resolvedEntries = entries;
     read.resolve(entries);
   }
 
@@ -171,6 +218,7 @@ function harness(
   transport: FakeTransport,
   overrides: Partial<DeliveryConsumerCallbacks> = {},
   configuration = defaultDeliveryConsumerConfiguration,
+  scheduler?: DeliveryConsumerScheduler,
 ): Harness {
   const delivered: DeliveryEnvelope[] = [];
   const quarantined: { boardId: string; reason: string; overflowed: boolean }[] = [];
@@ -190,7 +238,7 @@ function harness(
     ...overrides,
   };
   return {
-    consumer: new RedisDeliveryConsumer(transport, callbacks, { ...configuration }),
+    consumer: new RedisDeliveryConsumer(transport, callbacks, { ...configuration }, scheduler),
     delivered,
     quarantined,
     lifecycle,
@@ -245,6 +293,110 @@ describe("RedisDeliveryConsumer", () => {
     expect(test.delivered).toHaveLength(1);
     await test.consumer.stop();
   });
+
+  it.each([
+    [
+      "newest entry deleted",
+      metadata({
+        length: "1",
+        firstEntryId: "10-0",
+        lastEntryId: "10-0",
+        lastGeneratedId: "11-0",
+        maxDeletedEntryId: "11-0",
+        entriesAdded: "2",
+      }),
+    ],
+    [
+      "all entries deleted",
+      metadata({
+        length: "0",
+        firstEntryId: null,
+        lastEntryId: null,
+        lastGeneratedId: "11-0",
+        maxDeletedEntryId: "11-0",
+        entriesAdded: "1",
+      }),
+    ],
+  ])(
+    "starts from lastGeneratedId when %s and reconnects without false cursor loss",
+    async (_name, startup) => {
+      const transport = new FakeTransport(startup, startup, startup);
+      const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+        wait: () => Promise.resolve(),
+      });
+      await test.consumer.start();
+
+      expect(test.consumer.lastHandledCursor).toBe("11-0");
+      expect(transport.readCalls[0]?.cursor).toBe("11-0");
+      expect(test.lifecycle).toContainEqual({
+        state: "established",
+        cursor: "11-0",
+        initialTail: "11-0",
+      });
+
+      transport.rejectRead();
+      await eventually(() => expect(transport.readCalls).toHaveLength(2));
+      expect(transport.readCalls[1]?.cursor).toBe("11-0");
+      expect(test.lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+      expect(test.consumer.lastHandledCursor).toBe("11-0");
+      await test.consumer.stop();
+    },
+  );
+
+  it.each([
+    [
+      "XDEL",
+      metadata({
+        length: "1",
+        firstEntryId: "12-0",
+        lastEntryId: "12-0",
+        lastGeneratedId: "12-0",
+        maxDeletedEntryId: "11-0",
+        entriesAdded: "3",
+      }),
+      "TRIMMED_BEYOND_CURSOR",
+    ],
+    [
+      "XTRIM",
+      metadata({
+        length: "1",
+        firstEntryId: "12-0",
+        lastEntryId: "12-0",
+        lastGeneratedId: "12-0",
+        maxDeletedEntryId: "0-0",
+        entriesAdded: "3",
+      }),
+      "TRIMMED_BEYOND_CURSOR",
+    ],
+    [
+      "stream recreation",
+      metadata({
+        length: "1",
+        firstEntryId: "20-0",
+        lastEntryId: "20-0",
+        lastGeneratedId: "20-0",
+        maxDeletedEntryId: "0-0",
+        entriesAdded: "1",
+      }),
+      "STREAM_RECREATED",
+    ],
+  ])(
+    "fails closed on healthy-read %s before delivering or advancing",
+    async (_name, healthyMetadata, reason) => {
+      const transport = new FakeTransport(metadata(), healthyMetadata);
+      const test = harness(transport);
+      await test.consumer.start();
+
+      transport.resolveRead([entry(healthyMetadata.lastGeneratedId, envelope(11))]);
+      await eventually(() =>
+        expect(test.lifecycle.at(-1)).toMatchObject({ state: "cursor_lost", reason }),
+      );
+      expect(test.delivered).toEqual([]);
+      expect(test.consumer.lastHandledCursor).toBe("10-0");
+      expect(transport.readCalls).toHaveLength(1);
+      await test.consumer.stop();
+    },
+  );
 
   it("gives two independent consumers every post-start entry", async () => {
     const firstTransport = new FakeTransport(metadata());
@@ -502,6 +654,93 @@ describe("RedisDeliveryConsumer", () => {
     expect(test.consumer.lastHandledCursor).toBe("12-0");
     expect(test.lifecycle.at(-1)).toMatchObject({ state: "recovered", recoveryTail: "12-0" });
     expect(transport.readCalls[2]?.cursor).toBe("12-0");
+    await test.consumer.stop();
+  });
+
+  it("stays in recovery when metadata inspection fails after reconnect", async () => {
+    const retryGate = deferred<void>();
+    const recoveredMetadata = metadata({
+      length: "3",
+      lastEntryId: "12-0",
+      lastGeneratedId: "12-0",
+      entriesAdded: "3",
+    });
+    const transport = new FakeTransport(
+      metadata(),
+      new Error("transient XINFO failure"),
+      recoveredMetadata,
+    );
+    let waits = 0;
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => {
+        waits += 1;
+        return retryGate.promise;
+      },
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(waits).toBe(1));
+    expect(test.lifecycle.at(-1)).toEqual({ state: "recovering", cursor: "10-0" });
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(transport.inspectCalls).toBe(2);
+    expect(transport.readCalls).toHaveLength(1);
+
+    retryGate.resolve();
+    await eventually(() => expect(transport.inspectCalls).toBe(3));
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    expect(transport.readCalls[1]?.cursor).toBe("10-0");
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.lifecycle.some(({ state }) => state === "recovered")).toBe(false);
+    await test.consumer.stop();
+  });
+
+  it("uses one recovery loop across repeated inspection failures and recovers only after draining", async () => {
+    const recoveredMetadata = metadata({
+      length: "3",
+      lastEntryId: "12-0",
+      lastGeneratedId: "12-0",
+      entriesAdded: "3",
+    });
+    const transport = new FakeTransport(
+      metadata(),
+      new Error("first transient XINFO failure"),
+      new Error("second transient XINFO failure"),
+      recoveredMetadata,
+      recoveredMetadata,
+    );
+    let waits = 0;
+    const cursorsDuringFailures: string[] = [];
+    const observed: { consumer?: RedisDeliveryConsumer } = {};
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => {
+        waits += 1;
+        if (!observed.consumer) throw new Error("consumer not initialized");
+        cursorsDuringFailures.push(observed.consumer.lastHandledCursor);
+        return Promise.resolve();
+      },
+    });
+    observed.consumer = test.consumer;
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.inspectCalls).toBe(4));
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    expect(waits).toBe(2);
+    expect(cursorsDuringFailures).toEqual(["10-0", "10-0"]);
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.lifecycle.filter(({ state }) => state === "recovering")).toHaveLength(1);
+    expect(test.lifecycle.filter(({ state }) => state === "recovered")).toHaveLength(0);
+    expect(transport.maximumActiveReads).toBe(1);
+
+    transport.resolveRead([entry("11-0", envelope(11)), entry("12-0", envelope(12))]);
+    await eventually(() => expect(transport.readCalls).toHaveLength(3));
+    expect(test.consumer.lastHandledCursor).toBe("12-0");
+    expect(test.lifecycle.filter(({ state }) => state === "recovered")).toEqual([
+      { state: "recovered", cursor: "12-0", recoveryTail: "12-0" },
+    ]);
+    expect(transport.readCalls[2]?.cursor).toBe("12-0");
+    expect(transport.maximumActiveReads).toBe(1);
     await test.consumer.stop();
   });
 
