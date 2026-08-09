@@ -14,6 +14,9 @@ export const OUTBOX_MAX_ATTEMPTS = 20;
 export const OUTBOX_RETRY_BASE_MS = 250;
 export const OUTBOX_RETRY_CAP_MS = 30_000;
 
+const INVALID_DELIVERY_ENVELOPE_CODE = "INVALID_DELIVERY_ENVELOPE";
+const INVALID_DELIVERY_ENVELOPE_MESSAGE = "Delivery envelope failed strict validation.";
+
 export type OutboxStatus = "pending" | "leased" | "retry_wait" | "published" | "blocked";
 
 export interface ClaimedOutboxEvent {
@@ -312,7 +315,37 @@ export class OutboxRepository {
                    event.lease_owner, event.lease_token, event.leased_until`,
         [OUTBOX_MAX_ATTEMPTS, batchSize, owner, leaseDurationMs],
       );
-      const claims = result.rows.map(claimedEvent);
+      const claims: ClaimedOutboxEvent[] = [];
+      for (const row of result.rows) {
+        try {
+          claims.push(claimedEvent(row));
+        } catch {
+          const quarantined = await client.query(
+            `UPDATE outbox_events
+             SET status = 'blocked',
+                 lease_owner = NULL,
+                 lease_token = NULL,
+                 leased_until = NULL,
+                 next_attempt_at = 'infinity'::timestamptz,
+                 last_error_code = $3,
+                 last_error_message = $4,
+                 last_error_at = statement_timestamp(),
+                 updated_at = statement_timestamp()
+             WHERE id = $1
+               AND status = 'leased'
+               AND lease_token = $2
+             RETURNING id`,
+            [
+              row.id,
+              row.lease_token,
+              INVALID_DELIVERY_ENVELOPE_CODE,
+              INVALID_DELIVERY_ENVELOPE_MESSAGE,
+            ],
+          );
+          if (quarantined.rowCount !== 1)
+            throw new Error("Failed to quarantine invalid delivery envelope");
+        }
+      }
       await this.hooks.afterClaimUpdate?.(claims);
       await client.query("COMMIT");
       return claims;

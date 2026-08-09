@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { PoolClient } from "pg";
 import {
@@ -15,11 +17,17 @@ import {
 } from "@converge/protocol";
 import { createRectangleCommand, fixtureIds } from "@converge/testkit";
 
-const databaseUrl =
+const sharedDatabaseUrl =
   process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
-const pool = createPool(databaseUrl);
-const boardRepository = new BoardRepository(pool);
-const outboxRepository = new OutboxRepository(pool);
+const repositoryRoot = new URL("../..", import.meta.url);
+const runFile = promisify(execFile);
+
+let isolatedDatabaseName: string | undefined;
+let isolatedDatabaseUrl: string | undefined;
+let adminPool: ReturnType<typeof createPool> | undefined;
+let pool: ReturnType<typeof createPool>;
+let boardRepository: BoardRepository;
+let outboxRepository: OutboxRepository;
 const createdBoardIds = new Set<string>();
 
 interface SeededEvent {
@@ -49,6 +57,29 @@ interface OutboxState {
 }
 
 beforeAll(async () => {
+  isolatedDatabaseName = `converge_outbox_repository_${process.pid}_${crypto
+    .randomUUID()
+    .replaceAll("-", "")
+    .slice(0, 12)}`;
+  const adminUrl = new URL(sharedDatabaseUrl);
+  adminUrl.pathname = "/postgres";
+  adminUrl.searchParams.delete("options");
+  adminPool = createPool(adminUrl.toString());
+  await adminPool.query(`CREATE DATABASE "${isolatedDatabaseName}"`);
+
+  const testUrl = new URL(sharedDatabaseUrl);
+  testUrl.pathname = `/${isolatedDatabaseName}`;
+  testUrl.searchParams.delete("options");
+  isolatedDatabaseUrl = testUrl.toString();
+  await runFile("pnpm", ["--filter", "@converge/database", "migrate"], {
+    cwd: repositoryRoot,
+    env: { ...process.env, DATABASE_URL: isolatedDatabaseUrl },
+    maxBuffer: 1024 * 1024,
+  });
+
+  pool = createPool(isolatedDatabaseUrl);
+  boardRepository = new BoardRepository(pool);
+  outboxRepository = new OutboxRepository(pool);
   await pool.query("SELECT 1");
 });
 
@@ -59,7 +90,13 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-  await pool.end();
+  if (pool) await pool.end();
+  try {
+    if (adminPool && isolatedDatabaseName)
+      await adminPool.query(`DROP DATABASE "${isolatedDatabaseName}"`);
+  } finally {
+    await adminPool?.end();
+  }
 });
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -166,6 +203,88 @@ async function expectConstraintFailure(
 }
 
 describe("leased PostgreSQL outbox repository", () => {
+  it("quarantines a strict-schema-invalid claim without rolling back unrelated claims", async () => {
+    const [poison, later] = await seedRevocationBoard(2);
+    const [unrelated] = await seedRevocationBoard();
+    if (!poison || !later || !unrelated) throw new Error("Expected seeded events");
+    await pool.query(
+      `UPDATE outbox_events
+       SET payload = payload || '{"unexpected":"must be rejected"}'::jsonb
+       WHERE id = $1`,
+      [poison.eventId],
+    );
+    const originalPoison = await stateFor(poison.eventId);
+
+    const claims = await outboxRepository.claimAvailable({
+      owner: "schema-validation-worker",
+      batchSize: 32,
+    });
+
+    expect(claims.map((claim) => claim.eventId)).toEqual([unrelated.eventId]);
+    const blockedPoison = await stateFor(poison.eventId);
+    expect(blockedPoison).toMatchObject({
+      status: "blocked",
+      attempt_count: 1,
+      lease_owner: null,
+      lease_token: null,
+      leased_until: null,
+      next_attempt_infinite: true,
+      last_error_code: "INVALID_DELIVERY_ENVELOPE",
+      last_error_message: "Delivery envelope failed strict validation.",
+    });
+    expect(blockedPoison).toMatchObject({
+      id: originalPoison.id,
+      board_id: originalPoison.board_id,
+      delivery_seq: originalPoison.delivery_seq,
+      payload: originalPoison.payload,
+    });
+    expect(blockedPoison.last_error_message).not.toMatch(/unexpected|unrecognized|payload/i);
+    expect(await stateFor(unrelated.eventId)).toMatchObject({
+      status: "leased",
+      attempt_count: 1,
+      lease_owner: "schema-validation-worker",
+    });
+    expect(await stateFor(later.eventId)).toMatchObject({
+      status: "pending",
+      attempt_count: 0,
+      lease_owner: null,
+      lease_token: null,
+      leased_until: null,
+    });
+    await expect(
+      outboxRepository.claimAvailable({ owner: "schema-validation-worker-2" }),
+    ).resolves.toEqual([]);
+  });
+
+  it("quarantines multiple invalid rows while committing unrelated valid claims", async () => {
+    const poisonBoards = await Promise.all([seedRevocationBoard(), seedRevocationBoard()]);
+    const poisonEvents = poisonBoards.flat();
+    const [unrelated] = await seedRevocationBoard();
+    if (!unrelated) throw new Error("Expected unrelated event");
+    await pool.query(
+      `UPDATE outbox_events
+       SET payload = payload || '{"unknown":true}'::jsonb
+       WHERE id = ANY($1::uuid[])`,
+      [poisonEvents.map((event) => event.eventId)],
+    );
+
+    const claims = await outboxRepository.claimAvailable({
+      owner: "multiple-schema-validation-worker",
+    });
+
+    expect(claims.map((claim) => claim.eventId)).toEqual([unrelated.eventId]);
+    for (const poison of poisonEvents)
+      expect(await stateFor(poison.eventId)).toMatchObject({
+        status: "blocked",
+        attempt_count: 1,
+        lease_owner: null,
+        lease_token: null,
+        leased_until: null,
+        last_error_code: "INVALID_DELIVERY_ENVELOPE",
+        last_error_message: "Delivery envelope failed strict validation.",
+      });
+  });
+
   it("uses SKIP LOCKED so concurrent claimers never share an event or overtake its board", async () => {
     const [first, second] = await seedRevocationBoard(2);
     const [unrelated] = await seedRevocationBoard();
