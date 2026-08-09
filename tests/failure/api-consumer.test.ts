@@ -18,6 +18,20 @@ const streamKeys = new Set<string>();
 const consumers = new Set<RedisDeliveryConsumer>();
 let publisher: RedisClientType;
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 class FailFirstReadTransport implements DeliveryConsumerTransport {
   private failNextRead = true;
 
@@ -38,6 +52,40 @@ class FailFirstReadTransport implements DeliveryConsumerTransport {
     return new Promise<never>((_resolve, reject) => {
       queueMicrotask(() => queueMicrotask(() => reject(new Error("injected read disconnect"))));
     });
+  }
+
+  cancelRead(): Promise<void> {
+    return this.delegate.cancelRead();
+  }
+
+  close(): Promise<void> {
+    return this.delegate.close();
+  }
+}
+
+class ControlledFirstReadFailureTransport implements DeliveryConsumerTransport {
+  private readonly firstRead = deferred<readonly never[]>();
+  private useInjectedRead = true;
+
+  constructor(private readonly delegate: RedisDeliveryConsumerTransport) {}
+
+  connect(): Promise<void> {
+    return this.delegate.connect();
+  }
+
+  inspect(input: Parameters<DeliveryConsumerTransport["inspect"]>[0]) {
+    return this.delegate.inspect(input);
+  }
+
+  readAfter(input: Parameters<DeliveryConsumerTransport["readAfter"]>[0]) {
+    if (!this.useInjectedRead) return this.delegate.readAfter(input);
+    this.useInjectedRead = false;
+    input.onIssued();
+    return this.firstRead.promise;
+  }
+
+  failFirstRead(): void {
+    this.firstRead.reject(new Error("injected read disconnect"));
   }
 
   cancelRead(): Promise<void> {
@@ -455,6 +503,43 @@ describe("real Redis independent delivery consumers", () => {
       second.eventId,
     ]);
     await eventually(() => expect(consumer.lastHandledCursor).toBe("4-0"));
+  });
+
+  it("retains the trimmed-empty witness from recovery inspection through consumption", async () => {
+    const key = uniqueStreamKey();
+    await appendAt(key, "1-0", envelope(1));
+    await appendAt(key, "2-0", envelope(2));
+    await publisher.sendCommand(["XTRIM", key, "MAXLEN", "0"]);
+    const transport = new ControlledFirstReadFailureTransport(
+      new RedisDeliveryConsumerTransport(redisUrl, key),
+    );
+    let resolveOutcome!: (outcome: "delivered" | "cursor_lost") => void;
+    const outcome = new Promise<"delivered" | "cursor_lost">((resolve) => {
+      resolveOutcome = resolve;
+    });
+    const delivered: DeliveryContext[] = [];
+    const consumer = new RedisDeliveryConsumer(transport, {
+      deliver: (context) => {
+        delivered.push(context);
+        resolveOutcome("delivered");
+        return Promise.resolve();
+      },
+      quarantine: () => Promise.resolve(),
+      lifecycle: (event) => {
+        if (event.state === "cursor_lost") resolveOutcome("cursor_lost");
+      },
+    });
+    consumers.add(consumer);
+    await consumer.start();
+    expect(consumer.lastHandledCursor).toBe("2-0");
+
+    const value = envelope(3);
+    const id = await appendAt(key, "3-0", value);
+    transport.failFirstRead();
+
+    expect(await withDeadline(outcome)).toBe("delivered");
+    expect(delivered).toEqual([{ redisEntryId: id, envelope: value }]);
+    await eventually(() => expect(consumer.lastHandledCursor).toBe("3-0"));
   });
 
   it.each(["xdel", "xtrim", "recreate"] as const)(

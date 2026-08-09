@@ -643,7 +643,6 @@ export class RedisDeliveryConsumer {
           ...witness,
           metadata,
           observedStream: true,
-          emptyBoundary: undefined,
         };
         return;
       }
@@ -747,7 +746,14 @@ export class RedisDeliveryConsumer {
       await this.hooks.beforeCursorAdvance?.(entry.id);
       this.assertGeneration(generation);
       this.cursor = entry.id;
-      if (this.witness) this.witness.minimumEntriesAdded += 1n;
+      if (this.witness) {
+        this.witness.minimumEntriesAdded += 1n;
+        if (
+          this.witness.emptyBoundary !== undefined &&
+          compareRedisStreamIds(this.cursor, this.witness.emptyBoundary.lastGeneratedId) > 0
+        )
+          this.witness.emptyBoundary = undefined;
+      }
       await this.hooks.afterCursorAdvance?.(entry.id);
       if (stopAt !== undefined && compareRedisStreamIds(this.cursor, stopAt) >= 0) return;
     }

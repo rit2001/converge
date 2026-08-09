@@ -12,6 +12,7 @@ import {
   compareRedisStreamIds,
   defaultDeliveryConsumerConfiguration,
   type DeliveryConsumerCallbacks,
+  type DeliveryConsumerHooks,
   type DeliveryConsumerLifecycleEvent,
   type DeliveryConsumerScheduler,
   type DeliveryConsumerTransport,
@@ -233,6 +234,7 @@ function harness(
   overrides: Partial<DeliveryConsumerCallbacks> = {},
   configuration = defaultDeliveryConsumerConfiguration,
   scheduler?: DeliveryConsumerScheduler,
+  hooks: DeliveryConsumerHooks = {},
 ): Harness {
   const delivered: DeliveryEnvelope[] = [];
   const quarantined: { boardId: string; reason: string; overflowed: boolean }[] = [];
@@ -252,11 +254,25 @@ function harness(
     ...overrides,
   };
   return {
-    consumer: new RedisDeliveryConsumer(transport, callbacks, { ...configuration }, scheduler),
+    consumer: new RedisDeliveryConsumer(
+      transport,
+      callbacks,
+      { ...configuration },
+      scheduler,
+      hooks,
+    ),
     delivered,
     quarantined,
     lifecycle,
   };
+}
+
+function retainedEmptyBoundary(consumer: RedisDeliveryConsumer): string | undefined {
+  return (
+    consumer as unknown as {
+      witness?: { emptyBoundary?: { lastGeneratedId: string } };
+    }
+  ).witness?.emptyBoundary?.lastGeneratedId;
 }
 
 async function eventually(assertion: () => void): Promise<void> {
@@ -403,6 +419,122 @@ describe("RedisDeliveryConsumer", () => {
     expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
     expect(test.lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
     await test.consumer.stop();
+  });
+
+  it("retains the empty boundary when recovery inspection precedes recovery consumption", async () => {
+    const afterEntry = metadata({
+      firstEntryId: "11-0",
+      lastEntryId: "11-0",
+      lastGeneratedId: "11-0",
+      entriesAdded: "3",
+    });
+    const transport = new FakeTransport(existingEmptyMetadata(), afterEntry, afterEntry);
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => Promise.resolve(),
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("11-0"));
+
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+    expect(test.lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+    expect(retainedEmptyBoundary(test.consumer)).toBeUndefined();
+    await test.consumer.stop();
+  });
+
+  it("retains the empty boundary across an empty-read inspection race", async () => {
+    const afterEntry = metadata({
+      firstEntryId: "11-0",
+      lastEntryId: "11-0",
+      lastGeneratedId: "11-0",
+      entriesAdded: "3",
+    });
+    const transport = new FakeTransport(existingEmptyMetadata(), afterEntry, afterEntry);
+    const test = harness(transport);
+    await test.consumer.start();
+
+    transport.resolveRead([]);
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("11-0"));
+
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+    expect(test.lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+    expect(retainedEmptyBoundary(test.consumer)).toBeUndefined();
+    await test.consumer.stop();
+  });
+
+  it("retains the empty boundary when handling fails before cursor advancement", async () => {
+    const transport = new FakeTransport(existingEmptyMetadata());
+    const test = harness(transport, {
+      deliver: () => Promise.reject(new Error("injected handler failure")),
+    });
+    await test.consumer.start();
+
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await eventually(() =>
+      expect(test.lifecycle.at(-1)).toMatchObject({
+        state: "error",
+        code: "DELIVERY_CALLBACK_FAILED",
+      }),
+    );
+
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(retainedEmptyBoundary(test.consumer)).toBe("10-0");
+    await test.consumer.stop();
+  });
+
+  it("clears the empty boundary only after the owned cursor advancement", async () => {
+    const beforeAdvance = deferred<void>();
+    const allowAdvance = deferred<void>();
+    const transport = new FakeTransport(existingEmptyMetadata());
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, undefined, {
+      beforeCursorAdvance: async () => {
+        beforeAdvance.resolve();
+        await allowAdvance.promise;
+      },
+    });
+    await test.consumer.start();
+
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await beforeAdvance.promise;
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(retainedEmptyBoundary(test.consumer)).toBe("10-0");
+
+    allowAdvance.resolve();
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("11-0"));
+    expect(retainedEmptyBoundary(test.consumer)).toBeUndefined();
+    await test.consumer.stop();
+  });
+
+  it("does not let a stale handler completion clear the active empty boundary", async () => {
+    const beforeAdvance = deferred<void>();
+    const allowCompletion = deferred<void>();
+    const transport = new FakeTransport(existingEmptyMetadata());
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, undefined, {
+      beforeCursorAdvance: async () => {
+        beforeAdvance.resolve();
+        await allowCompletion.promise;
+      },
+    });
+    await test.consumer.start();
+
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await beforeAdvance.promise;
+    const stopping = test.consumer.stop();
+    allowCompletion.resolve();
+    await stopping;
+
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(retainedEmptyBoundary(test.consumer)).toBe("10-0");
+    expect(test.lifecycle.map(({ state }) => state).slice(-2)).toEqual(["stopping", "stopped"]);
   });
 
   it.each([
