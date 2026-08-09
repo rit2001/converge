@@ -447,7 +447,9 @@ describe("real Redis independent delivery consumers", () => {
       DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
       DELIVERY_STREAM_INITIALIZATION_TYPE,
       DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
-      expect.any(String),
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
     ]);
     expect(first.lastHandledCursor).toBe(initialized[0]?.id);
     expect(second.lastHandledCursor).toBe(initialized[0]?.id);
@@ -460,6 +462,110 @@ describe("real Redis independent delivery consumers", () => {
     ]);
     expect(firstDelivery).toEqual({ redisEntryId: publishedId, envelope: published });
     expect(secondDelivery).toEqual({ redisEntryId: publishedId, envelope: published });
+  });
+
+  it.each([
+    [
+      "non-UUID",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "not-a-uuid",
+      ],
+    ],
+    [
+      "uppercase UUID",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "10000000-0000-4000-8000-00000000000A",
+      ],
+    ],
+    [
+      "empty generation",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "",
+      ],
+    ],
+    [
+      "whitespace generation",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        " 10000000-0000-4000-8000-000000000001",
+      ],
+    ],
+    [
+      "oversized generation",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "a".repeat(100_000),
+      ],
+    ],
+    [
+      "duplicate generation",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "10000000-0000-4000-8000-000000000001",
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "10000000-0000-4000-8000-000000000001",
+      ],
+    ],
+    [
+      "reordered fields",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "10000000-0000-4000-8000-000000000001",
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+      ],
+    ],
+    [
+      "unknown sentinel field",
+      [
+        DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+        DELIVERY_STREAM_INITIALIZATION_TYPE,
+        DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+        "10000000-0000-4000-8000-000000000001",
+        "unexpected",
+        "value",
+      ],
+    ],
+  ] as const)("fails startup on Redis sentinel evidence with %s", async (_name, fields) => {
+    const key = uniqueStreamKey();
+    await publisher.sendCommand(["XADD", key, "*", ...fields]);
+    const delivered: DeliveryContext[] = [];
+    const quarantined: unknown[] = [];
+    const lifecycle: DeliveryConsumerLifecycleEvent[] = [];
+    const consumer = new RedisDeliveryConsumer(new RedisDeliveryConsumerTransport(redisUrl, key), {
+      deliver: (context) => {
+        delivered.push(context);
+        return Promise.resolve();
+      },
+      quarantine: (event) => {
+        quarantined.push(event);
+        return Promise.resolve();
+      },
+      lifecycle: (event) => {
+        lifecycle.push(event);
+      },
+    });
+    consumers.add(consumer);
+
+    await expect(consumer.start()).rejects.toThrow("invalid sentinel evidence");
+    expect(delivered).toEqual([]);
+    expect(quarantined).toEqual([]);
+    expect(lifecycle.some(({ state }) => state === "established")).toBe(false);
   });
 
   it("fails startup when its initialization sentinel is deleted before validation", async () => {

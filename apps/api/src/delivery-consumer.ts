@@ -5,10 +5,13 @@ import {
   type DeliveryEnvelope,
   type DeliveryStreamFieldPair,
 } from "@converge/protocol";
+import { isCanonicalDeliveryStreamGeneration } from "./delivery-stream-sentinel.js";
 
 export const REDIS_DELIVERY_READ_COUNT = 100 as const;
 export const REDIS_DELIVERY_BLOCK_MS = 5_000 as const;
 export const REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND = 100_000 as const;
+export const REDIS_DELIVERY_RECONNECT_DELAY_MIN_MS = 1 as const;
+export const REDIS_DELIVERY_RECONNECT_DELAY_MAX_MS = 2_147_483_647 as const;
 
 const ZERO_STREAM_ID = "0-0";
 const STREAM_ID_PATTERN = /^(0|[1-9]\d*)-(0|[1-9]\d*)$/;
@@ -244,6 +247,12 @@ class CursorLossError extends Error {
 
 class StaleGenerationError extends Error {}
 
+class LifecycleNotificationError extends Error {
+  constructor(cause: unknown) {
+    super("Delivery consumer availability callback failed", { cause });
+  }
+}
+
 function parseStreamId(value: string, allowZero: boolean): readonly [bigint, bigint] {
   const match = STREAM_ID_PATTERN.exec(value);
   const milliseconds = match?.[1];
@@ -330,7 +339,9 @@ function validateConfiguration(configuration: DeliveryConsumerConfiguration): vo
     configuration.boardDedupeMaximumEvents === 0 ||
     configuration.boardDedupeMaximumBytes === 0 ||
     configuration.maximumBoardStates === 0 ||
-    configuration.maximumBoardStates > REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND
+    configuration.maximumBoardStates > REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND ||
+    configuration.reconnectDelayMs < REDIS_DELIVERY_RECONNECT_DELAY_MIN_MS ||
+    configuration.reconnectDelayMs > REDIS_DELIVERY_RECONNECT_DELAY_MAX_MS
   )
     throw new FatalConsumerError("INVALID_CONFIGURATION");
 }
@@ -448,6 +459,8 @@ export class RedisDeliveryConsumer {
       await this.transport.connect();
       this.assertGeneration(generation);
       const startupGenerationToken = randomUUID();
+      if (!isCanonicalDeliveryStreamGeneration(startupGenerationToken))
+        throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
       const initialization = await this.transport.initializeStream({
         generationToken: startupGenerationToken,
         signal: this.abortController.signal,
@@ -463,7 +476,7 @@ export class RedisDeliveryConsumer {
       if (sentinelId !== null && generationToken !== null) {
         if (
           !redisStreamEntryIdSchema.safeParse(sentinelId).success ||
-          generationToken.length === 0 ||
+          !isCanonicalDeliveryStreamGeneration(generationToken) ||
           !metadata.exists
         )
           throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
@@ -518,12 +531,16 @@ export class RedisDeliveryConsumer {
       try {
         const entries = await this.issueRead(generation, async () => {
           if (!firstRead) return;
+          await this.notifyLifecycle(
+            {
+              state: "established",
+              cursor: this.cursor,
+              initialTail,
+            },
+            true,
+          );
+          this.assertGeneration(generation);
           firstRead = false;
-          await this.notifyLifecycle({
-            state: "established",
-            cursor: this.cursor,
-            initialTail,
-          });
           established.resolve();
         });
         if (this.stopping) return;
@@ -531,9 +548,23 @@ export class RedisDeliveryConsumer {
         this.validateReadContinuity(metadata, entries);
         await this.processBatch(entries, generation);
       } catch (error) {
-        if (this.stopping || error instanceof StaleGenerationError) return;
+        if (this.stopping || error instanceof StaleGenerationError) {
+          established.resolve();
+          return;
+        }
         if (error instanceof FatalConsumerError) {
           await this.reportFatalError(error);
+          established.reject(error);
+          return;
+        }
+        if (error instanceof LifecycleNotificationError) {
+          await this.notifyLifecycle({
+            state: "unavailable",
+            cursor: this.cursor,
+            code: "REDIS_UNAVAILABLE",
+          });
+          this.generation += 1;
+          await this.transport.cancelRead().catch(() => undefined);
           established.reject(error);
           return;
         }
@@ -556,7 +587,10 @@ export class RedisDeliveryConsumer {
         try {
           await this.recover(generation);
         } catch (recoveryError) {
-          if (this.stopping || recoveryError instanceof StaleGenerationError) return;
+          if (this.stopping || recoveryError instanceof StaleGenerationError) {
+            established.resolve();
+            return;
+          }
           if (recoveryError instanceof FatalConsumerError) {
             await this.reportFatalError(recoveryError);
             established.reject(recoveryError);
@@ -582,35 +616,53 @@ export class RedisDeliveryConsumer {
     onIssued: () => Promise<void>,
   ): Promise<readonly RawDeliveryStreamEntry[]> {
     this.assertGeneration(generation);
-    const issued = deferred<void>();
+    const issuance = deferred<void>();
+    let issuanceSignalled = false;
+    let issuanceClosed = false;
+    let lifecycleWork: Promise<void> | undefined;
     const result = this.transport.readAfter({
       cursor: this.cursor,
       count: REDIS_DELIVERY_READ_COUNT,
       blockMs: REDIS_DELIVERY_BLOCK_MS,
       signal: this.abortController.signal,
       onIssued: () => {
+        if (issuanceSignalled || issuanceClosed) return;
         if (!this.isActiveGeneration(generation)) {
-          issued.reject(new StaleGenerationError());
+          issuanceClosed = true;
+          issuance.reject(new StaleGenerationError());
           return;
         }
-        void onIssued().then(() => {
-          try {
-            this.assertGeneration(generation);
-            issued.resolve();
-          } catch (error) {
-            issued.reject(error);
-          }
-        }, issued.reject);
+        issuanceSignalled = true;
+        issuance.resolve();
+        try {
+          lifecycleWork = onIssued();
+        } catch (error) {
+          lifecycleWork = Promise.reject(
+            error instanceof Error
+              ? error
+              : new Error("Delivery consumer issuance callback failed", { cause: error }),
+          );
+        }
       },
     });
-    await Promise.race([
-      issued.promise,
-      result.then(
-        () => Promise.reject(new Error("Redis XREAD completed before it was issued")),
-        (error: unknown) =>
-          Promise.reject(error instanceof Error ? error : new Error("Redis XREAD failed")),
-      ),
-    ]);
+    const never = new Promise<never>(() => undefined);
+    const settledBeforeIssuance = result.then(
+      () => {
+        if (issuanceSignalled) return never;
+        issuanceClosed = true;
+        throw new Error("Redis XREAD completed before it was issued");
+      },
+      (error: unknown) => {
+        if (issuanceSignalled) return never;
+        issuanceClosed = true;
+        throw new Error("Redis XREAD failed before it was issued", { cause: error });
+      },
+    );
+    await Promise.race([issuance.promise, settledBeforeIssuance]);
+    const issuedLifecycleWork = lifecycleWork;
+    if (!issuedLifecycleWork) throw new Error("Redis XREAD issuance callback did not run");
+    await issuedLifecycleWork;
+    this.assertGeneration(generation);
     const entries = await result;
     this.assertGeneration(generation);
     return entries;
@@ -641,7 +693,10 @@ export class RedisDeliveryConsumer {
         const pendingRead = this.issueRead(generation, () =>
           Promise.resolve().then(async () => {
             availabilityAnnounced = true;
-            await this.notifyLifecycle({ state: "recovered", cursor: this.cursor, recoveryTail });
+            await this.notifyLifecycle(
+              { state: "recovered", cursor: this.cursor, recoveryTail },
+              true,
+            );
           }),
         );
         const entries = await pendingRead;
@@ -1116,7 +1171,10 @@ export class RedisDeliveryConsumer {
     if (!this.isActiveGeneration(generation)) throw new StaleGenerationError();
   }
 
-  private async notifyLifecycle(event: DeliveryConsumerLifecycleEvent): Promise<void> {
+  private async notifyLifecycle(
+    event: DeliveryConsumerLifecycleEvent,
+    failOnCallbackError = false,
+  ): Promise<void> {
     if (event.state === "unavailable") {
       if (this.availabilityState === "unavailable") return;
       this.availabilityState = "unavailable";
@@ -1125,7 +1183,8 @@ export class RedisDeliveryConsumer {
     }
     try {
       await this.callbacks.lifecycle(event);
-    } catch {
+    } catch (error) {
+      if (failOnCallbackError) throw new LifecycleNotificationError(error);
       // Diagnostics callbacks cannot weaken cursor, recovery, or shutdown invariants.
     }
   }

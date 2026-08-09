@@ -9,6 +9,8 @@ import {
   REDIS_DELIVERY_BLOCK_MS,
   REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND,
   REDIS_DELIVERY_READ_COUNT,
+  REDIS_DELIVERY_RECONNECT_DELAY_MAX_MS,
+  REDIS_DELIVERY_RECONNECT_DELAY_MIN_MS,
   RedisDeliveryConsumer,
   compareRedisStreamIds,
   defaultDeliveryConsumerConfiguration,
@@ -146,11 +148,14 @@ class FakeTransport implements DeliveryConsumerTransport {
   verifyCalls = 0;
   verificationResult = true;
   initializeBarrier: Promise<void> | undefined;
+  initializationResult: DeliveryStreamInitialization | undefined;
+  issueReads = true;
   activeReads = 0;
   maximumActiveReads = 0;
   onRead: ((cursor: string) => void) | undefined;
   private readonly pendingReads: ReturnType<typeof deferred<readonly RawDeliveryStreamEntry[]>>[] =
     [];
+  private readonly pendingIssuanceCallbacks: (() => void)[] = [];
   private inspectIndex = 0;
   private lastMetadata: DeliveryStreamMetadata | undefined;
   private resolvedEntries: readonly RawDeliveryStreamEntry[] = [];
@@ -169,6 +174,7 @@ class FakeTransport implements DeliveryConsumerTransport {
   }): Promise<DeliveryStreamInitialization> {
     this.initializeCalls += 1;
     await this.initializeBarrier;
+    if (this.initializationResult) return this.initializationResult;
     const startupMetadata = this.inspections[this.inspectIndex];
     if (!(startupMetadata instanceof Error) && startupMetadata?.exists === false) {
       this.inspections[this.inspectIndex] = initializedSentinelMetadata();
@@ -243,11 +249,18 @@ class FakeTransport implements DeliveryConsumerTransport {
     input.signal.addEventListener("abort", () => pending.reject(new Error("aborted")), {
       once: true,
     });
-    input.onIssued();
+    if (this.issueReads) input.onIssued();
+    else this.pendingIssuanceCallbacks.push(input.onIssued);
     this.onRead?.(input.cursor);
     return pending.promise.finally(() => {
       this.activeReads -= 1;
     });
+  }
+
+  issueNextRead(): void {
+    const onIssued = this.pendingIssuanceCallbacks.shift();
+    if (!onIssued) throw new Error("No pending XREAD issuance callback");
+    onIssued();
   }
 
   resolveRead(entries: readonly RawDeliveryStreamEntry[]): void {
@@ -343,6 +356,272 @@ async function eventually(assertion: () => void): Promise<void> {
 }
 
 describe("RedisDeliveryConsumer", () => {
+  it("retains an issued first-read batch until established completes", async () => {
+    const establishedGate = deferred<void>();
+    const transport = new FakeTransport(metadata());
+    transport.onRead = () => {
+      transport.onRead = undefined;
+      transport.resolveRead([entry("11-0", envelope(1))]);
+    };
+    const test = harness(transport, {
+      lifecycle: async (event) => {
+        test.lifecycle.push(event);
+        if (event.state === "established") await establishedGate.promise;
+      },
+    });
+
+    const startup = test.consumer.start();
+    await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("established"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(test.delivered).toEqual([]);
+    expect(test.lifecycle.map(({ state }) => state)).toEqual(["starting", "established"]);
+    establishedGate.resolve();
+    await startup;
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("11-0"));
+
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+    expect(test.lifecycle.map(({ state }) => state)).toEqual(["starting", "established"]);
+    await test.consumer.stop();
+  });
+
+  it("retains an issued post-recovery batch until recovered completes", async () => {
+    const recoveredGate = deferred<void>();
+    const transport = new FakeTransport(metadata(), metadata());
+    const test = harness(
+      transport,
+      {
+        lifecycle: async (event) => {
+          test.lifecycle.push(event);
+          if (event.state === "recovered") await recoveredGate.promise;
+        },
+      },
+      defaultDeliveryConsumerConfiguration,
+      { wait: () => Promise.resolve() },
+    );
+    await test.consumer.start();
+
+    transport.onRead = () => {
+      transport.onRead = undefined;
+      transport.resolveRead([entry("11-0", envelope(1))]);
+    };
+    transport.rejectRead();
+    await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("recovered"));
+    expect(test.delivered).toEqual([]);
+    recoveredGate.resolve();
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("11-0"));
+
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+      "recovering",
+      "recovered",
+    ]);
+    await test.consumer.stop();
+  });
+
+  it("classifies an issued read rejection only after pending lifecycle work settles", async () => {
+    const lifecycleGate = deferred<void>();
+    const transport = new FakeTransport(metadata());
+    const test = harness(transport);
+    const internal = test.consumer as unknown as {
+      issueRead(generation: number, onIssued: () => Promise<void>): Promise<unknown>;
+    };
+    let settled = false;
+    const outcome = internal
+      .issueRead(0, () => lifecycleGate.promise)
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      .finally(() => {
+        settled = true;
+      });
+    await eventually(() => expect(transport.readCalls).toHaveLength(1));
+
+    transport.rejectRead(new Error("issued read failed"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    lifecycleGate.resolve();
+
+    await expect(outcome).resolves.toMatchObject({ message: "issued read failed" });
+    await test.consumer.stop();
+  });
+
+  it("rejects a read that settles before its issuance callback is signalled", async () => {
+    const transport = new FakeTransport(metadata());
+    transport.issueReads = false;
+    const test = harness(transport);
+    const internal = test.consumer as unknown as {
+      issueRead(generation: number, onIssued: () => Promise<void>): Promise<unknown>;
+    };
+    const outcome = internal.issueRead(0, () => Promise.resolve());
+    await eventually(() => expect(transport.readCalls).toHaveLength(1));
+
+    transport.resolveRead([]);
+    await expect(outcome).rejects.toThrow("Redis XREAD completed before it was issued");
+    transport.issueNextRead();
+    await test.consumer.stop();
+  });
+
+  it("fences an issued read when availability establishment rejects", async () => {
+    const lifecycleGate = deferred<void>();
+    const transport = new FakeTransport(metadata());
+    const test = harness(transport);
+    const internal = test.consumer as unknown as {
+      issueRead(generation: number, onIssued: () => Promise<void>): Promise<unknown>;
+    };
+    const outcome = internal.issueRead(0, () => lifecycleGate.promise);
+    await eventually(() => expect(transport.readCalls).toHaveLength(1));
+    transport.resolveRead([entry("11-0", envelope(1))]);
+
+    lifecycleGate.reject(new Error("availability callback failed"));
+    await expect(outcome).rejects.toThrow("availability callback failed");
+    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.delivered).toEqual([]);
+    await test.consumer.stop();
+  });
+
+  it("cancels startup when the established lifecycle callback rejects after issuance", async () => {
+    const transport = new FakeTransport(metadata());
+    transport.onRead = () => {
+      transport.onRead = undefined;
+      transport.resolveRead([entry("11-0", envelope(1))]);
+    };
+    const test = harness(transport, {
+      lifecycle: (event) => {
+        test.lifecycle.push(event);
+        if (event.state === "established")
+          return Promise.reject(new Error("established callback rejected"));
+      },
+    });
+
+    await expect(test.consumer.start()).rejects.toThrow(
+      "Delivery consumer availability callback failed",
+    );
+
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+    ]);
+    expect(transport.cancelCalls).toBe(1);
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    await test.consumer.stop();
+  });
+
+  it("does not emit a late failure when shutdown fences pending establishment", async () => {
+    const establishedGate = deferred<void>();
+    const transport = new FakeTransport(metadata());
+    const test = harness(transport, {
+      lifecycle: async (event) => {
+        test.lifecycle.push(event);
+        if (event.state === "established") await establishedGate.promise;
+      },
+    });
+
+    const startup = test.consumer.start();
+    await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("established"));
+    const shutdown = test.consumer.stop();
+    establishedGate.resolve();
+
+    await Promise.all([startup, shutdown]);
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "stopping",
+      "stopped",
+    ]);
+    expect(test.delivered).toEqual([]);
+  });
+
+  it("fences and retries when the recovered lifecycle callback rejects after issuance", async () => {
+    const transport = new FakeTransport(metadata(), metadata(), metadata());
+    let recoveredCallbacks = 0;
+    const test = harness(
+      transport,
+      {
+        lifecycle: (event) => {
+          test.lifecycle.push(event);
+          if (event.state === "recovered" && recoveredCallbacks++ === 0)
+            return Promise.reject(new Error("recovered callback rejected"));
+        },
+      },
+      defaultDeliveryConsumerConfiguration,
+      { wait: () => Promise.resolve() },
+    );
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(3));
+    await eventually(() =>
+      expect(test.lifecycle.map(({ state }) => state)).toEqual([
+        "starting",
+        "established",
+        "unavailable",
+        "recovering",
+        "recovered",
+        "unavailable",
+        "recovering",
+        "recovered",
+      ]),
+    );
+
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    expect(transport.maximumActiveReads).toBe(1);
+    await test.consumer.stop();
+  });
+
+  it.each([
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+    REDIS_DELIVERY_RECONNECT_DELAY_MAX_MS + 1,
+  ])("rejects reconnectDelayMs=%s before connecting", async (reconnectDelayMs) => {
+    const transport = new FakeTransport(metadata());
+    let waits = 0;
+    const test = harness(
+      transport,
+      {},
+      { ...defaultDeliveryConsumerConfiguration, reconnectDelayMs },
+      {
+        wait: () => {
+          waits += 1;
+          return Promise.resolve();
+        },
+      },
+    );
+
+    await expect(test.consumer.start()).rejects.toThrow("INVALID_CONFIGURATION");
+    expect(transport.connectCalls).toBe(0);
+    expect(waits).toBe(0);
+    await test.consumer.stop();
+  });
+
+  it.each([REDIS_DELIVERY_RECONNECT_DELAY_MIN_MS, REDIS_DELIVERY_RECONNECT_DELAY_MAX_MS])(
+    "accepts reconnectDelayMs=%s",
+    async (reconnectDelayMs) => {
+      const transport = new FakeTransport(metadata());
+      const test = harness(
+        transport,
+        {},
+        {
+          ...defaultDeliveryConsumerConfiguration,
+          reconnectDelayMs,
+        },
+      );
+
+      await test.consumer.start();
+      await test.consumer.stop();
+    },
+  );
+
   it("uses a verified initialization sentinel as the absent-stream startup cursor and tail", async () => {
     const transport = new FakeTransport(emptyMetadata());
     const test = harness(transport);
@@ -359,6 +638,43 @@ describe("RedisDeliveryConsumer", () => {
       cursor: "0-1",
       initialTail: "0-1",
     });
+    await test.consumer.stop();
+  });
+
+  it.each([
+    "not-a-uuid",
+    "10000000-0000-4000-8000-00000000000A",
+    "",
+    " 10000000-0000-4000-8000-000000000001",
+    "10000000-0000-4000-8000-000000000001 ",
+    "a".repeat(100_000),
+  ])("fails startup on an invalid observed sentinel generation", async (generationToken) => {
+    const transport = new FakeTransport(metadata());
+    transport.initializationResult = {
+      created: false,
+      sentinelId: "10-0",
+      generationToken,
+    };
+    const test = harness(transport);
+
+    await expect(test.consumer.start()).rejects.toThrow("STREAM_INITIALIZATION_FAILED");
+    expect(test.delivered).toEqual([]);
+    expect(test.quarantined).toEqual([]);
+    expect(transport.verifyCalls).toBe(0);
+    await test.consumer.stop();
+  });
+
+  it("accepts a valid canonical observed sentinel generation", async () => {
+    const transport = new FakeTransport(metadata());
+    transport.initializationResult = {
+      created: false,
+      sentinelId: "10-0",
+      generationToken: "10000000-0000-4000-8000-000000000001",
+    };
+    const test = harness(transport);
+
+    await test.consumer.start();
+    expect(transport.verifyCalls).toBe(1);
     await test.consumer.stop();
   });
 

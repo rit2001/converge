@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 
 const redisMock = vi.hoisted(() => {
   let numberReply: ((value: string) => unknown) | undefined;
+  let initializerReply: unknown[] | undefined;
   const commands: string[][] = [];
   return {
     reset(): void {
       numberReply = undefined;
+      initializerReply = undefined;
       commands.length = 0;
     },
     mapNumber(mapping: Record<number, (value: string) => unknown>): void {
@@ -13,6 +15,12 @@ const redisMock = vi.hoisted(() => {
     },
     reply(value: string): unknown {
       return numberReply ? numberReply(value) : Number(value);
+    },
+    setInitializerReply(value: unknown[]): void {
+      initializerReply = value;
+    },
+    initializerReply(): unknown[] | undefined {
+      return initializerReply;
     },
     record(command: readonly string[]): void {
       commands.push([...command]);
@@ -63,12 +71,18 @@ vi.mock("redis", () => ({
             "last-entry",
             null,
           ];
-        if (command[0] === "EVAL") return [redisMock.reply("1"), "5-0", command.at(-1)];
+        if (command[0] === "EVAL")
+          return redisMock.initializerReply() ?? [redisMock.reply("1"), "5-0", command.at(-1)];
         if (command[0] === "XRANGE")
           return [
             [
               "5-0",
-              ["controlType", "converge.stream.initialized.v1", "generation", "test-generation"],
+              [
+                "controlType",
+                "converge.stream.initialized.v1",
+                "generation",
+                "10000000-0000-4000-8000-000000000001",
+              ],
             ],
           ];
         throw new Error(`Unexpected Redis command ${command[0]}`);
@@ -84,6 +98,8 @@ import {
 } from "./redis-delivery-transport.js";
 
 describe("RedisDeliveryConsumerTransport", () => {
+  const canonicalGeneration = "10000000-0000-4000-8000-000000000001";
+
   it("uses one atomic Redis-side initializer and verifies the exact sentinel", async () => {
     redisMock.reset();
     const transport = new RedisDeliveryConsumerTransport(
@@ -93,19 +109,19 @@ describe("RedisDeliveryConsumerTransport", () => {
     await transport.connect();
 
     const initialization = await transport.initializeStream({
-      generationToken: "test-generation",
+      generationToken: canonicalGeneration,
       signal: new AbortController().signal,
     });
     const verified = await transport.verifyInitialization({
       sentinelId: "5-0",
-      generationToken: "test-generation",
+      generationToken: canonicalGeneration,
       signal: new AbortController().signal,
     });
 
     expect(initialization).toEqual({
       created: true,
       sentinelId: "5-0",
-      generationToken: "test-generation",
+      generationToken: canonicalGeneration,
     });
     expect(verified).toBe(true);
     const initializer = redisMock.commands().find(([name]) => name === "EVAL");
@@ -114,9 +130,75 @@ describe("RedisDeliveryConsumerTransport", () => {
       expect.stringContaining("redis.call('EXISTS', KEYS[1])"),
       "1",
       "converge:test:m24a:initializer",
-      "test-generation",
+      canonicalGeneration,
     ]);
     expect(redisMock.commands().filter(([name]) => name === "EVAL")).toHaveLength(1);
+    await transport.close();
+  });
+
+  it.each([
+    "not-a-uuid",
+    "10000000-0000-4000-8000-00000000000A",
+    "",
+    " 10000000-0000-4000-8000-000000000001",
+    "10000000-0000-4000-8000-000000000001 ",
+    "a".repeat(100_000),
+  ])("rejects a noncanonical locally supplied sentinel generation", async (generationToken) => {
+    redisMock.reset();
+    const transport = new RedisDeliveryConsumerTransport(
+      "redis://test",
+      "converge:test:m24a:invalid-local-generation",
+    );
+    await transport.connect();
+
+    await expect(
+      transport.initializeStream({ generationToken, signal: new AbortController().signal }),
+    ).rejects.toThrow("invalid generation token");
+    expect(redisMock.commands().some(([name]) => name === "EVAL")).toBe(false);
+    await transport.close();
+  });
+
+  it("rejects a noncanonical generation before initialization verification", async () => {
+    redisMock.reset();
+    const transport = new RedisDeliveryConsumerTransport(
+      "redis://test",
+      "converge:test:m24a:invalid-verification-generation",
+    );
+    await transport.connect();
+
+    await expect(
+      transport.verifyInitialization({
+        sentinelId: "5-0",
+        generationToken: "not-a-uuid",
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("invalid generation token");
+    expect(redisMock.commands().some(([name]) => name === "XRANGE")).toBe(false);
+    await transport.close();
+  });
+
+  it.each([
+    "not-a-uuid",
+    "10000000-0000-4000-8000-00000000000A",
+    "",
+    " 10000000-0000-4000-8000-000000000001",
+    "10000000-0000-4000-8000-000000000001 ",
+    "a".repeat(100_000),
+  ])("rejects a noncanonical observed sentinel generation", async (generationToken) => {
+    redisMock.reset();
+    redisMock.setInitializerReply([redisMock.reply("0"), "5-0", generationToken]);
+    const transport = new RedisDeliveryConsumerTransport(
+      "redis://test",
+      "converge:test:m24a:invalid-observed-generation",
+    );
+    await transport.connect();
+
+    await expect(
+      transport.initializeStream({
+        generationToken: canonicalGeneration,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("invalid generation token");
     await transport.close();
   });
 

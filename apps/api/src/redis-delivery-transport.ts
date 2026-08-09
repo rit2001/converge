@@ -7,13 +7,43 @@ import type {
   DeliveryStreamMetadata,
   RawDeliveryStreamEntry,
 } from "./delivery-consumer.js";
+import {
+  DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+  DELIVERY_STREAM_INITIALIZATION_TYPE,
+  DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+  isCanonicalDeliveryStreamGeneration,
+} from "./delivery-stream-sentinel.js";
 
-export const DELIVERY_STREAM_INITIALIZATION_TYPE = "converge.stream.initialized.v1" as const;
-export const DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD = "controlType" as const;
-export const DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD = "generation" as const;
+export {
+  DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+  DELIVERY_STREAM_INITIALIZATION_TYPE,
+  DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+} from "./delivery-stream-sentinel.js";
 
 const UINT64_MAXIMUM = 18_446_744_073_709_551_615n;
 const INITIALIZE_STREAM_SCRIPT = `
+local function is_canonical_generation(value)
+  if type(value) ~= 'string' or string.len(value) ~= 36 then
+    return false
+  end
+  if string.sub(value, 9, 9) ~= '-' or
+     string.sub(value, 14, 14) ~= '-' or
+     string.sub(value, 19, 19) ~= '-' or
+     string.sub(value, 24, 24) ~= '-' then
+    return false
+  end
+  if string.sub(value, 15, 15) ~= '4' or
+     not string.match(string.sub(value, 20, 20), '^[89ab]$') then
+    return false
+  end
+  local compact = string.gsub(value, '-', '')
+  return string.len(compact) == 32 and string.match(compact, '^[0-9a-f]+$') ~= nil
+end
+
+if not is_canonical_generation(ARGV[1]) then
+  return {2, '', ''}
+end
+
 if redis.call('EXISTS', KEYS[1]) == 1 then
   local first = redis.call('XRANGE', KEYS[1], '-', '+', 'COUNT', 1)
   if #first == 1 then
@@ -21,8 +51,15 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
     if #fields == 4 and
        fields[1] == '${DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD}' and
        fields[2] == '${DELIVERY_STREAM_INITIALIZATION_TYPE}' and
-       fields[3] == '${DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD}' then
+       fields[3] == '${DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD}' and
+       is_canonical_generation(fields[4]) then
       return {0, first[1][1], fields[4]}
+    end
+    for index = 1, #fields, 2 do
+      if fields[index] == '${DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD}' or
+         fields[index] == '${DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD}' then
+        return {2, '', ''}
+      end
     end
   end
   return {0, '', ''}
@@ -165,6 +202,8 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
     generationToken: string;
     signal: AbortSignal;
   }): Promise<DeliveryStreamInitialization> {
+    if (!isCanonicalDeliveryStreamGeneration(input.generationToken))
+      throw new Error("Redis stream initializer received an invalid generation token");
     const response = asArray(
       await this.requireControl().sendCommand(
         ["EVAL", INITIALIZE_STREAM_SCRIPT, "1", this.streamKey, input.generationToken],
@@ -186,14 +225,21 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
       response[2],
       "Redis stream initializer returned an invalid generation token",
     );
+    if (created === "2")
+      throw new Error("Redis stream initializer returned invalid sentinel evidence");
     if (created === "0") {
       if (sentinelId === "" && generationToken === "")
         return { created: false, sentinelId: null, generationToken: null };
-      if (sentinelId !== "" && generationToken !== "")
+      if (sentinelId !== "" && isCanonicalDeliveryStreamGeneration(generationToken))
         return { created: false, sentinelId, generationToken };
-      throw new Error("Redis stream initializer returned inconsistent existing evidence");
+      throw new Error("Redis stream initializer returned an invalid generation token");
     }
-    if (created !== "1" || sentinelId === "" || generationToken !== input.generationToken)
+    if (
+      created !== "1" ||
+      sentinelId === "" ||
+      !isCanonicalDeliveryStreamGeneration(generationToken) ||
+      generationToken !== input.generationToken
+    )
       throw new Error("Redis stream initializer returned inconsistent evidence");
     return { created: true, sentinelId, generationToken };
   }
@@ -203,6 +249,8 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
     generationToken: string;
     signal: AbortSignal;
   }): Promise<boolean> {
+    if (!isCanonicalDeliveryStreamGeneration(input.generationToken))
+      throw new Error("Redis initialization verification received an invalid generation token");
     const response = asArray(
       await this.requireControl().sendCommand(
         ["XRANGE", this.streamKey, input.sentinelId, input.sentinelId, "COUNT", "1"],
