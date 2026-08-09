@@ -93,6 +93,20 @@ function emptyMetadata(): DeliveryStreamMetadata {
   };
 }
 
+function existingEmptyMetadata(
+  input: Partial<DeliveryStreamMetadata> = {},
+): DeliveryStreamMetadata {
+  return metadata({
+    length: "0",
+    firstEntryId: null,
+    lastEntryId: null,
+    lastGeneratedId: "10-0",
+    maxDeletedEntryId: "0-0",
+    entriesAdded: "2",
+    ...input,
+  });
+}
+
 class FakeTransport implements DeliveryConsumerTransport {
   readonly readCalls: { cursor: string; count: number; blockMs: number }[] = [];
   readonly inspections: (DeliveryStreamMetadata | Error)[] = [];
@@ -342,6 +356,112 @@ describe("RedisDeliveryConsumer", () => {
       await test.consumer.stop();
     },
   );
+
+  it.each([
+    ["XTRIM", existingEmptyMetadata()],
+    ["XDEL", existingEmptyMetadata({ maxDeletedEntryId: "10-0" })],
+  ])(
+    "delivers the first valid post-start entry after an existing stream was emptied by %s",
+    async (_name, startup) => {
+      const transport = new FakeTransport(startup);
+      const test = harness(transport);
+      await test.consumer.start();
+
+      expect(test.consumer.lastHandledCursor).toBe("10-0");
+      transport.resolveRead([entry("11-0", envelope(1))]);
+      await eventually(() => expect(test.consumer.lastHandledCursor).toBe("11-0"));
+      expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+      expect(test.lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+      await test.consumer.stop();
+    },
+  );
+
+  it("delivers multiple valid entries in order after a validated empty boundary", async () => {
+    const transport = new FakeTransport(existingEmptyMetadata());
+    const test = harness(transport);
+    await test.consumer.start();
+
+    transport.resolveRead([entry("11-0", envelope(1)), entry("12-0", envelope(2))]);
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("12-0"));
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1, 2]);
+    expect(test.lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+    await test.consumer.stop();
+  });
+
+  it("captures a validated empty boundary during recovery", async () => {
+    const emptiedDuringFailure = existingEmptyMetadata({ entriesAdded: "1" });
+    const transport = new FakeTransport(metadata(), emptiedDuringFailure);
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => Promise.resolve(),
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("11-0"));
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+    expect(test.lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+    await test.consumer.stop();
+  });
+
+  it.each([
+    [
+      "XDEL",
+      existingEmptyMetadata({
+        length: "1",
+        firstEntryId: "12-0",
+        lastEntryId: "12-0",
+        lastGeneratedId: "12-0",
+        maxDeletedEntryId: "11-0",
+        entriesAdded: "4",
+      }),
+    ],
+    [
+      "XTRIM",
+      existingEmptyMetadata({
+        length: "1",
+        firstEntryId: "12-0",
+        lastEntryId: "12-0",
+        lastGeneratedId: "12-0",
+        entriesAdded: "4",
+      }),
+    ],
+  ])("fails closed when post-boundary %s removes an unread entry", async (_name, afterLoss) => {
+    const transport = new FakeTransport(existingEmptyMetadata(), afterLoss);
+    const test = harness(transport);
+    await test.consumer.start();
+
+    transport.resolveRead([entry("12-0", envelope(2))]);
+    await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("cursor_lost"));
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    await test.consumer.stop();
+  });
+
+  it("fails closed when an initially empty stream is deleted and recreated", async () => {
+    const replacement = metadata({
+      firstEntryId: "20-0",
+      lastEntryId: "20-0",
+      lastGeneratedId: "20-0",
+      maxDeletedEntryId: "0-0",
+      entriesAdded: "1",
+    });
+    const transport = new FakeTransport(existingEmptyMetadata(), replacement);
+    const test = harness(transport);
+    await test.consumer.start();
+
+    transport.resolveRead([entry("20-0", envelope(1))]);
+    await eventually(() =>
+      expect(test.lifecycle.at(-1)).toMatchObject({
+        state: "cursor_lost",
+        reason: "STREAM_RECREATED",
+      }),
+    );
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    await test.consumer.stop();
+  });
 
   it.each([
     [
@@ -742,6 +862,171 @@ describe("RedisDeliveryConsumer", () => {
     expect(transport.readCalls[2]?.cursor).toBe("12-0");
     expect(transport.maximumActiveReads).toBe(1);
     await test.consumer.stop();
+  });
+
+  it("revokes availability when the pending read fails after recovered", async () => {
+    const transport = new FakeTransport(metadata(), metadata(), metadata());
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => Promise.resolve(),
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("recovered"));
+    transport.rejectRead(new Error("post-recovery XREAD failed"));
+    await eventually(() => expect(transport.readCalls).toHaveLength(3));
+
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+      "recovering",
+      "recovered",
+      "unavailable",
+      "recovering",
+      "recovered",
+    ]);
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    expect(transport.maximumActiveReads).toBe(1);
+    await test.consumer.stop();
+  });
+
+  it("revokes availability when first post-recovery metadata inspection fails", async () => {
+    const afterEntry = metadata({
+      length: "2",
+      lastEntryId: "11-0",
+      lastGeneratedId: "11-0",
+      entriesAdded: "2",
+    });
+    const transport = new FakeTransport(
+      metadata(),
+      metadata(),
+      new Error("post-recovery XINFO failed"),
+      afterEntry,
+    );
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => Promise.resolve(),
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await eventually(() => expect(transport.readCalls).toHaveLength(3));
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    transport.resolveRead([entry("11-0", envelope(1))]);
+    await eventually(() => expect(transport.readCalls).toHaveLength(4));
+
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+      "recovering",
+      "recovered",
+      "unavailable",
+      "recovering",
+      "recovered",
+    ]);
+    expect(test.consumer.lastHandledCursor).toBe("11-0");
+    expect(test.delivered.map(({ deliverySeq }) => deliverySeq)).toEqual([1]);
+    expect(transport.maximumActiveReads).toBe(1);
+    await test.consumer.stop();
+  });
+
+  it("never emits recovered twice without unavailable across repeated post-recovery failures", async () => {
+    const transport = new FakeTransport(metadata(), metadata());
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => Promise.resolve(),
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    transport.rejectRead(new Error("first post-recovery failure"));
+    await eventually(() => expect(transport.readCalls).toHaveLength(3));
+    transport.rejectRead(new Error("second post-recovery failure"));
+    await eventually(() => expect(transport.readCalls).toHaveLength(4));
+
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+      "recovering",
+      "recovered",
+      "unavailable",
+      "recovering",
+      "recovered",
+      "unavailable",
+      "recovering",
+      "recovered",
+    ]);
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    expect(transport.maximumActiveReads).toBe(1);
+    await test.consumer.stop();
+  });
+
+  it("emits unavailable once while one post-recovery failure episode keeps retrying", async () => {
+    const transport = new FakeTransport(
+      metadata(),
+      metadata(),
+      new Error("first retry inspection failed"),
+      new Error("second retry inspection failed"),
+      metadata(),
+    );
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => Promise.resolve(),
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    transport.rejectRead(new Error("post-recovery read failed"));
+    await eventually(() => expect(transport.inspectCalls).toBe(5));
+    await eventually(() => expect(transport.readCalls).toHaveLength(3));
+
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+      "recovering",
+      "recovered",
+      "unavailable",
+      "recovering",
+      "recovered",
+    ]);
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
+    expect(transport.maximumActiveReads).toBe(1);
+    await test.consumer.stop();
+  });
+
+  it("shutdown after recovered emits no spurious availability transition", async () => {
+    const transport = new FakeTransport(metadata(), metadata());
+    const test = harness(transport, {}, defaultDeliveryConsumerConfiguration, {
+      wait: () => Promise.resolve(),
+    });
+    await test.consumer.start();
+
+    transport.rejectRead();
+    await eventually(() => expect(transport.readCalls).toHaveLength(2));
+    await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("recovered"));
+    await test.consumer.stop();
+
+    expect(test.lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+      "recovering",
+      "recovered",
+      "stopping",
+      "stopped",
+    ]);
+    expect(test.consumer.lastHandledCursor).toBe("10-0");
+    expect(test.delivered).toEqual([]);
   });
 
   it.each([

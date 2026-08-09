@@ -145,6 +145,20 @@ async function withDeadline<T>(promise: Promise<T>): Promise<T> {
   }
 }
 
+async function eventually(assertion: () => void): Promise<void> {
+  let failure: unknown;
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      failure = error;
+      await Promise.resolve();
+    }
+  }
+  throw failure;
+}
+
 beforeAll(async () => {
   publisher = createClient({ url: redisUrl });
   publisher.on("error", () => undefined);
@@ -357,4 +371,152 @@ describe("real Redis independent delivery consumers", () => {
     expect(lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
     expect(consumer.lastHandledCursor).toBe("2-0");
   });
+
+  it.each(["xtrim", "xdel"] as const)(
+    "delivers the first post-start entry after an existing stream was emptied with %s",
+    async (operation) => {
+      const key = uniqueStreamKey();
+      await appendAt(key, "1-0", envelope(1));
+      await appendAt(key, "2-0", envelope(2));
+      if (operation === "xtrim") await publisher.sendCommand(["XTRIM", key, "MAXLEN", "0"]);
+      else await publisher.sendCommand(["XDEL", key, "1-0", "2-0"]);
+
+      let resolveOutcome!: (outcome: "delivered" | "cursor_lost") => void;
+      const outcome = new Promise<"delivered" | "cursor_lost">((resolve) => {
+        resolveOutcome = resolve;
+      });
+      const delivered: DeliveryContext[] = [];
+      const consumer = new RedisDeliveryConsumer(
+        new RedisDeliveryConsumerTransport(redisUrl, key),
+        {
+          deliver: (context) => {
+            delivered.push(context);
+            resolveOutcome("delivered");
+            return Promise.resolve();
+          },
+          quarantine: () => Promise.resolve(),
+          lifecycle: (event) => {
+            if (event.state === "cursor_lost") resolveOutcome("cursor_lost");
+          },
+        },
+      );
+      consumers.add(consumer);
+      await consumer.start();
+      expect(consumer.lastHandledCursor).toBe("2-0");
+
+      const value = envelope(3);
+      const id = await appendAt(key, "3-0", value);
+      expect(await withDeadline(outcome)).toBe("delivered");
+      expect(delivered).toEqual([{ redisEntryId: id, envelope: value }]);
+      await eventually(() => expect(consumer.lastHandledCursor).toBe("3-0"));
+    },
+  );
+
+  it("delivers multiple post-start entries in order after a completely trimmed stream", async () => {
+    const key = uniqueStreamKey();
+    await appendAt(key, "1-0", envelope(1));
+    await appendAt(key, "2-0", envelope(2));
+    await publisher.sendCommand(["XTRIM", key, "MAXLEN", "0"]);
+    let resolveOutcome!: (outcome: "delivered" | "cursor_lost") => void;
+    const outcome = new Promise<"delivered" | "cursor_lost">((resolve) => {
+      resolveOutcome = resolve;
+    });
+    const delivered: DeliveryContext[] = [];
+    const consumer = new RedisDeliveryConsumer(new RedisDeliveryConsumerTransport(redisUrl, key), {
+      deliver: (context) => {
+        delivered.push(context);
+        if (delivered.length === 2) resolveOutcome("delivered");
+        return Promise.resolve();
+      },
+      quarantine: () => Promise.resolve(),
+      lifecycle: (event) => {
+        if (event.state === "cursor_lost") resolveOutcome("cursor_lost");
+      },
+    });
+    consumers.add(consumer);
+    await consumer.start();
+
+    const first = envelope(3);
+    const second = envelope(4);
+    await publisher.sendCommand([
+      "EVAL",
+      "redis.call('XADD', KEYS[1], ARGV[1], unpack(ARGV, 3, 14)); return redis.call('XADD', KEYS[1], ARGV[2], unpack(ARGV, 15, 26))",
+      "1",
+      key,
+      "3-0",
+      "4-0",
+      ...streamFieldArguments(first),
+      ...streamFieldArguments(second),
+    ]);
+
+    expect(await withDeadline(outcome)).toBe("delivered");
+    expect(delivered.map(({ envelope: value }) => value.eventId)).toEqual([
+      first.eventId,
+      second.eventId,
+    ]);
+    await eventually(() => expect(consumer.lastHandledCursor).toBe("4-0"));
+  });
+
+  it.each(["xdel", "xtrim", "recreate"] as const)(
+    "fails closed when an unread post-boundary entry is lost through %s",
+    async (operation) => {
+      const key = uniqueStreamKey();
+      await appendAt(key, "1-0", envelope(1));
+      await appendAt(key, "2-0", envelope(2));
+      await publisher.sendCommand(["XTRIM", key, "MAXLEN", "0"]);
+      const delivered: DeliveryContext[] = [];
+      const loss = cursorLossGate();
+      const consumer = new RedisDeliveryConsumer(
+        new RedisDeliveryConsumerTransport(redisUrl, key),
+        {
+          deliver: (context) => {
+            delivered.push(context);
+            return Promise.resolve();
+          },
+          quarantine: () => Promise.resolve(),
+          lifecycle: loss.lifecycle,
+        },
+      );
+      consumers.add(consumer);
+      await consumer.start();
+
+      if (operation === "xdel") {
+        await publisher.sendCommand([
+          "EVAL",
+          "redis.call('XADD', KEYS[1], ARGV[1], unpack(ARGV, 3, 14)); redis.call('XDEL', KEYS[1], ARGV[1]); return redis.call('XADD', KEYS[1], ARGV[2], unpack(ARGV, 15, 26))",
+          "1",
+          key,
+          "3-0",
+          "4-0",
+          ...streamFieldArguments(envelope(3)),
+          ...streamFieldArguments(envelope(4)),
+        ]);
+      } else if (operation === "xtrim") {
+        await publisher.sendCommand([
+          "EVAL",
+          "redis.call('XADD', KEYS[1], ARGV[1], unpack(ARGV, 3, 14)); redis.call('XADD', KEYS[1], ARGV[2], unpack(ARGV, 15, 26)); redis.call('XTRIM', KEYS[1], 'MINID', ARGV[2]); return ARGV[2]",
+          "1",
+          key,
+          "3-0",
+          "4-0",
+          ...streamFieldArguments(envelope(3)),
+          ...streamFieldArguments(envelope(4)),
+        ]);
+      } else {
+        await publisher.sendCommand([
+          "EVAL",
+          "redis.call('DEL', KEYS[1]); return redis.call('XADD', KEYS[1], ARGV[1], unpack(ARGV, 2, 13))",
+          "1",
+          key,
+          "4-0",
+          ...streamFieldArguments(envelope(4)),
+        ]);
+      }
+
+      const failure = await withDeadline(loss.promise);
+      expect(failure.cursor).toBe("2-0");
+      expect(consumer.lastHandledCursor).toBe("2-0");
+      expect(delivered).toEqual([]);
+    },
+  );
 });

@@ -180,6 +180,14 @@ interface ContinuityWitness {
   metadata: DeliveryStreamMetadata;
   observedStream: boolean;
   minimumEntriesAdded: bigint;
+  emptyBoundary: EmptyStreamBoundary | undefined;
+}
+
+interface EmptyStreamBoundary {
+  lastGeneratedId: string;
+  entriesAdded: bigint;
+  maxDeletedEntryId: string;
+  incarnation: string;
 }
 
 class FatalConsumerError extends Error {
@@ -226,6 +234,16 @@ export function compareRedisStreamIds(left: string, right: string): number {
 function parseCounter(value: string): bigint {
   if (!/^(0|[1-9]\d*)$/.test(value)) throw new Error("Invalid Redis stream counter");
   return BigInt(value);
+}
+
+function captureEmptyBoundary(metadata: DeliveryStreamMetadata): EmptyStreamBoundary | undefined {
+  if (!metadata.exists || metadata.length !== "0") return undefined;
+  return {
+    lastGeneratedId: metadata.lastGeneratedId,
+    entriesAdded: parseCounter(metadata.entriesAdded),
+    maxDeletedEntryId: metadata.maxDeletedEntryId,
+    incarnation: metadata.incarnation,
+  };
 }
 
 function validateMetadata(metadata: DeliveryStreamMetadata): void {
@@ -381,6 +399,7 @@ export class RedisDeliveryConsumer {
         metadata,
         observedStream: metadata.exists,
         minimumEntriesAdded: parseCounter(metadata.entriesAdded),
+        emptyBoundary: captureEmptyBoundary(metadata),
       };
 
       const established = deferred<void>();
@@ -521,6 +540,7 @@ export class RedisDeliveryConsumer {
 
   private async recover(generation: number): Promise<void> {
     await this.notifyLifecycle({ state: "recovering", cursor: this.cursor });
+    let availabilityAnnounced = false;
     while (this.isActiveGeneration(generation)) {
       try {
         await this.transport.connect();
@@ -540,9 +560,10 @@ export class RedisDeliveryConsumer {
         }
         this.assertGeneration(generation);
         const pendingRead = this.issueRead(generation, () =>
-          Promise.resolve(
-            this.notifyLifecycle({ state: "recovered", cursor: this.cursor, recoveryTail }),
-          ),
+          Promise.resolve().then(async () => {
+            availabilityAnnounced = true;
+            await this.notifyLifecycle({ state: "recovered", cursor: this.cursor, recoveryTail });
+          }),
         );
         const entries = await pendingRead;
         const liveMetadata = await this.inspectStrict(generation);
@@ -552,6 +573,17 @@ export class RedisDeliveryConsumer {
       } catch (error) {
         if (this.stopping || error instanceof StaleGenerationError) return;
         if (error instanceof FatalConsumerError || error instanceof CursorLossError) throw error;
+        if (availabilityAnnounced) {
+          availabilityAnnounced = false;
+          await this.notifyLifecycle({
+            state: "unavailable",
+            cursor: this.cursor,
+            code: "REDIS_UNAVAILABLE",
+          });
+          if (!this.isActiveGeneration(generation)) return;
+          await this.notifyLifecycle({ state: "recovering", cursor: this.cursor });
+          if (!this.isActiveGeneration(generation)) return;
+        }
         await this.transport.cancelRead().catch(() => undefined);
         await this.scheduler.wait(this.configuration.reconnectDelayMs, this.abortController.signal);
       }
@@ -583,8 +615,46 @@ export class RedisDeliveryConsumer {
       throw new CursorLossError("STREAM_BEHIND_CURSOR");
     if (compareRedisStreamIds(metadata.maxDeletedEntryId, this.cursor) > 0)
       throw new CursorLossError("TRIMMED_BEYOND_CURSOR");
-    if (parseCounter(metadata.entriesAdded) < witness.minimumEntriesAdded)
-      throw new CursorLossError("STREAM_RECREATED");
+    const entriesAdded = parseCounter(metadata.entriesAdded);
+    if (entriesAdded < witness.minimumEntriesAdded) throw new CursorLossError("STREAM_RECREATED");
+    if (metadata.length === "0") {
+      const boundary = witness.emptyBoundary;
+      if (
+        compareRedisStreamIds(metadata.lastGeneratedId, this.cursor) > 0 ||
+        (boundary === undefined && entriesAdded !== witness.minimumEntriesAdded) ||
+        (boundary !== undefined &&
+          (metadata.lastGeneratedId !== boundary.lastGeneratedId ||
+            entriesAdded !== boundary.entriesAdded ||
+            metadata.maxDeletedEntryId !== boundary.maxDeletedEntryId ||
+            metadata.incarnation !== boundary.incarnation))
+      )
+        throw new CursorLossError("TRIMMED_BEYOND_CURSOR");
+      this.witness = {
+        ...witness,
+        metadata,
+        observedStream: true,
+        emptyBoundary: captureEmptyBoundary(metadata),
+      };
+      return;
+    }
+    if (witness.emptyBoundary !== undefined) {
+      if (this.provesCompleteAppendAfterEmptyBoundary(witness.emptyBoundary, metadata)) {
+        this.witness = {
+          ...witness,
+          metadata,
+          observedStream: true,
+          emptyBoundary: undefined,
+        };
+        return;
+      }
+      if (
+        entriesAdded < witness.emptyBoundary.entriesAdded ||
+        metadata.firstEntryId === null ||
+        compareRedisStreamIds(metadata.firstEntryId, witness.emptyBoundary.lastGeneratedId) <= 0
+      )
+        throw new CursorLossError("STREAM_RECREATED");
+      throw new CursorLossError("TRIMMED_BEYOND_CURSOR");
+    }
     if (
       witness.observedStream &&
       metadata.firstEntryId !== null &&
@@ -596,6 +666,24 @@ export class RedisDeliveryConsumer {
       throw new CursorLossError("STREAM_RECREATED");
     }
     this.witness = { ...witness, metadata, observedStream: true };
+  }
+
+  private provesCompleteAppendAfterEmptyBoundary(
+    boundary: EmptyStreamBoundary,
+    metadata: DeliveryStreamMetadata,
+  ): boolean {
+    if (
+      metadata.incarnation !== boundary.incarnation ||
+      metadata.firstEntryId === null ||
+      metadata.lastEntryId === null ||
+      compareRedisStreamIds(metadata.firstEntryId, boundary.lastGeneratedId) <= 0 ||
+      compareRedisStreamIds(metadata.maxDeletedEntryId, boundary.lastGeneratedId) > 0 ||
+      metadata.lastGeneratedId !== metadata.lastEntryId
+    )
+      return false;
+    const entriesAdded = parseCounter(metadata.entriesAdded);
+    if (entriesAdded <= boundary.entriesAdded) return false;
+    return parseCounter(metadata.length) === entriesAdded - boundary.entriesAdded;
   }
 
   private validateReadContinuity(
