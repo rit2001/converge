@@ -141,9 +141,16 @@ describe("authoritative operation transactions", () => {
   });
 
   it("backfills drained M1 outbox rows with deterministic historical delivery ordering", async () => {
-    const migration = await readFile(
+    const orderingMigration = await readFile(
       new URL(
         "../../packages/database/migrations/0004_durable_board_delivery_ordering.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const constraintMigration = await readFile(
+      new URL(
+        "../../packages/database/migrations/0005_complete_outbox_envelope_constraints.sql",
         import.meta.url,
       ),
       "utf8",
@@ -276,7 +283,8 @@ describe("authoritative operation transactions", () => {
         ],
       );
 
-      await client.query(migration);
+      await client.query(orderingMigration);
+      await client.query(constraintMigration);
 
       const events = await client.query<{
         id: string;
