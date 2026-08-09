@@ -12,6 +12,7 @@
   "devDependencies": {
     "@converge/canvas-engine": "workspace:*",
     "@converge/protocol": "workspace:*",
-    "@playwright/test": "1.55.0"
+    "@playwright/test": "1.55.0",
+    "@types/node": "22.18.0"
   }
 }
