@@ -3,6 +3,7 @@ import {
   boardAccessRevokedEventSchema,
   boardSnapshotSchema,
   createBoardRequestSchema,
+  deliveryEnvelopeSchema,
   durableCommandSchema,
   ephemeralEventTypeSchema,
   httpInternalErrorResponseSchema,
@@ -11,7 +12,6 @@ import {
   operationRangeQuerySchema,
   operationRangeResponseSchema,
   protocolErrorSchema,
-  membershipRevocationOutboxPayloadSchema,
   removeBoardMemberParamsSchema,
   removeBoardMemberRequestSchema,
   removeBoardMemberResponseSchema,
@@ -152,20 +152,94 @@ describe("protocol schemas", () => {
     );
   });
 
-  it("validates the typed membership-revocation outbox payload", () => {
-    const payload = {
-      schemaVersion: SCHEMA_VERSION,
-      eventId: command.opId,
-      kind: "board.membership.revoked",
-      boardId: command.boardId,
-      revokedUserId: command.clientId,
-      initiatedByUserId: command.targetId,
+  it("validates strict current delivery-envelope variants", () => {
+    const operation = {
+      ...command,
+      seq: 1,
       committedAt: "2026-08-07T12:00:01.000Z",
     };
-    expect(membershipRevocationOutboxPayloadSchema.parse(payload)).toEqual(payload);
+    const operationEnvelope = {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.opId,
+      boardId: command.boardId,
+      deliverySeq: 1,
+      eventType: "operation.committed",
+      occurredAt: operation.committedAt,
+      payload: { operation },
+    };
+    expect(deliveryEnvelopeSchema.parse(operationEnvelope)).toEqual(operationEnvelope);
+
+    const revocationEnvelope = {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.clientId,
+      boardId: command.boardId,
+      deliverySeq: 2,
+      eventType: "board.membership.revoked",
+      occurredAt: "2026-08-07T12:00:02.000Z",
+      payload: {
+        revokedUserId: command.clientId,
+        initiatedByUserId: command.targetId,
+      },
+    };
+    expect(deliveryEnvelopeSchema.parse(revocationEnvelope)).toEqual(revocationEnvelope);
     expect(
-      membershipRevocationOutboxPayloadSchema.safeParse({ ...payload, boardContent: {} }).success,
+      deliveryEnvelopeSchema.safeParse({ ...revocationEnvelope, boardContent: {} }).success,
     ).toBe(false);
+    expect(
+      deliveryEnvelopeSchema.safeParse({
+        ...revocationEnvelope,
+        payload: { ...revocationEnvelope.payload, boardContent: {} },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects malformed, mismatched, and reserved delivery envelopes", () => {
+    const operation = {
+      ...command,
+      seq: 1,
+      committedAt: "2026-08-07T12:00:01.000Z",
+    };
+    const envelope = {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.opId,
+      boardId: command.boardId,
+      deliverySeq: 1,
+      eventType: "operation.committed",
+      occurredAt: operation.committedAt,
+      payload: { operation },
+    };
+    expect(deliveryEnvelopeSchema.safeParse({ ...envelope, deliverySeq: 0 }).success).toBe(false);
+    expect(
+      deliveryEnvelopeSchema.safeParse({
+        ...envelope,
+        payload: {
+          operation: {
+            ...operation,
+            boardId: "50000000-0000-4000-8000-000000000001",
+          },
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      deliveryEnvelopeSchema.safeParse({
+        ...envelope,
+        eventType: "version.restored",
+        payload: { sourceVersionId: command.targetId, newCanvasSeq: 2 },
+      }).success,
+    ).toBe(false);
+    expect(deliveryEnvelopeSchema.safeParse({ ...envelope, schemaVersion: 2 }).success).toBe(false);
+  });
+
+  it("prevents callers from supplying server-owned delivery metadata", () => {
+    for (const metadata of [
+      { deliverySeq: 1 },
+      { eventId: "50000000-0000-4000-8000-000000000001" },
+      { committedAt: "2026-08-07T12:00:01.000Z" },
+      { occurredAt: "2026-08-07T12:00:01.000Z" },
+      { eventType: "operation.committed" },
+    ]) {
+      expect(durableCommandSchema.safeParse({ ...command, ...metadata }).success).toBe(false);
+    }
   });
 
   it("validates strict join acknowledgements and synchronization errors", () => {

@@ -9,11 +9,13 @@ import {
   canvasObjectSchema,
   committedOperationSchema,
   durableCommandSchema,
-  membershipRevocationOutboxPayloadSchema,
+  membershipRevokedDeliveryEnvelopeSchema,
+  operationCommittedDeliveryEnvelopeSchema,
   type BoardSnapshot,
   type CommittedOperation,
   type DurableCommand,
-  type MembershipRevocationOutboxPayload,
+  type MembershipRevokedDeliveryEnvelope,
+  type OperationCommittedDeliveryEnvelope,
   type OperationRangeResponse,
 } from "@converge/protocol";
 
@@ -38,6 +40,16 @@ export class RepositoryError extends Error {
 export interface BoardRepositoryHooks {
   beforeSequenceLock?: (command: DurableCommand) => Promise<void>;
   afterSequenceLock?: (command: DurableCommand) => Promise<void>;
+  beforeMembershipSequenceLock?: (context: {
+    boardId: string;
+    actorId: string;
+    targetUserId: string;
+  }) => Promise<void>;
+  afterMembershipSequenceLock?: (context: {
+    boardId: string;
+    actorId: string;
+    targetUserId: string;
+  }) => Promise<void>;
   afterMembershipDelete?: (context: {
     boardId: string;
     actorId: string;
@@ -47,7 +59,13 @@ export interface BoardRepositoryHooks {
 
 export interface RemoveBoardMemberResult {
   removed: boolean;
-  event: MembershipRevocationOutboxPayload | null;
+  event: MembershipRevokedDeliveryEnvelope | null;
+}
+
+export interface CommitOperationResult {
+  duplicate: boolean;
+  operation: CommittedOperation;
+  event: OperationCommittedDeliveryEnvelope;
 }
 
 export function createPool(databaseUrl: string): pg.Pool {
@@ -208,9 +226,16 @@ export class BoardRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      const hookContext = { boardId, actorId, targetUserId };
+      await this.hooks.beforeMembershipSequenceLock?.(hookContext);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
-      const board = await client.query<{ created_by: string; actor_role: string | null }>(
-        `SELECT b.created_by, m.role AS actor_role
+      await this.hooks.afterMembershipSequenceLock?.(hookContext);
+      const board = await client.query<{
+        created_by: string;
+        actor_role: string | null;
+        last_delivery_seq: string;
+      }>(
+        `SELECT b.created_by, b.last_delivery_seq, m.role AS actor_role
          FROM boards b
          LEFT JOIN board_members m ON m.board_id = b.id AND m.user_id = $2
          WHERE b.id = $1
@@ -236,22 +261,31 @@ export class BoardRepository {
         boardId,
         targetUserId,
       ]);
-      await this.hooks.afterMembershipDelete?.({ boardId, actorId, targetUserId });
+      await this.hooks.afterMembershipDelete?.(hookContext);
       const eventId = crypto.randomUUID();
+      const deliverySeq = Number(boardRow.last_delivery_seq) + 1;
       const committedAt = new Date().toISOString();
-      const event = membershipRevocationOutboxPayloadSchema.parse({
+      const event = membershipRevokedDeliveryEnvelopeSchema.parse({
         schemaVersion: 1,
         eventId,
-        kind: "board.membership.revoked",
         boardId,
-        revokedUserId: targetUserId,
-        initiatedByUserId: actorId,
-        committedAt,
+        deliverySeq,
+        eventType: "board.membership.revoked",
+        occurredAt: committedAt,
+        payload: {
+          revokedUserId: targetUserId,
+          initiatedByUserId: actorId,
+        },
       });
       await client.query(
-        `INSERT INTO outbox_events(id, board_id, board_seq, event_type, payload, created_at)
-         VALUES ($1, $2, NULL, 'board.membership.revoked', $3, $4)`,
-        [eventId, boardId, event, committedAt],
+        "UPDATE boards SET last_delivery_seq = $2, updated_at = now() WHERE id = $1",
+        [boardId, deliverySeq],
+      );
+      await client.query(
+        `INSERT INTO outbox_events(
+           id, board_id, delivery_seq, canvas_seq, event_type, schema_version, payload, created_at
+         ) VALUES ($1, $2, $3, NULL, 'board.membership.revoked', 1, $4, $5)`,
+        [eventId, boardId, deliverySeq, event, committedAt],
       );
       await client.query("COMMIT");
       return { removed: true, event };
@@ -263,10 +297,7 @@ export class BoardRepository {
     }
   }
 
-  async commitOperation(
-    userId: string,
-    input: DurableCommand,
-  ): Promise<{ duplicate: boolean; operation: CommittedOperation }> {
+  async commitOperation(userId: string, input: DurableCommand): Promise<CommitOperationResult> {
     const command = durableCommandSchema.parse(input);
     const client = await this.pool.connect();
     try {
@@ -282,20 +313,24 @@ export class BoardRepository {
       );
       if (!role.rowCount || role.rows[0]?.role === "viewer")
         throw new RepositoryError("FORBIDDEN", "Board edit permission required");
-      const board = await client.query<{ last_seq: string }>(
-        "SELECT last_seq FROM boards WHERE id = $1 FOR UPDATE",
+      const board = await client.query<{ last_seq: string; last_delivery_seq: string }>(
+        "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1 FOR UPDATE",
         [command.boardId],
       );
       if (!board.rowCount) throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");
       const authoritativeLastSeq = Number(board.rows[0]?.last_seq ?? 0);
+      const authoritativeLastDeliverySeq = Number(board.rows[0]?.last_delivery_seq ?? 0);
       const duplicate = await client.query<{
         command: unknown;
         seq: string;
         committed_at: Date;
         user_id: string;
+        event_id: string;
+        delivery_seq: string;
         same_command: boolean;
       }>(
-        `SELECT command, seq, committed_at, user_id, command = $3::jsonb AS same_command
+        `SELECT command, seq, committed_at, user_id, event_id, delivery_seq,
+                command = $3::jsonb AS same_command
          FROM board_operations WHERE board_id = $1 AND op_id = $2`,
         [command.boardId, command.opId, command],
       );
@@ -306,14 +341,25 @@ export class BoardRepository {
             "IDEMPOTENCY_CONFLICT",
             "Operation id was already used for a different command",
           );
+        const operation = committedOperationSchema.parse({
+          ...durableCommandSchema.parse(prior.command),
+          seq: Number(prior.seq),
+          committedAt: prior.committed_at.toISOString(),
+        });
+        const event = operationCommittedDeliveryEnvelopeSchema.parse({
+          schemaVersion: 1,
+          eventId: prior.event_id,
+          boardId: command.boardId,
+          deliverySeq: Number(prior.delivery_seq),
+          eventType: "operation.committed",
+          occurredAt: operation.committedAt,
+          payload: { operation },
+        });
         await client.query("COMMIT");
         return {
           duplicate: true,
-          operation: committedOperationSchema.parse({
-            ...durableCommandSchema.parse(prior.command),
-            seq: Number(prior.seq),
-            committedAt: prior.committed_at.toISOString(),
-          }),
+          operation,
+          event,
         };
       }
       if (command.baseSeq > authoritativeLastSeq)
@@ -350,6 +396,7 @@ export class BoardRepository {
         if (projected.deletedSeq === null) state.order.push(row.object_id);
       }
       const seq = state.lastSeq + 1;
+      const deliverySeq = authoritativeLastDeliverySeq + 1;
       const reduced = reduceCommand(state, command, seq);
       if (!reduced.ok) throw new RepositoryError(reduced.code, reduced.message);
       const projected = reduced.state.objects[command.targetId];
@@ -357,15 +404,29 @@ export class BoardRepository {
       const stackOrder = stackOrderByObjectId.get(command.targetId) ?? seq;
       const committedAt = new Date().toISOString();
       const operation = committedOperationSchema.parse({ ...command, seq, committedAt });
+      const eventId = crypto.randomUUID();
+      const event = operationCommittedDeliveryEnvelopeSchema.parse({
+        schemaVersion: 1,
+        eventId,
+        boardId: command.boardId,
+        deliverySeq,
+        eventType: "operation.committed",
+        occurredAt: committedAt,
+        payload: { operation },
+      });
       await client.query(
-        `INSERT INTO board_operations(board_id, seq, op_id, client_id, user_id, base_seq, type, target_id, command, committed_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        `INSERT INTO board_operations(
+           board_id, seq, op_id, client_id, user_id, event_id, delivery_seq, base_seq, type,
+           target_id, command, committed_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [
           command.boardId,
           seq,
           command.opId,
           command.clientId,
           userId,
+          eventId,
+          deliverySeq,
           command.baseSeq,
           command.type,
           command.targetId,
@@ -390,16 +451,20 @@ export class BoardRepository {
           projected.deletedSeq,
         ],
       );
-      await client.query("UPDATE boards SET last_seq = $2, updated_at = now() WHERE id = $1", [
-        command.boardId,
-        seq,
-      ]);
       await client.query(
-        "INSERT INTO outbox_events(id, board_id, board_seq, event_type, payload) VALUES ($1,$2,$3,'operation.committed',$4)",
-        [crypto.randomUUID(), command.boardId, seq, operation],
+        `UPDATE boards
+         SET last_seq = $2, last_delivery_seq = $3, updated_at = now()
+         WHERE id = $1`,
+        [command.boardId, seq, deliverySeq],
+      );
+      await client.query(
+        `INSERT INTO outbox_events(
+           id, board_id, delivery_seq, canvas_seq, event_type, schema_version, payload
+         ) VALUES ($1,$2,$3,$4,'operation.committed',1,$5)`,
+        [eventId, command.boardId, deliverySeq, seq, event],
       );
       await client.query("COMMIT");
-      return { duplicate: false, operation };
+      return { duplicate: false, operation, event };
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;

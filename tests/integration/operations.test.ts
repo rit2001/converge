@@ -8,7 +8,13 @@ import {
 } from "@converge/canvas-engine";
 import { BoardRepository, createPool } from "@converge/database";
 import { createRectangleCommand, fixtureIds } from "@converge/testkit";
-import { boardSnapshotSchema, type BoardSnapshot, type DurableCommand } from "@converge/protocol";
+import {
+  boardSnapshotSchema,
+  deliveryEnvelopeSchema,
+  operationCommittedDeliveryEnvelopeSchema,
+  type BoardSnapshot,
+  type DurableCommand,
+} from "@converge/protocol";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
@@ -22,11 +28,13 @@ async function board(): Promise<string> {
 async function durableState(boardId: string) {
   const result = await pool.query<{
     last_seq: string;
+    last_delivery_seq: string;
     operation_count: string;
     projection: unknown;
+    membership_count: string;
     outbox_count: string;
   }>(
-    `SELECT b.last_seq,
+    `SELECT b.last_seq, b.last_delivery_seq,
             (SELECT count(*) FROM board_operations WHERE board_id = b.id) operation_count,
             COALESCE(
               (SELECT jsonb_agg(
@@ -42,6 +50,7 @@ async function durableState(boardId: string) {
                ) FROM board_objects o WHERE o.board_id = b.id),
               '[]'::jsonb
             ) projection,
+            (SELECT count(*) FROM board_members WHERE board_id = b.id) membership_count,
             (SELECT count(*) FROM outbox_events WHERE board_id = b.id) outbox_count
      FROM boards b WHERE b.id = $1`,
     [boardId],
@@ -81,6 +90,15 @@ afterAll(async () => {
 });
 
 describe("authoritative operation transactions", () => {
+  it("starts a new board with zero canvas and delivery heads", async () => {
+    const boardId = await board();
+    const heads = await pool.query<{ last_seq: string; last_delivery_seq: string }>(
+      "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
+      [boardId],
+    );
+    expect(heads.rows[0]).toEqual({ last_seq: "0", last_delivery_seq: "0" });
+  });
+
   it("backfills stack order from created sequence for existing projections", async () => {
     const migration = await readFile(
       new URL(
@@ -115,6 +133,193 @@ describe("authoritative operation transactions", () => {
       expect(rows.rows).toEqual([
         { created_seq: "3", stack_order: "3" },
         { created_seq: "7", stack_order: "7" },
+      ]);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
+  });
+
+  it("backfills drained M1 outbox rows with deterministic historical delivery ordering", async () => {
+    const migration = await readFile(
+      new URL(
+        "../../packages/database/migrations/0004_durable_board_delivery_ordering.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL search_path TO pg_temp");
+      await client.query(`
+        CREATE TEMP TABLE boards (
+          id uuid PRIMARY KEY,
+          name text NOT NULL,
+          created_by uuid NOT NULL,
+          last_seq bigint NOT NULL DEFAULT 0,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now()
+        );
+        CREATE TEMP TABLE board_operations (
+          board_id uuid NOT NULL,
+          seq bigint NOT NULL,
+          op_id uuid NOT NULL,
+          client_id uuid NOT NULL,
+          user_id uuid NOT NULL,
+          base_seq bigint NOT NULL,
+          type text NOT NULL,
+          target_id uuid NOT NULL,
+          command jsonb NOT NULL,
+          committed_at timestamptz NOT NULL,
+          PRIMARY KEY (board_id, seq),
+          UNIQUE (board_id, op_id)
+        );
+        CREATE TEMP TABLE outbox_events (
+          id uuid PRIMARY KEY,
+          board_id uuid NOT NULL,
+          board_seq bigint,
+          event_type text NOT NULL,
+          payload jsonb NOT NULL,
+          attempts integer NOT NULL DEFAULT 0,
+          created_at timestamptz NOT NULL,
+          published_at timestamptz
+        );
+        CREATE UNIQUE INDEX outbox_operation_board_seq_uq
+          ON outbox_events(board_id, board_seq)
+          WHERE event_type = 'operation.committed';
+      `);
+
+      const boardA = "a0000000-0000-4000-8000-000000000001";
+      const boardB = "b0000000-0000-4000-8000-000000000001";
+      const operationA1 = {
+        ...createRectangleCommand(boardA),
+        seq: 1,
+        committedAt: "2026-08-07T12:00:02.000Z",
+      };
+      const operationA2 = {
+        ...createRectangleCommand(boardA),
+        baseSeq: 1,
+        seq: 2,
+        committedAt: "2026-08-07T12:00:03.000Z",
+      };
+      const operationB1 = {
+        ...createRectangleCommand(boardB),
+        seq: 1,
+        committedAt: "2026-08-07T12:00:04.000Z",
+      };
+      await client.query(
+        `INSERT INTO boards(id, name, created_by, last_seq)
+         VALUES ($1, 'Legacy A', $3, 2), ($2, 'Legacy B', $3, 1)`,
+        [boardA, boardB, fixtureIds.user],
+      );
+      for (const operation of [operationA1, operationA2, operationB1]) {
+        await client.query(
+          `INSERT INTO board_operations(
+             board_id, seq, op_id, client_id, user_id, base_seq, type, target_id, command,
+             committed_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [
+            operation.boardId,
+            operation.seq,
+            operation.opId,
+            operation.clientId,
+            fixtureIds.user,
+            operation.baseSeq,
+            operation.type,
+            operation.targetId,
+            {
+              schemaVersion: operation.schemaVersion,
+              opId: operation.opId,
+              boardId: operation.boardId,
+              clientId: operation.clientId,
+              baseSeq: operation.baseSeq,
+              type: operation.type,
+              targetId: operation.targetId,
+              payload: operation.payload,
+              clientTimestamp: operation.clientTimestamp,
+            },
+            operation.committedAt,
+          ],
+        );
+      }
+      const operationEventIds = [
+        "a1000000-0000-4000-8000-000000000001",
+        "a1000000-0000-4000-8000-000000000002",
+        "b1000000-0000-4000-8000-000000000001",
+      ];
+      await client.query(
+        `INSERT INTO outbox_events(
+           id, board_id, board_seq, event_type, payload, created_at
+         ) VALUES
+           ($1, $4, 1, 'operation.committed', $7, '2026-08-07T12:00:02Z'),
+           ($2, $4, 2, 'operation.committed', $8, '2026-08-07T12:00:03Z'),
+           ($3, $5, 1, 'operation.committed', $9, '2026-08-07T12:00:04Z'),
+           ($6, $4, NULL, 'board.membership.revoked', $10, '2026-08-07T12:00:01Z')`,
+        [
+          ...operationEventIds,
+          boardA,
+          boardB,
+          "a2000000-0000-4000-8000-000000000001",
+          operationA1,
+          operationA2,
+          operationB1,
+          {
+            schemaVersion: 1,
+            eventId: "a2000000-0000-4000-8000-000000000001",
+            kind: "board.membership.revoked",
+            boardId: boardA,
+            revokedUserId: "a3000000-0000-4000-8000-000000000001",
+            initiatedByUserId: fixtureIds.user,
+            committedAt: "2026-08-07T12:00:01.000Z",
+          },
+        ],
+      );
+
+      await client.query(migration);
+
+      const events = await client.query<{
+        id: string;
+        board_id: string;
+        delivery_seq: string;
+        canvas_seq: string | null;
+        published_at: Date | null;
+        payload: unknown;
+      }>(
+        `SELECT id, board_id, delivery_seq, canvas_seq, published_at, payload
+         FROM outbox_events ORDER BY board_id, delivery_seq`,
+      );
+      expect(
+        events.rows.map(({ board_id, delivery_seq, canvas_seq, published_at }) => ({
+          board_id,
+          delivery_seq,
+          canvas_seq,
+          published: published_at !== null,
+        })),
+      ).toEqual([
+        { board_id: boardA, delivery_seq: "1", canvas_seq: "1", published: true },
+        { board_id: boardA, delivery_seq: "2", canvas_seq: "2", published: true },
+        { board_id: boardA, delivery_seq: "3", canvas_seq: null, published: true },
+        { board_id: boardB, delivery_seq: "1", canvas_seq: "1", published: true },
+      ]);
+      for (const event of events.rows)
+        expect(deliveryEnvelopeSchema.parse(event.payload)).toBeDefined();
+
+      const heads = await client.query<{ id: string; last_delivery_seq: string }>(
+        "SELECT id, last_delivery_seq FROM boards ORDER BY id",
+      );
+      expect(heads.rows).toEqual([
+        { id: boardA, last_delivery_seq: "3" },
+        { id: boardB, last_delivery_seq: "1" },
+      ]);
+      const mappings = await client.query<{
+        event_id: string;
+        delivery_seq: string;
+      }>("SELECT event_id, delivery_seq FROM board_operations ORDER BY board_id, seq");
+      expect(mappings.rows).toEqual([
+        { event_id: operationEventIds[0], delivery_seq: "1" },
+        { event_id: operationEventIds[1], delivery_seq: "2" },
+        { event_id: operationEventIds[2], delivery_seq: "1" },
       ]);
     } finally {
       await client.query("ROLLBACK");
@@ -224,7 +429,7 @@ describe("authoritative operation transactions", () => {
     ]);
   });
 
-  it("assigns monotonic board-local sequences", async () => {
+  it("advances both heads and atomically persists one typed operation event", async () => {
     const boardId = await board();
     const first = await repository.commitOperation(
       fixtureIds.user,
@@ -235,6 +440,92 @@ describe("authoritative operation transactions", () => {
       createRectangleCommand(boardId),
     );
     expect([first.operation.seq, second.operation.seq]).toEqual([1, 2]);
+    expect([first.event.deliverySeq, second.event.deliverySeq]).toEqual([1, 2]);
+    expect(first.event).toMatchObject({
+      eventType: "operation.committed",
+      boardId,
+      deliverySeq: 1,
+      payload: { operation: first.operation },
+    });
+    const persisted = await pool.query<{
+      last_seq: string;
+      last_delivery_seq: string;
+      operation_event_id: string;
+      operation_delivery_seq: string;
+      outbox_event_id: string;
+      outbox_delivery_seq: string;
+      canvas_seq: string;
+      schema_version: number;
+      payload: unknown;
+    }>(
+      `SELECT b.last_seq, b.last_delivery_seq,
+              operation.event_id operation_event_id,
+              operation.delivery_seq operation_delivery_seq,
+              event.id outbox_event_id,
+              event.delivery_seq outbox_delivery_seq,
+              event.canvas_seq,
+              event.schema_version,
+              event.payload
+       FROM boards b
+       JOIN board_operations operation ON operation.board_id = b.id AND operation.seq = 1
+       JOIN outbox_events event ON event.id = operation.event_id
+       WHERE b.id = $1`,
+      [boardId],
+    );
+    expect(persisted.rows[0]).toMatchObject({
+      last_seq: "2",
+      last_delivery_seq: "2",
+      operation_event_id: first.event.eventId,
+      operation_delivery_seq: "1",
+      outbox_event_id: first.event.eventId,
+      outbox_delivery_seq: "1",
+      canvas_seq: "1",
+      schema_version: 1,
+    });
+    expect(operationCommittedDeliveryEnvelopeSchema.parse(persisted.rows[0]?.payload)).toEqual(
+      first.event,
+    );
+  });
+
+  it("keeps delivery sequences independent across boards", async () => {
+    const boardA = await board();
+    const boardB = await board();
+    const [eventA, eventB] = await Promise.all([
+      repository.commitOperation(fixtureIds.user, createRectangleCommand(boardA)),
+      repository.commitOperation(fixtureIds.user, createRectangleCommand(boardB)),
+    ]);
+    expect(eventA.event.deliverySeq).toBe(1);
+    expect(eventB.event.deliverySeq).toBe(1);
+    const heads = await pool.query<{ id: string; last_delivery_seq: string }>(
+      "SELECT id, last_delivery_seq FROM boards WHERE id = ANY($1::uuid[]) ORDER BY id",
+      [[boardA, boardB]],
+    );
+    expect(heads.rows.map((row) => row.last_delivery_seq)).toEqual(["1", "1"]);
+  });
+
+  it("rejects a duplicate authoritative board delivery sequence", async () => {
+    const boardId = await board();
+    const committed = await repository.commitOperation(
+      fixtureIds.user,
+      createRectangleCommand(boardId),
+    );
+    const duplicateId = crypto.randomUUID();
+    const duplicate = {
+      ...committed.event,
+      eventId: duplicateId,
+      eventType: "board.membership.revoked" as const,
+      payload: { revokedUserId: fixtureIds.user, initiatedByUserId: fixtureIds.user },
+    };
+    const before = await durableState(boardId);
+    await expect(
+      pool.query(
+        `INSERT INTO outbox_events(
+           id, board_id, delivery_seq, canvas_seq, event_type, schema_version, payload
+         ) VALUES ($1, $2, $3, NULL, 'board.membership.revoked', 1, $4)`,
+        [duplicateId, boardId, committed.event.deliverySeq, duplicate],
+      ),
+    ).rejects.toMatchObject({ code: "23505" });
+    expect(await durableState(boardId)).toEqual(before);
   });
 
   it("returns the original acknowledgement for duplicate opId without duplicating state", async () => {
@@ -246,6 +537,7 @@ describe("authoritative operation transactions", () => {
     expect(duplicate).toMatchObject({
       duplicate: true,
       operation: { seq: first.operation.seq, opId: command.opId },
+      event: { eventId: first.event.eventId, deliverySeq: first.event.deliverySeq },
     });
     expect(await durableState(boardId)).toEqual(afterFirst);
   });
@@ -256,6 +548,21 @@ describe("authoritative operation transactions", () => {
     const command = { ...createRectangleCommand(boardId), baseSeq: 9_000 };
     await expect(repository.commitOperation(fixtureIds.user, command)).rejects.toMatchObject({
       code: "RESYNC_REQUIRED",
+    });
+    expect(await durableState(boardId)).toEqual(before);
+  });
+
+  it("rejects caller-supplied delivery metadata before changing durable state", async () => {
+    const boardId = await board();
+    const before = await durableState(boardId);
+    const command = {
+      ...createRectangleCommand(boardId),
+      deliverySeq: 99,
+      eventId: crypto.randomUUID(),
+      committedAt: new Date().toISOString(),
+    } as unknown as DurableCommand;
+    await expect(repository.commitOperation(fixtureIds.user, command)).rejects.toMatchObject({
+      name: "ZodError",
     });
     expect(await durableState(boardId)).toEqual(before);
   });
@@ -384,11 +691,11 @@ describe("authoritative operation transactions", () => {
     );
     const command = createRectangleCommand(boardId);
     await repository.commitOperation(editor, command);
-    const beforeRemovalRetry = await durableState(boardId);
     await pool.query("DELETE FROM board_members WHERE board_id = $1 AND user_id = $2", [
       boardId,
       editor,
     ]);
+    const beforeRemovalRetry = await durableState(boardId);
 
     await expect(repository.commitOperation(editor, command)).rejects.toMatchObject({
       code: "FORBIDDEN",

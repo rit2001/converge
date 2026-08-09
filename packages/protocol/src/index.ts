@@ -219,17 +219,70 @@ export const boardAccessRevokedEventSchema = z
   })
   .strict();
 
-export const membershipRevocationOutboxPayloadSchema = z
+export const deliveryEventTypeSchema = z.enum(["operation.committed", "board.membership.revoked"]);
+
+// Reserved by ADR 004, but deliberately not accepted by deliveryEnvelopeSchema until restore exists.
+export const reservedDeliveryEventTypeSchema = z.literal("version.restored");
+
+const deliveryEnvelopeMetadata = {
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  eventId: idSchema,
+  boardId: idSchema,
+  deliverySeq: sequenceSchema.positive(),
+  occurredAt: z.string().datetime({ offset: true }),
+};
+
+const operationCommittedDeliveryEnvelopeObjectSchema = z
   .object({
-    schemaVersion: z.literal(SCHEMA_VERSION),
-    eventId: idSchema,
-    kind: z.literal("board.membership.revoked"),
-    boardId: idSchema,
-    revokedUserId: idSchema,
-    initiatedByUserId: idSchema,
-    committedAt: z.string().datetime({ offset: true }),
+    ...deliveryEnvelopeMetadata,
+    eventType: z.literal("operation.committed"),
+    payload: z.object({ operation: committedOperationSchema }).strict(),
   })
   .strict();
+
+const membershipRevokedDeliveryEnvelopeObjectSchema = z
+  .object({
+    ...deliveryEnvelopeMetadata,
+    eventType: z.literal("board.membership.revoked"),
+    payload: z
+      .object({
+        revokedUserId: idSchema,
+        initiatedByUserId: idSchema,
+      })
+      .strict(),
+  })
+  .strict();
+
+function validateDeliveryEnvelopeIdentity(
+  envelope:
+    | z.infer<typeof operationCommittedDeliveryEnvelopeObjectSchema>
+    | z.infer<typeof membershipRevokedDeliveryEnvelopeObjectSchema>,
+  context: z.RefinementCtx,
+): void {
+  if (
+    envelope.eventType === "operation.committed" &&
+    envelope.payload.operation.boardId !== envelope.boardId
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["payload", "operation", "boardId"],
+      message: "Operation board must match delivery envelope board",
+    });
+  }
+}
+
+export const operationCommittedDeliveryEnvelopeSchema =
+  operationCommittedDeliveryEnvelopeObjectSchema.superRefine(validateDeliveryEnvelopeIdentity);
+
+export const membershipRevokedDeliveryEnvelopeSchema =
+  membershipRevokedDeliveryEnvelopeObjectSchema.superRefine(validateDeliveryEnvelopeIdentity);
+
+export const deliveryEnvelopeSchema = z
+  .discriminatedUnion("eventType", [
+    operationCommittedDeliveryEnvelopeObjectSchema,
+    membershipRevokedDeliveryEnvelopeObjectSchema,
+  ])
+  .superRefine(validateDeliveryEnvelopeIdentity);
 export const joinBoardRequestSchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION),
@@ -313,9 +366,14 @@ export type OperationRangeResponse = z.infer<typeof operationRangeResponseSchema
 export type RemoveBoardMemberParams = z.infer<typeof removeBoardMemberParamsSchema>;
 export type RemoveBoardMemberResponse = z.infer<typeof removeBoardMemberResponseSchema>;
 export type BoardAccessRevokedEvent = z.infer<typeof boardAccessRevokedEventSchema>;
-export type MembershipRevocationOutboxPayload = z.infer<
-  typeof membershipRevocationOutboxPayloadSchema
+export type DeliveryEventType = z.infer<typeof deliveryEventTypeSchema>;
+export type OperationCommittedDeliveryEnvelope = z.infer<
+  typeof operationCommittedDeliveryEnvelopeSchema
 >;
+export type MembershipRevokedDeliveryEnvelope = z.infer<
+  typeof membershipRevokedDeliveryEnvelopeSchema
+>;
+export type DeliveryEnvelope = z.infer<typeof deliveryEnvelopeSchema>;
 
 export interface ClientToServerEvents {
   "board:join": (request: JoinBoardRequest, acknowledge: (ack: JoinBoardAck) => void) => void;

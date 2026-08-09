@@ -1,5 +1,6 @@
 import {
   bigint,
+  check,
   index,
   integer,
   jsonb,
@@ -12,14 +13,25 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
-export const boards = pgTable("boards", {
-  id: uuid("id").primaryKey(),
-  name: text("name").notNull(),
-  createdBy: uuid("created_by").notNull(),
-  lastSeq: bigint("last_seq", { mode: "number" }).notNull().default(0),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const boards = pgTable(
+  "boards",
+  {
+    id: uuid("id").primaryKey(),
+    name: text("name").notNull(),
+    createdBy: uuid("created_by").notNull(),
+    lastSeq: bigint("last_seq", { mode: "number" }).notNull().default(0),
+    lastDeliverySeq: bigint("last_delivery_seq", { mode: "number" }).notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("boards_last_delivery_seq_check", sql`${table.lastDeliverySeq} >= 0`),
+    check(
+      "boards_delivery_head_covers_canvas_check",
+      sql`${table.lastDeliverySeq} >= ${table.lastSeq}`,
+    ),
+  ],
+);
 
 export const boardMembers = pgTable(
   "board_members",
@@ -66,6 +78,8 @@ export const boardOperations = pgTable(
     opId: uuid("op_id").notNull(),
     clientId: uuid("client_id").notNull(),
     userId: uuid("user_id").notNull(),
+    eventId: uuid("event_id").notNull(),
+    deliverySeq: bigint("delivery_seq", { mode: "number" }).notNull(),
     baseSeq: bigint("base_seq", { mode: "number" }).notNull(),
     type: text("type").notNull(),
     targetId: uuid("target_id").notNull(),
@@ -75,6 +89,8 @@ export const boardOperations = pgTable(
   (table) => [
     primaryKey({ columns: [table.boardId, table.seq] }),
     uniqueIndex("board_operations_board_op_id_uq").on(table.boardId, table.opId),
+    uniqueIndex("board_operations_event_id_uq").on(table.eventId),
+    uniqueIndex("board_operations_board_delivery_seq_uq").on(table.boardId, table.deliverySeq),
   ],
 );
 
@@ -82,18 +98,30 @@ export const outboxEvents = pgTable(
   "outbox_events",
   {
     id: uuid("id").primaryKey(),
-    boardId: uuid("board_id").notNull(),
-    boardSeq: bigint("board_seq", { mode: "number" }),
+    boardId: uuid("board_id")
+      .notNull()
+      .references(() => boards.id, { onDelete: "cascade" }),
+    deliverySeq: bigint("delivery_seq", { mode: "number" }).notNull(),
+    canvasSeq: bigint("canvas_seq", { mode: "number" }),
     eventType: text("event_type").notNull(),
+    schemaVersion: integer("schema_version").notNull(),
     payload: jsonb("payload").notNull(),
     attempts: integer("attempts").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     publishedAt: timestamp("published_at", { withTimezone: true }),
   },
   (table) => [
-    uniqueIndex("outbox_operation_board_seq_uq")
-      .on(table.boardId, table.boardSeq)
+    uniqueIndex("outbox_board_delivery_seq_uq").on(table.boardId, table.deliverySeq),
+    uniqueIndex("outbox_operation_canvas_seq_uq")
+      .on(table.boardId, table.canvasSeq)
       .where(sql`${table.eventType} = 'operation.committed'`),
+    check("outbox_delivery_seq_check", sql`${table.deliverySeq} > 0`),
+    check("outbox_schema_version_check", sql`${table.schemaVersion} = 1`),
+    check(
+      "outbox_event_canvas_seq_check",
+      sql`(${table.eventType} = 'operation.committed' AND ${table.canvasSeq} IS NOT NULL AND ${table.canvasSeq} > 0)
+          OR (${table.eventType} = 'board.membership.revoked' AND ${table.canvasSeq} IS NULL)`,
+    ),
     index("outbox_unpublished_idx").on(table.publishedAt, table.createdAt),
   ],
 );

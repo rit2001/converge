@@ -106,11 +106,12 @@ function nextCommitted(socket: TestSocket): Promise<CommittedOperation> {
 async function durableState(boardId: string) {
   const result = await pool.query<{
     last_seq: string;
+    last_delivery_seq: string;
     operation_count: string;
     projection: unknown;
     outbox_count: string;
   }>(
-    `SELECT b.last_seq,
+    `SELECT b.last_seq, b.last_delivery_seq,
             (SELECT count(*) FROM board_operations WHERE board_id = b.id) operation_count,
             COALESCE(
               (SELECT jsonb_agg(to_jsonb(o) - 'board_id' ORDER BY o.object_id)
@@ -242,6 +243,7 @@ describe("Socket.IO mutation-submission integrity", () => {
     });
     expect(await durableState(boardId)).toMatchObject({
       last_seq: "1",
+      last_delivery_seq: "1",
       operation_count: "1",
       outbox_count: "1",
     });
@@ -309,6 +311,7 @@ describe("Socket.IO mutation-submission integrity", () => {
     const afterUnknownOutcome = await durableState(boardId);
     expect(afterUnknownOutcome).toMatchObject({
       last_seq: "1",
+      last_delivery_seq: "1",
       operation_count: "1",
       outbox_count: "1",
     });
