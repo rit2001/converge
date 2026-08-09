@@ -171,7 +171,9 @@ race; deterministic stream-ID batch order; temporary disconnect with retained la
 batch validation/handling failure without cursor advancement; cursor trimming/recreation overrun;
 restart with no inherited socket/cursor state; duplicate stable event IDs under different Redis stream
 IDs; bounded global/per-board queue and dedupe overflow; out-of-order/corrupt envelopes; local-only
-`io.local` emission; and multi-instance operation convergence. Assert no consumer-group commands,
+`io.local` emission; deterministic committed-state LRU under a global retained-board cap; terminal
+capacity exhaustion when only quarantined/non-evictable states remain; and multi-instance operation
+convergence. Assert no consumer-group commands,
 Socket.IO Redis adapter, or adapter internal formats.
 
 **Commands to run:**

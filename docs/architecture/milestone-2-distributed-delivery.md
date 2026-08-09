@@ -243,6 +243,7 @@ invariants.
 | Redis `XREAD` block            | 5 seconds                                                        | Periodically returns control for shutdown/readiness without busy polling.      | `REDIS_XREAD_BLOCK_MS`                                                                            | Empty-read/reconnect rate and F09                      | No; provisional bound.           |
 | Stream retention               | Approximate 100,000 entries and 24-hour `MINID` age cap          | Bounds Redis while explicit overrun recovery preserves correctness.            | `REDIS_STREAM_MAXLEN`, `REDIS_STREAM_MAX_AGE_MS`                                                  | Stream length/age, overrun count, F14                  | No; not a retention SLO.         |
 | API global event queue         | 1,000 entries or 16 MiB                                          | Bounds process memory during bursts.                                           | `REDIS_API_QUEUE_MAX_EVENTS`, `REDIS_API_QUEUE_MAX_BYTES`                                         | Queue high-water marks and overflow test               | No; provisional bound.           |
+| API retained board states      | 1,000 boards                                                     | Globally bounds the number of per-board dedupe/quarantine allocations.         | Consumer `maximumBoardStates` (`REDIS_DELIVERY_MAX_BOARD_STATES` when environment wiring lands)   | LRU/capacity/high-cardinality unit tests               | No; provisional bound.           |
 | Per-board quarantine buffer    | 100 entries or 2 MiB                                             | Isolates a board gap without unbounded reordering memory.                      | `DELIVERY_BOARD_BUFFER_MAX_EVENTS`, `DELIVERY_BOARD_BUFFER_MAX_BYTES`                             | Board-buffer high-water marks and F25                  | No; provisional bound.           |
 | Per-board dedupe window        | 256 event ID/sequence pairs                                      | Handles ordinary retry duplicates with bounded board memory.                   | `DELIVERY_DEDUPE_WINDOW_EVENTS`                                                                   | Duplicate distance and F03/F10                         | No; provisional bound.           |
 | Fail-closed socket lifecycle   | 2 seconds maximum                                                | Readiness drops first; forced closure bounds stale socket lifetime.            | `SOCKET_FAIL_CLOSED_TIMEOUT_MS`                                                                   | Disconnect duration and F09/F23                        | No; provisional safety deadline. |
@@ -332,6 +333,29 @@ is idempotently suppressed; a conflicting ID inside the window is corruption. Ou
 the API validates against retained PostgreSQL outbox data when available and otherwise suppresses the
 old effect because its monotonic board cursor proves that sequence was already handled during that
 process lifetime. Redis stream ID remains only the global transport position.
+
+Each consumer also retains at most 1,000 `BoardState` objects by default; runtime configuration must
+be a positive safe integer no greater than 100,000. Because the dedupe and quarantine event/byte
+buffers inside every state are independently bounded, the board-count cap establishes a finite
+structural and retained-payload bound without another global byte budget. Diagnostics expose only
+current count, configured limit, eviction count, and capacity-failure count.
+
+When space is required, deterministic monotonic touch ordinals select the least-recently committed
+healthy state. A state is eligible only in the active generation, after its delivery/quarantine
+callback and Redis cursor commit both completed, with no pending commit, quarantine, gap, conflict, or
+buffered quarantine operation. Wall-clock age is irrelevant. The validated global Redis cursor proves
+that every intervening stream entry was inspected; PostgreSQL/outbox ordering remains authoritative;
+and any trim, deletion, recreation, or uncertain continuity already fails the whole consumer closed.
+Consequently a later event for an evicted healthy board may establish a new local baseline. Eviction
+does not promise permanent duplicate suppression: delivery remains at least once and downstream
+stable-event-ID deduplication is required.
+
+Quarantined and otherwise non-evictable states are never discarded to make room. If the cap is full
+and no eligible state exists, the consumer allocates nothing, emits one unavailable transition and a
+bounded `BOARD_STATE_CAPACITY_EXCEEDED` diagnostic, preserves its last committed cursor and retained
+states, and terminates that generation without automatic recovery. Unrelated entries cannot pass once
+this consumer-level safety bound is exhausted. Active-room-based ownership may replace or refine this
+provisional retention policy during M2.4B wiring; it is not part of M2.4A.
 
 ### Plain `XREAD` startup and cursor algorithm
 
@@ -579,7 +603,8 @@ browser commands retain original identities and are replayed through the existin
 PostgreSQL and Redis are stateful. Web deployments are stateless except browser-local IndexedDB.
 Workers are stateless outside leased/fenced rows. API replicas are horizontally replaceable but hold
 ephemeral sockets, rooms, one global Redis cursor, per-board delivery cursors, bounded quarantine, and
-dedupe windows for one process lifetime.
+dedupe windows for one process lifetime. Per-board delivery state is globally count-bounded and uses
+safe committed-state LRU eviction as described above; shutdown releases every retained state.
 
 The API replica is the connection-scaling unit; the worker replica is the outbox-throughput unit. More
 workers increase concurrency across boards, not within one board. More API replicas multiply stream

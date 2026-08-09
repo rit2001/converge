@@ -8,6 +8,7 @@ import {
 
 export const REDIS_DELIVERY_READ_COUNT = 100 as const;
 export const REDIS_DELIVERY_BLOCK_MS = 5_000 as const;
+export const REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND = 100_000 as const;
 
 const ZERO_STREAM_ID = "0-0";
 const STREAM_ID_PATTERN = /^(0|[1-9]\d*)-(0|[1-9]\d*)$/;
@@ -51,6 +52,7 @@ export interface DeliveryConsumerConfiguration {
   boardQuarantineMaximumBytes: number;
   boardDedupeMaximumEvents: number;
   boardDedupeMaximumBytes: number;
+  maximumBoardStates: number;
   reconnectDelayMs: number;
 }
 
@@ -62,6 +64,7 @@ export const defaultDeliveryConsumerConfiguration: Readonly<DeliveryConsumerConf
   boardQuarantineMaximumBytes: 2 * 1024 * 1024,
   boardDedupeMaximumEvents: 256,
   boardDedupeMaximumBytes: 2 * 1024 * 1024,
+  maximumBoardStates: 1_000,
   reconnectDelayMs: 250,
 };
 
@@ -72,6 +75,7 @@ export type DeliveryConsumerErrorCode =
   | "NON_MONOTONIC_REDIS_ENTRY_ID"
   | "INVALID_STREAM_ENTRY"
   | "GLOBAL_QUEUE_OVERFLOW"
+  | "BOARD_STATE_CAPACITY_EXCEEDED"
   | "DELIVERY_CALLBACK_FAILED"
   | "QUARANTINE_CALLBACK_FAILED";
 
@@ -86,7 +90,11 @@ export type CursorLossReason =
 export type DeliveryConsumerLifecycleEvent =
   | { state: "starting" }
   | { state: "established"; cursor: string; initialTail: string }
-  | { state: "unavailable"; cursor: string; code: "REDIS_UNAVAILABLE" }
+  | {
+      state: "unavailable";
+      cursor: string;
+      code: "REDIS_UNAVAILABLE" | "BOARD_STATE_CAPACITY_EXCEEDED";
+    }
   | { state: "recovering"; cursor: string }
   | { state: "recovered"; cursor: string; recoveryTail: string }
   | { state: "cursor_lost"; cursor: string; reason: CursorLossReason }
@@ -174,6 +182,18 @@ interface BoardState {
   dedupeBytes: number;
   quarantine: QuarantinedRecord[];
   quarantineBytes: number;
+  callbackInFlight: boolean;
+  pendingCommitEntryId: string | undefined;
+  committed: boolean;
+  ownerGeneration: number;
+  touchOrdinal: bigint;
+}
+
+export interface BoardStateCapacityDiagnostics {
+  currentCount: number;
+  configuredLimit: number;
+  evictionCount: number;
+  capacityFailureCount: number;
 }
 
 interface ContinuityWitness {
@@ -290,7 +310,9 @@ function validateConfiguration(configuration: DeliveryConsumerConfiguration): vo
     configuration.boardQuarantineMaximumEvents === 0 ||
     configuration.boardQuarantineMaximumBytes === 0 ||
     configuration.boardDedupeMaximumEvents === 0 ||
-    configuration.boardDedupeMaximumBytes === 0
+    configuration.boardDedupeMaximumBytes === 0 ||
+    configuration.maximumBoardStates === 0 ||
+    configuration.maximumBoardStates > REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND
   )
     throw new FatalConsumerError("INVALID_CONFIGURATION");
 }
@@ -335,6 +357,10 @@ export class RedisDeliveryConsumer {
   private stopPromise: Promise<void> | undefined;
   private stopping = false;
   private generation = 0;
+  private boardTouchOrdinal = 0n;
+  private boardStateEvictionCount = 0;
+  private boardStateCapacityFailureCount = 0;
+  private availabilityState: "unknown" | "available" | "unavailable" = "unknown";
 
   constructor(
     private readonly transport: DeliveryConsumerTransport,
@@ -352,6 +378,15 @@ export class RedisDeliveryConsumer {
 
   get activeBoardStateCount(): number {
     return this.boards.size;
+  }
+
+  get boardStateCapacityDiagnostics(): Readonly<BoardStateCapacityDiagnostics> {
+    return {
+      currentCount: this.boards.size,
+      configuredLimit: this.configuration.maximumBoardStates,
+      evictionCount: this.boardStateEvictionCount,
+      capacityFailureCount: this.boardStateCapacityFailureCount,
+    };
   }
 
   getBoardDiagnostics(boardId: string):
@@ -445,12 +480,7 @@ export class RedisDeliveryConsumer {
       } catch (error) {
         if (this.stopping || error instanceof StaleGenerationError) return;
         if (error instanceof FatalConsumerError) {
-          await this.notifyLifecycle({
-            state: "error",
-            cursor: this.cursor,
-            ...(error.entryId === undefined ? {} : { entryId: error.entryId }),
-            code: error.code,
-          });
+          await this.reportFatalError(error);
           established.reject(error);
           return;
         }
@@ -475,12 +505,7 @@ export class RedisDeliveryConsumer {
         } catch (recoveryError) {
           if (this.stopping || recoveryError instanceof StaleGenerationError) return;
           if (recoveryError instanceof FatalConsumerError) {
-            await this.notifyLifecycle({
-              state: "error",
-              cursor: this.cursor,
-              ...(recoveryError.entryId === undefined ? {} : { entryId: recoveryError.entryId }),
-              code: recoveryError.code,
-            });
+            await this.reportFatalError(recoveryError);
             established.reject(recoveryError);
             return;
           }
@@ -547,6 +572,7 @@ export class RedisDeliveryConsumer {
         this.assertGeneration(generation);
         const metadata = await this.inspectStrict(generation);
         this.validateContinuity(metadata);
+        this.adoptBoardStates(generation);
         const recoveryTail = metadata.lastGeneratedId;
         while (
           this.isActiveGeneration(generation) &&
@@ -599,6 +625,21 @@ export class RedisDeliveryConsumer {
     } catch {
       throw new FatalConsumerError("INVALID_STREAM_METADATA");
     }
+  }
+
+  private async reportFatalError(error: FatalConsumerError): Promise<void> {
+    if (error.code === "BOARD_STATE_CAPACITY_EXCEEDED")
+      await this.notifyLifecycle({
+        state: "unavailable",
+        cursor: this.cursor,
+        code: error.code,
+      });
+    await this.notifyLifecycle({
+      state: "error",
+      cursor: this.cursor,
+      ...(error.entryId === undefined ? {} : { entryId: error.entryId }),
+      code: error.code,
+    });
   }
 
   private validateContinuity(metadata: DeliveryStreamMetadata): void {
@@ -741,7 +782,7 @@ export class RedisDeliveryConsumer {
       } catch {
         throw new FatalConsumerError("INVALID_STREAM_ENTRY", entry.id);
       }
-      await this.handleBoardEntry(entry, envelope);
+      const board = await this.handleBoardEntry(entry, envelope, generation);
       this.assertGeneration(generation);
       await this.hooks.beforeCursorAdvance?.(entry.id);
       this.assertGeneration(generation);
@@ -754,6 +795,7 @@ export class RedisDeliveryConsumer {
         )
           this.witness.emptyBoundary = undefined;
       }
+      this.commitBoardState(envelope.boardId, board, entry.id, generation);
       await this.hooks.afterCursorAdvance?.(entry.id);
       if (stopAt !== undefined && compareRedisStreamIds(this.cursor, stopAt) >= 0) return;
     }
@@ -762,9 +804,11 @@ export class RedisDeliveryConsumer {
   private async handleBoardEntry(
     entry: RawDeliveryStreamEntry,
     envelope: DeliveryEnvelope,
-  ): Promise<void> {
+    generation: number,
+  ): Promise<BoardState> {
     let board = this.boards.get(envelope.boardId);
     if (!board) {
+      this.ensureBoardStateCapacity(generation, entry.id);
       board = {
         cursor: envelope.deliverySeq,
         quarantined: false,
@@ -772,20 +816,29 @@ export class RedisDeliveryConsumer {
         dedupeBytes: 0,
         quarantine: [],
         quarantineBytes: 0,
+        callbackInFlight: false,
+        pendingCommitEntryId: undefined,
+        committed: false,
+        ownerGeneration: generation,
+        touchOrdinal: 0n,
       };
+      this.boards.set(envelope.boardId, board);
       try {
-        await this.callbacks.deliver({ redisEntryId: entry.id, envelope });
+        await this.runBoardCallback(board, () =>
+          this.callbacks.deliver({ redisEntryId: entry.id, envelope }),
+        );
       } catch {
         throw new FatalConsumerError("DELIVERY_CALLBACK_FAILED", entry.id);
       }
       this.remember(board, entry, envelope);
-      this.boards.set(envelope.boardId, board);
-      return;
+      this.markBoardPending(envelope.boardId, board, entry.id, generation);
+      return board;
     }
 
     if (board.quarantined) {
       await this.quarantine(board, entry, envelope, "BOARD_ALREADY_QUARANTINED");
-      return;
+      this.markBoardPending(envelope.boardId, board, entry.id, generation);
+      return board;
     }
 
     const raw = rawEnvelope(entry);
@@ -794,7 +847,8 @@ export class RedisDeliveryConsumer {
     const byEvent = board.dedupe.find((record) => record.eventId === envelope.eventId);
     if (byEvent && byEvent.deliverySeq !== envelope.deliverySeq) {
       await this.quarantine(board, entry, envelope, "EVENT_ID_REUSED");
-      return;
+      this.markBoardPending(envelope.boardId, board, entry.id, generation);
+      return board;
     }
     if (envelope.deliverySeq <= board.cursor) {
       if (
@@ -802,25 +856,118 @@ export class RedisDeliveryConsumer {
         (bySequence.eventId !== envelope.eventId || bySequence.envelopeDigest !== digest)
       ) {
         await this.quarantine(board, entry, envelope, "CONFLICTING_DELIVERY_SEQUENCE");
-        return;
+        this.markBoardPending(envelope.boardId, board, entry.id, generation);
+        return board;
       }
       if (byEvent && byEvent.envelopeDigest !== digest) {
         await this.quarantine(board, entry, envelope, "CONFLICTING_DELIVERY_SEQUENCE");
       }
-      return;
+      this.markBoardPending(envelope.boardId, board, entry.id, generation);
+      return board;
     }
     if (envelope.deliverySeq !== board.cursor + 1) {
       await this.quarantine(board, entry, envelope, "DELIVERY_SEQUENCE_GAP");
-      return;
+      this.markBoardPending(envelope.boardId, board, entry.id, generation);
+      return board;
     }
 
     try {
-      await this.callbacks.deliver({ redisEntryId: entry.id, envelope });
+      await this.runBoardCallback(board, () =>
+        this.callbacks.deliver({ redisEntryId: entry.id, envelope }),
+      );
     } catch {
       throw new FatalConsumerError("DELIVERY_CALLBACK_FAILED", entry.id);
     }
     board.cursor = envelope.deliverySeq;
     this.remember(board, entry, envelope);
+    this.markBoardPending(envelope.boardId, board, entry.id, generation);
+    return board;
+  }
+
+  private ensureBoardStateCapacity(generation: number, entryId: string): void {
+    this.assertGeneration(generation);
+    if (this.boards.size < this.configuration.maximumBoardStates) return;
+
+    let candidate: { boardId: string; board: BoardState } | undefined;
+    for (const [boardId, board] of this.boards) {
+      if (!this.isBoardStateEvictable(board, generation)) continue;
+      if (
+        candidate === undefined ||
+        board.touchOrdinal < candidate.board.touchOrdinal ||
+        (board.touchOrdinal === candidate.board.touchOrdinal && boardId < candidate.boardId)
+      )
+        candidate = { boardId, board };
+    }
+
+    if (!candidate) {
+      this.boardStateCapacityFailureCount += 1;
+      throw new FatalConsumerError("BOARD_STATE_CAPACITY_EXCEEDED", entryId);
+    }
+
+    // The global stream cursor has validated every intervening entry before this point. Evicting a
+    // fully committed healthy state therefore drops only process-local duplicate history, not an
+    // unresolved operation or ordering evidence. A later event may establish a new baseline, but
+    // delivery remains at least once and downstream stable-event-ID deduplication is still required.
+    candidate.board.dedupe.length = 0;
+    candidate.board.dedupeBytes = 0;
+    candidate.board.quarantine.length = 0;
+    candidate.board.quarantineBytes = 0;
+    candidate.board.pendingCommitEntryId = undefined;
+    this.boards.delete(candidate.boardId);
+    this.boardStateEvictionCount += 1;
+  }
+
+  private isBoardStateEvictable(board: BoardState, generation: number): boolean {
+    return (
+      board.ownerGeneration === generation &&
+      board.committed &&
+      !board.quarantined &&
+      !board.callbackInFlight &&
+      board.pendingCommitEntryId === undefined &&
+      board.quarantine.length === 0 &&
+      board.quarantineBytes === 0
+    );
+  }
+
+  private adoptBoardStates(generation: number): void {
+    this.assertGeneration(generation);
+    for (const board of this.boards.values()) board.ownerGeneration = generation;
+  }
+
+  private async runBoardCallback(board: BoardState, callback: () => Promise<void>): Promise<void> {
+    board.callbackInFlight = true;
+    try {
+      await callback();
+    } finally {
+      board.callbackInFlight = false;
+    }
+  }
+
+  private markBoardPending(
+    boardId: string,
+    board: BoardState,
+    entryId: string,
+    generation: number,
+  ): void {
+    this.assertGeneration(generation);
+    if (this.boards.get(boardId) !== board) throw new StaleGenerationError();
+    board.ownerGeneration = generation;
+    board.pendingCommitEntryId = entryId;
+  }
+
+  private commitBoardState(
+    boardId: string,
+    board: BoardState,
+    entryId: string,
+    generation: number,
+  ): void {
+    this.assertGeneration(generation);
+    if (this.boards.get(boardId) !== board || board.pendingCommitEntryId !== entryId)
+      throw new StaleGenerationError();
+    board.pendingCommitEntryId = undefined;
+    board.committed = true;
+    board.ownerGeneration = generation;
+    board.touchOrdinal = ++this.boardTouchOrdinal;
   }
 
   private remember(
@@ -871,16 +1018,18 @@ export class RedisDeliveryConsumer {
       board.quarantineBytes += record.bytes;
     }
     try {
-      await this.callbacks.quarantine({
-        redisEntryId: entry.id,
-        boardId: envelope.boardId,
-        eventId: envelope.eventId,
-        deliverySeq: envelope.deliverySeq,
-        reason,
-        retainedEvents: board.quarantine.length,
-        retainedBytes: board.quarantineBytes,
-        overflowed,
-      });
+      await this.runBoardCallback(board, () =>
+        this.callbacks.quarantine({
+          redisEntryId: entry.id,
+          boardId: envelope.boardId,
+          eventId: envelope.eventId,
+          deliverySeq: envelope.deliverySeq,
+          reason,
+          retainedEvents: board.quarantine.length,
+          retainedBytes: board.quarantineBytes,
+          overflowed,
+        }),
+      );
     } catch {
       throw new FatalConsumerError("QUARANTINE_CALLBACK_FAILED", entry.id);
     }
@@ -894,6 +1043,15 @@ export class RedisDeliveryConsumer {
     await this.transport.cancelRead().catch(() => undefined);
     await this.transport.close();
     await this.loopPromise?.catch(() => undefined);
+    for (const board of this.boards.values()) {
+      board.dedupe.length = 0;
+      board.dedupeBytes = 0;
+      board.quarantine.length = 0;
+      board.quarantineBytes = 0;
+      board.pendingCommitEntryId = undefined;
+    }
+    this.boards.clear();
+    this.boardTouchOrdinal = 0n;
     await this.notifyLifecycle({ state: "stopped", cursor: this.cursor });
   }
 
@@ -906,6 +1064,12 @@ export class RedisDeliveryConsumer {
   }
 
   private async notifyLifecycle(event: DeliveryConsumerLifecycleEvent): Promise<void> {
+    if (event.state === "unavailable") {
+      if (this.availabilityState === "unavailable") return;
+      this.availabilityState = "unavailable";
+    } else if (event.state === "established" || event.state === "recovered") {
+      this.availabilityState = "available";
+    }
     try {
       await this.callbacks.lifecycle(event);
     } catch {
