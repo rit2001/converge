@@ -1,0 +1,23 @@
+{
+  "name": "@converge/testkit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@converge/api": "workspace:*",
+    "@converge/protocol": "workspace:*",
+    "socket.io-client": "4.8.1"
+  },
+  "devDependencies": {
+    "vitest": "3.2.4"
+  }
+}

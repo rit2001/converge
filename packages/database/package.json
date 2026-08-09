@@ -1,0 +1,29 @@
+{
+  "name": "@converge/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema": "./src/schema.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "migrate": "tsx src/migrate.ts",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@converge/canvas-engine": "workspace:*",
+    "@converge/protocol": "workspace:*",
+    "drizzle-orm": "0.44.5",
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.0",
+    "@types/pg": "8.15.5",
+    "tsx": "4.20.4",
+    "vitest": "3.2.4"
+  }
+}

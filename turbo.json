@@ -1,0 +1,23 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalPassThroughEnv": [
+    "NODE_ENV",
+    "HOST",
+    "API_PORT",
+    "WEB_ORIGIN",
+    "NEXT_PUBLIC_API_URL",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "LOG_LEVEL",
+    "DEV_AUTH_USER_ID",
+    "DEV_AUTH_USER_NAME",
+    "CI"
+  ],
+  "tasks": {
+    "build": { "dependsOn": ["^build"], "outputs": ["dist/**", ".next/**", "!.next/cache/**"] },
+    "dev": { "cache": false, "persistent": true },
+    "lint": { "dependsOn": ["^lint"] },
+    "test": { "dependsOn": ["^build"], "outputs": ["coverage/**"] },
+    "typecheck": { "dependsOn": ["^typecheck"] }
+  }
+}

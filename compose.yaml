@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: converge
+      POSTGRES_USER: converge
+      POSTGRES_PASSWORD: converge
+    ports: ["${POSTGRES_PORT:-55432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U converge -d converge"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes: ["converge-postgres:/var/lib/postgresql/data"]
+  redis:
+    image: redis:8.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes: ["converge-redis:/data"]
+
+volumes:
+  converge-postgres:
+  converge-redis:

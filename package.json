@@ -1,0 +1,34 @@
+{
+  "name": "converge",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.15.0",
+  "engines": {
+    "node": ">=22.18.0 <23",
+    "pnpm": ">=10.15.0 <11"
+  },
+  "scripts": {
+    "build": "turbo build",
+    "dev": "node scripts/root-environment.mjs pnpm run dev:workspace",
+    "dev:workspace": "turbo dev --parallel",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint scripts && turbo lint",
+    "migrate": "node scripts/root-environment.mjs pnpm --filter @converge/database migrate",
+    "test": "node --test scripts/root-environment.test.mjs && turbo test --filter=!@converge/integration --filter=!@converge/playwright --filter=!@converge/k6 --filter=!@converge/failure",
+    "test:integration": "node scripts/root-environment.mjs pnpm --filter @converge/integration test",
+    "test:playwright": "node scripts/root-environment.mjs pnpm --filter @converge/playwright test",
+    "typecheck": "turbo typecheck"
+  },
+  "devDependencies": {
+    "@next/eslint-plugin-next": "15.5.22",
+    "@eslint/js": "9.33.0",
+    "eslint": "9.33.0",
+    "eslint-config-prettier": "10.1.8",
+    "globals": "16.3.0",
+    "prettier": "3.6.2",
+    "turbo": "2.5.6",
+    "typescript": "5.9.2",
+    "typescript-eslint": "8.40.0"
+  }
+}
