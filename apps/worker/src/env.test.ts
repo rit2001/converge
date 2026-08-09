@@ -1,5 +1,10 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { parseWorkerEnvironment, WorkerEnvironmentConfigurationError } from "./env.js";
+import {
+  parseWorkerEnvironment,
+  workerEnvironmentVariableNames,
+  WorkerEnvironmentConfigurationError,
+} from "./env.js";
 
 const required = {
   DATABASE_URL: "postgresql://converge:password@localhost:55432/converge",
@@ -11,6 +16,7 @@ describe("worker environment", () => {
       OUTBOX_CLAIM_BATCH_SIZE: 32,
       OUTBOX_PUBLISH_CONCURRENCY: 8,
       OUTBOX_LEASE_MS: 60_000,
+      OUTBOX_FINALIZATION_MARGIN_MS: 5_000,
       OUTBOX_IDLE_POLL_MS: 250,
       OUTBOX_POLL_JITTER_RATIO: 0.2,
       REDIS_PUBLISH_TIMEOUT_MS: 5_000,
@@ -37,10 +43,10 @@ describe("worker environment", () => {
     expect(() =>
       parseWorkerEnvironment({
         ...required,
-        OUTBOX_LEASE_MS: "5000",
+        OUTBOX_LEASE_MS: "8000",
         REDIS_PUBLISH_TIMEOUT_MS: "5000",
       }),
-    ).toThrowError(new WorkerEnvironmentConfigurationError(["REDIS_PUBLISH_TIMEOUT_MS"]));
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["OUTBOX_LEASE_MS"]));
   });
 
   it("reports only field names for secret-bearing configuration errors", () => {
@@ -53,5 +59,15 @@ describe("worker environment", () => {
     }
     expect(message).toBe("Invalid worker environment configuration: DATABASE_URL, REDIS_URL");
     expect(message).not.toContain(secret);
+  });
+
+  it("registers every parsed worker variable in Turbo pass-through configuration", async () => {
+    const turbo = JSON.parse(
+      await readFile(new URL("../../../turbo.json", import.meta.url), "utf8"),
+    ) as { globalPassThroughEnv?: unknown };
+    expect(turbo.globalPassThroughEnv).toEqual(expect.any(Array));
+    const passThrough = new Set(turbo.globalPassThroughEnv as string[]);
+
+    expect(workerEnvironmentVariableNames.filter((name) => !passThrough.has(name))).toEqual([]);
   });
 });

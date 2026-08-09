@@ -258,12 +258,18 @@ async function entriesFor(key: string): Promise<StreamEntry[]> {
   return parseEntries(await redis.sendCommand(["XRANGE", key, "-", "+"]));
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 describe("worker outbox publication crash recovery", () => {
@@ -310,6 +316,7 @@ describe("worker outbox publication crash recovery", () => {
           ? Promise.reject(new RedisXaddRejectedError("private connection details"))
           : Promise.resolve("6000-0"),
       trimByAge: () => Promise.resolve(),
+      resetAfterCommandTimeout: () => Promise.resolve(),
       close: () => Promise.resolve(),
     };
     const worker = await createWorker(key, {}, { stream });
@@ -360,6 +367,7 @@ describe("worker outbox publication crash recovery", () => {
       isReady: () => true,
       append: () => Promise.resolve("malformed"),
       trimByAge: () => Promise.resolve(),
+      resetAfterCommandTimeout: () => Promise.resolve(),
       close: () => Promise.resolve(),
     };
     const worker = await createWorker(key, {}, { stream });
@@ -382,8 +390,9 @@ describe("worker outbox publication crash recovery", () => {
     const trimFailureStream: DeliveryStream = {
       connect: () => Promise.resolve(),
       isReady: () => realStream.isReady(),
-      append: (fields) => realStream.append(fields),
+      append: (fields, signal) => realStream.append(fields, signal),
       trimByAge: () => Promise.reject(new Error("private trim details")),
+      resetAfterCommandTimeout: () => realStream.resetAfterCommandTimeout(),
       close: () => Promise.resolve(),
     };
     const worker = await createWorker(key, {}, { stream: trimFailureStream });
@@ -456,12 +465,16 @@ describe("worker outbox publication crash recovery", () => {
     const ambiguousStream: DeliveryStream = {
       connect: () => Promise.resolve(),
       isReady: () => realStream.isReady(),
-      append: async (fields) => {
-        await realStream.append(fields);
+      append: async (fields, signal) => {
+        await realStream.append(fields, signal);
         accepted.resolve();
+        signal.addEventListener("abort", () => neverReturn.reject(new Error("timed out")), {
+          once: true,
+        });
         return neverReturn.promise;
       },
-      trimByAge: () => realStream.trimByAge(),
+      trimByAge: (signal) => realStream.trimByAge(signal),
+      resetAfterCommandTimeout: () => realStream.resetAfterCommandTimeout(),
       close: () => Promise.resolve(),
     };
     const timeoutScheduler: WorkerScheduler = {
@@ -553,7 +566,8 @@ describe("worker outbox publication crash recovery", () => {
     });
     const lengthStream = createStream(maxLengthKey, 10, 24 * 60 * 60 * 1000);
     await lengthStream.connect();
-    for (let index = 0; index < 250; index += 1) await lengthStream.append(fields);
+    for (let index = 0; index < 250; index += 1)
+      await lengthStream.append(fields, new AbortController().signal);
     const length = Number(await redis.sendCommand(["XLEN", maxLengthKey]));
     expect(length).toBeLessThan(250);
 
@@ -565,8 +579,8 @@ describe("worker outbox publication crash recovery", () => {
     await redis.sendCommand(["XADD", ageKey, `${oldMilliseconds}-0`, "fixture", "old"]);
     const ageStream = createStream(ageKey, 100_000, 1_000);
     await ageStream.connect();
-    await ageStream.append(fields);
-    await ageStream.trimByAge();
+    await ageStream.append(fields, new AbortController().signal);
+    await ageStream.trimByAge(new AbortController().signal);
     const retained = await redis.sendCommand(["XRANGE", ageKey, "-", "+"]);
     if (!Array.isArray(retained)) throw new Error("Expected retained entries");
     expect(retained).toHaveLength(1);

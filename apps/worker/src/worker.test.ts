@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   ClaimedOutboxEvent,
   ClaimOutboxOptions,
@@ -16,6 +16,7 @@ import { RedisXaddRejectedError, type DeliveryStream } from "./redis-stream.js";
 import { WorkerProcessLifecycle, type WorkerLoop } from "./lifecycle.js";
 import {
   OutboxWorker,
+  systemWorkerScheduler,
   type OutboxPublicationRepository,
   type OutboxWorkerConfiguration,
   type WorkerScheduler,
@@ -90,6 +91,7 @@ class FakeStream implements DeliveryStream {
   results: unknown[] = [];
   trimCalls = 0;
   trimFailure = false;
+  resetCalls = 0;
 
   connect(): Promise<void> {
     this.ready = true;
@@ -100,15 +102,22 @@ class FakeStream implements DeliveryStream {
     return this.ready;
   }
 
-  append(fields: DeliveryStreamFields): Promise<unknown> {
+  append(fields: DeliveryStreamFields, signal: AbortSignal): Promise<unknown> {
+    void signal;
     this.appended.push(fields);
     const result = this.results.shift() ?? `${this.appended.length}-0`;
     return result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
   }
 
-  trimByAge(): Promise<void> {
+  trimByAge(signal: AbortSignal): Promise<void> {
+    void signal;
     this.trimCalls += 1;
     return this.trimFailure ? Promise.reject(new Error("trim details")) : Promise.resolve();
+  }
+
+  resetAfterCommandTimeout(): Promise<void> {
+    this.resetCalls += 1;
+    return Promise.resolve();
   }
 
   close(force?: boolean): Promise<void> {
@@ -118,12 +127,18 @@ class FakeStream implements DeliveryStream {
   }
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 const scheduler: WorkerScheduler = {
@@ -160,9 +175,9 @@ describe("outbox worker", () => {
       return claimAvailable(options);
     };
     const append = stream.append.bind(stream);
-    stream.append = (fields) => {
+    stream.append = (fields, signal) => {
       order.push("xadd");
-      return append(fields);
+      return append(fields, signal);
     };
     const markPublished = repository.markPublished.bind(repository);
     repository.markPublished = (input) => {
@@ -233,8 +248,17 @@ describe("outbox worker", () => {
     const append = deferred<unknown>();
     const timeout = deferred<void>();
     repository.claims.push(event);
-    stream.append = (fields) => {
+    let cancelled = false;
+    stream.append = (fields, signal) => {
       stream.appended.push(fields);
+      signal.addEventListener(
+        "abort",
+        () => {
+          cancelled = true;
+          append.reject(new Error("cancelled command"));
+        },
+        { once: true },
+      );
       return append.promise;
     };
     const timeoutScheduler: WorkerScheduler = {
@@ -247,6 +271,8 @@ describe("outbox worker", () => {
     await Promise.resolve();
     timeout.resolve();
     expect((await cycle).outcomes).toEqual(["retry_scheduled"]);
+    expect(cancelled).toBe(true);
+    expect(stream.resetCalls).toBe(1);
     expect(repository.failures[0]).toMatchObject({
       retryable: true,
       retryJitter: 0.25,
@@ -254,7 +280,64 @@ describe("outbox worker", () => {
       errorMessage: "Redis publication outcome is ambiguous.",
     });
     expect(repository.published).toEqual([]);
-    append.resolve("1500-0");
+    append.resolve("late-accepted-id");
+    await Promise.resolve();
+    expect(repository.published).toEqual([]);
+
+    const recovered = claim();
+    repository.claims.push(recovered);
+    stream.append = (fields) => {
+      stream.appended.push(fields);
+      return Promise.resolve("1501-0");
+    };
+    const recoveredWorker = new OutboxWorker(repository, stream, configuration, logger, scheduler);
+    expect((await recoveredWorker.runCycle()).outcomes).toEqual(["published"]);
+    expect(repository.published.at(-1)?.eventId).toBe(recovered.eventId);
+  });
+
+  it("cancels stalled commands before releasing bounded publication slots", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    const timeout = deferred<void>();
+    let inFlight = 0;
+    let maximumInFlight = 0;
+    let cancelled = 0;
+    repository.claims.push(...Array.from({ length: 10 }, () => claim()));
+    stream.append = (fields, signal) => {
+      stream.appended.push(fields);
+      inFlight += 1;
+      maximumInFlight = Math.max(maximumInFlight, inFlight);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            inFlight -= 1;
+            cancelled += 1;
+            reject(new Error("cancelled stalled command"));
+          },
+          { once: true },
+        );
+      });
+    };
+    const timeoutScheduler: WorkerScheduler = {
+      random: () => 0,
+      sleep: () => timeout.promise,
+    };
+    const worker = new OutboxWorker(repository, stream, configuration, logger, timeoutScheduler);
+
+    const cycle = worker.runCycle();
+    while (inFlight < configuration.publishConcurrency) await Promise.resolve();
+    timeout.resolve();
+    const result = await cycle;
+
+    expect(result.claimed).toBe(8);
+    expect(result.outcomes).toEqual(Array.from({ length: 8 }, () => "retry_scheduled"));
+    expect(maximumInFlight).toBe(8);
+    expect(inFlight).toBe(0);
+    expect(cancelled).toBe(8);
+    expect(repository.published).toEqual([]);
+    expect(repository.failures).toHaveLength(8);
+    expect(repository.claims).toHaveLength(2);
   });
 
   it("treats connection loss during XADD as an ambiguous retryable outcome", async () => {
@@ -318,9 +401,61 @@ describe("outbox worker", () => {
     const worker = new OutboxWorker(repository, stream, configuration, logger, scheduler);
 
     expect((await worker.runCycle()).outcomes).toEqual(["published"]);
+    await worker.drain(10_000);
     expect(stream.trimCalls).toBe(1);
     expect(repository.published[0]?.publicationId).toBe("2000-0");
     expect(repository.failures).toEqual([]);
+  });
+
+  it("finalizes immediately after XADD without waiting for stalled age trimming", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    const order: string[] = [];
+    const trimStarted = deferred<void>();
+    const trimFinished = deferred<void>();
+    repository.claims.push(claim());
+    stream.append = () => {
+      order.push("xadd");
+      return Promise.resolve("2001-0");
+    };
+    repository.markPublished = (input) => {
+      order.push("mark-published");
+      repository.published.push(input);
+      return Promise.resolve(applied(input.eventId, "published"));
+    };
+    stream.trimByAge = () => {
+      order.push("trim");
+      trimStarted.resolve();
+      return trimFinished.promise;
+    };
+    const worker = new OutboxWorker(repository, stream, configuration, logger, scheduler);
+
+    await expect(worker.runCycle()).resolves.toMatchObject({ outcomes: ["published"] });
+    await trimStarted.promise;
+    expect(order).toEqual(["xadd", "mark-published", "trim"]);
+    expect(repository.published).toHaveLength(1);
+    trimFinished.resolve();
+    await expect(worker.drain(10_000)).resolves.toBe(true);
+  });
+
+  it("allows only one retention-maintenance task to accumulate", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    const trimFinished = deferred<void>();
+    repository.claims.push(claim(), claim());
+    stream.trimByAge = () => {
+      stream.trimCalls += 1;
+      return trimFinished.promise;
+    };
+    const worker = new OutboxWorker(repository, stream, configuration, logger, scheduler);
+
+    await expect(worker.runCycle()).resolves.toMatchObject({
+      claimed: 2,
+      outcomes: ["published", "published"],
+    });
+    expect(stream.trimCalls).toBe(1);
+    trimFinished.resolve();
+    await expect(worker.drain(10_000)).resolves.toBe(true);
   });
 
   it("honors stale lease fencing after XADD", async () => {
@@ -403,6 +538,37 @@ describe("outbox worker", () => {
     expect(delays).toEqual([275]);
   });
 
+  it("removes abort listeners and timers after repeated normal idle sleeps", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const signal = controller.signal;
+    const addEventListener = signal.addEventListener.bind(signal);
+    const removeEventListener = signal.removeEventListener.bind(signal);
+    let listenerCount = 0;
+    signal.addEventListener = ((...arguments_: Parameters<AbortSignal["addEventListener"]>) => {
+      listenerCount += 1;
+      return addEventListener(...arguments_);
+    }) as AbortSignal["addEventListener"];
+    signal.removeEventListener = ((
+      ...arguments_: Parameters<AbortSignal["removeEventListener"]>
+    ) => {
+      listenerCount -= 1;
+      return removeEventListener(...arguments_);
+    }) as AbortSignal["removeEventListener"];
+
+    try {
+      for (let index = 0; index < 100; index += 1) {
+        const sleeping = systemWorkerScheduler.sleep(10, signal);
+        await vi.advanceTimersByTimeAsync(10);
+        await sleeping;
+        expect(listenerCount).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("stops new claims and abandons unfinished work after the grace boundary", async () => {
     const repository = new FakeRepository();
     const stream = new FakeStream();
@@ -441,6 +607,99 @@ describe("outbox worker", () => {
     append.resolve("5000-0");
     await cycle;
     expect(repository.published).toEqual([]);
+  });
+
+  it("waits for a pending claim that resolves inside shutdown grace and drains it", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    const claimStarted = deferred<void>();
+    const pendingClaim = deferred<ClaimedOutboxEvent[]>();
+    const event = claim();
+    const order: string[] = [];
+    repository.claimAvailable = (options) => {
+      repository.claimOptions.push(options);
+      claimStarted.resolve();
+      return pendingClaim.promise;
+    };
+    repository.markPublished = (input) => {
+      order.push("mark-published");
+      repository.published.push(input);
+      return Promise.resolve(applied(input.eventId, "published"));
+    };
+    stream.close = () => {
+      order.push("close-redis");
+      stream.ready = false;
+      return Promise.resolve();
+    };
+    const worker = new OutboxWorker(repository, stream, configuration, logger, scheduler);
+    const lifecycle = new WorkerProcessLifecycle(
+      worker,
+      stream,
+      { end: () => Promise.resolve(order.push("close-database")).then(() => undefined) },
+      10_000,
+      logger,
+    );
+
+    const cycle = worker.runCycle();
+    await claimStarted.promise;
+    const shutdown = lifecycle.shutdown("SIGTERM");
+    pendingClaim.resolve([event]);
+
+    await expect(cycle).resolves.toMatchObject({ claimed: 1, outcomes: ["published"] });
+    await shutdown;
+    expect(order).toEqual(["mark-published", "close-redis", "close-database"]);
+    expect(repository.published[0]?.eventId).toBe(event.eventId);
+  });
+
+  it("fences a pending claim that resolves after grace and makes repeated shutdown idempotent", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    const claimStarted = deferred<void>();
+    const pendingClaim = deferred<ClaimedOutboxEvent[]>();
+    const graceExpired = deferred<void>();
+    const event = claim();
+    let closed = false;
+    repository.claimAvailable = (options) => {
+      repository.claimOptions.push(options);
+      claimStarted.resolve();
+      return pendingClaim.promise;
+    };
+    stream.append = () => {
+      if (closed) throw new Error("used closed Redis dependency");
+      return Promise.resolve("9000-0");
+    };
+    stream.close = () => {
+      closed = true;
+      stream.ready = false;
+      return Promise.resolve();
+    };
+    const graceScheduler: WorkerScheduler = {
+      random: () => 0,
+      sleep: () => graceExpired.promise,
+    };
+    const worker = new OutboxWorker(repository, stream, configuration, logger, graceScheduler);
+    const lifecycle = new WorkerProcessLifecycle(
+      worker,
+      stream,
+      { end: () => Promise.resolve() },
+      10_000,
+      logger,
+    );
+
+    const cycle = worker.runCycle();
+    await claimStarted.promise;
+    const firstShutdown = lifecycle.shutdown("SIGINT");
+    expect(lifecycle.shutdown("SIGTERM")).toBe(firstShutdown);
+    graceExpired.resolve();
+    await firstShutdown;
+    pendingClaim.resolve([event]);
+
+    await expect(cycle).resolves.toMatchObject({ state: "stopping", claimed: 1, outcomes: [] });
+    expect(stream.appended).toEqual([]);
+    expect(repository.published).toEqual([]);
+    expect(repository.failures).toEqual([]);
+    expect(repository.claimOptions).toHaveLength(1);
+    await expect(worker.runCycle()).resolves.toMatchObject({ state: "stopping", claimed: 0 });
   });
 });
 

@@ -35,15 +35,17 @@ export const systemWorkerScheduler: WorkerScheduler = {
         resolve();
         return;
       }
-      const timeout = setTimeout(resolve, delayMs);
-      signal?.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timeout);
-          resolve();
-        },
-        { once: true },
-      );
+      let settled = false;
+      const settle = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", settle);
+        resolve();
+      };
+      const timeout = setTimeout(settle, delayMs);
+      signal?.addEventListener("abort", settle, { once: true });
+      if (signal?.aborted) settle();
     }),
   random: Math.random,
 };
@@ -98,18 +100,31 @@ class DeliveryPreparationError extends Error {
 const textEncoder = new TextEncoder();
 
 async function withTimeout<T>(
-  operation: Promise<T>,
+  operation: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   scheduler: WorkerScheduler,
+  recoverAfterTimeout: () => Promise<void>,
 ): Promise<T> {
+  const operationController = new AbortController();
   const timeoutController = new AbortController();
+  const operationResult = Promise.resolve()
+    .then(() => operation(operationController.signal))
+    .then(
+      (value) => ({ state: "fulfilled" as const, value }),
+      (error: unknown) => ({ state: "rejected" as const, error }),
+    );
+  const timeoutResult = scheduler
+    .sleep(timeoutMs, timeoutController.signal)
+    .then(() => ({ state: "timed_out" as const }));
   try {
-    return await Promise.race([
-      operation,
-      scheduler.sleep(timeoutMs, timeoutController.signal).then(() => {
-        throw new PublicationTimeoutError("Redis operation timed out");
-      }),
-    ]);
+    const result = await Promise.race([operationResult, timeoutResult]);
+    if (result.state === "timed_out") {
+      operationController.abort();
+      await Promise.allSettled([recoverAfterTimeout(), operationResult]);
+      throw new PublicationTimeoutError("Redis operation timed out");
+    }
+    if (result.state === "rejected") throw result.error;
+    return result.value;
   } finally {
     timeoutController.abort();
   }
@@ -159,6 +174,9 @@ function eventLogFields(claim: ClaimedOutboxEvent): Record<string, unknown> {
 
 export class OutboxWorker {
   private readonly active = new Set<Promise<PublicationOutcome>>();
+  private readonly cycles = new Set<Promise<WorkerCycleResult>>();
+  private retentionTask: Promise<void> | undefined;
+  private retentionController: AbortController | undefined;
   private acceptingClaims = true;
   private abandoningActiveLeases = false;
 
@@ -177,14 +195,15 @@ export class OutboxWorker {
 
   abandonActiveLeases(): void {
     this.abandoningActiveLeases = true;
+    this.retentionController?.abort();
   }
 
   async drain(gracePeriodMs: number): Promise<boolean> {
-    if (this.active.size === 0) return true;
+    if (this.cycles.size === 0 && this.retentionTask === undefined) return true;
     const graceController = new AbortController();
     try {
       return await Promise.race([
-        Promise.allSettled([...this.active]).then(() => true),
+        this.waitForLifecycleWork().then(() => true),
         this.scheduler.sleep(gracePeriodMs, graceController.signal).then(() => false),
       ]);
     } finally {
@@ -192,7 +211,17 @@ export class OutboxWorker {
     }
   }
 
-  async runCycle(): Promise<WorkerCycleResult> {
+  runCycle(): Promise<WorkerCycleResult> {
+    const cycle = this.executeCycle();
+    this.cycles.add(cycle);
+    void cycle.then(
+      () => this.cycles.delete(cycle),
+      () => this.cycles.delete(cycle),
+    );
+    return cycle;
+  }
+
+  private async executeCycle(): Promise<WorkerCycleResult> {
     if (!this.acceptingClaims) return { state: "stopping", claimed: 0, outcomes: [] };
     if (!this.stream.isReady()) return { state: "redis_unavailable", claimed: 0, outcomes: [] };
     const freeSlots = this.configuration.publishConcurrency - this.active.size;
@@ -202,7 +231,11 @@ export class OutboxWorker {
       batchSize: Math.min(this.configuration.claimBatchSize, freeSlots),
       leaseDurationMs: this.configuration.leaseDurationMs,
     });
+    if (this.abandoningActiveLeases)
+      return { state: "stopping", claimed: claims.length, outcomes: [] };
     await this.hooks.afterClaimsCommitted?.(claims);
+    if (this.abandoningActiveLeases)
+      return { state: "stopping", claimed: claims.length, outcomes: [] };
     if (claims.length === 0) return { state: "empty", claimed: 0, outcomes: [] };
 
     const tasks = claims.map((claim) => {
@@ -240,6 +273,14 @@ export class OutboxWorker {
     }
   }
 
+  private async waitForLifecycleWork(): Promise<void> {
+    while (this.cycles.size > 0 || this.retentionTask !== undefined) {
+      const work: Promise<unknown>[] = [...this.cycles];
+      if (this.retentionTask) work.push(this.retentionTask);
+      await Promise.allSettled(work);
+    }
+  }
+
   private async publishSafely(claim: ClaimedOutboxEvent): Promise<PublicationOutcome> {
     try {
       return await this.publish(claim);
@@ -268,9 +309,10 @@ export class OutboxWorker {
     let redisResult: unknown;
     try {
       redisResult = await withTimeout(
-        this.stream.append(fields),
+        (signal) => this.stream.append(fields, signal),
         this.configuration.publicationTimeoutMs,
         this.scheduler,
+        () => this.stream.resetAfterCommandTimeout(),
       );
     } catch (error) {
       if (this.abandoningActiveLeases) return "unexpected_failure";
@@ -300,19 +342,6 @@ export class OutboxWorker {
     await this.hooks.afterXadd?.(claim, redisEntryId);
     if (this.abandoningActiveLeases) return "unexpected_failure";
 
-    try {
-      await withTimeout(
-        this.stream.trimByAge(),
-        this.configuration.publicationTimeoutMs,
-        this.scheduler,
-      );
-    } catch {
-      this.logger.warn(
-        { ...eventLogFields(claim), redisEntryId, code: "REDIS_AGE_TRIM_FAILED" },
-        "Redis age retention maintenance failed",
-      );
-    }
-
     await this.hooks.beforeMarkPublished?.(claim, redisEntryId);
     if (this.abandoningActiveLeases) return "unexpected_failure";
     let finalized: LeaseMutationResult;
@@ -329,6 +358,7 @@ export class OutboxWorker {
       );
       return "unexpected_failure";
     }
+    this.scheduleRetentionMaintenance(claim, redisEntryId);
     if (finalized.outcome === "stale") {
       this.logger.warn(
         { ...eventLogFields(claim), redisEntryId, code: "STALE_LEASE_AFTER_XADD" },
@@ -341,6 +371,51 @@ export class OutboxWorker {
       "Outbox event published",
     );
     return "published";
+  }
+
+  private scheduleRetentionMaintenance(claim: ClaimedOutboxEvent, redisEntryId: string): void {
+    if (this.retentionTask || this.abandoningActiveLeases) return;
+    const controller = new AbortController();
+    this.retentionController = controller;
+    const task = this.runRetentionMaintenance(claim, redisEntryId, controller.signal).finally(
+      () => {
+        if (this.retentionTask === task) {
+          this.retentionTask = undefined;
+          this.retentionController = undefined;
+        }
+      },
+    );
+    this.retentionTask = task;
+  }
+
+  private async runRetentionMaintenance(
+    claim: ClaimedOutboxEvent,
+    redisEntryId: string,
+    shutdownSignal: AbortSignal,
+  ): Promise<void> {
+    if (shutdownSignal.aborted) return;
+    try {
+      await withTimeout(
+        (signal) => {
+          const controller = new AbortController();
+          const abort = (): void => controller.abort();
+          signal.addEventListener("abort", abort, { once: true });
+          shutdownSignal.addEventListener("abort", abort, { once: true });
+          return this.stream.trimByAge(controller.signal).finally(() => {
+            signal.removeEventListener("abort", abort);
+            shutdownSignal.removeEventListener("abort", abort);
+          });
+        },
+        this.configuration.publicationTimeoutMs,
+        this.scheduler,
+        () => this.stream.resetAfterCommandTimeout(),
+      );
+    } catch {
+      this.logger.warn(
+        { ...eventLogFields(claim), redisEntryId, code: "REDIS_AGE_TRIM_FAILED" },
+        "Redis age retention maintenance failed",
+      );
+    }
   }
 
   private async recordFailure(
