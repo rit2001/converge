@@ -375,6 +375,47 @@ export function decodeDeliveryStreamFields(input: unknown): DeliveryEnvelope {
   const fields = deliveryStreamFieldsSchema.parse(input);
   return deliveryEnvelopeSchema.parse(JSON.parse(fields.event));
 }
+
+export const DELIVERY_STREAM_FIELD_NAMES = Object.freeze([
+  "schemaVersion",
+  "eventId",
+  "boardId",
+  "deliverySeq",
+  "eventType",
+  "event",
+] as const);
+
+export type DeliveryStreamFieldPair = readonly [name: string, value: string];
+
+/**
+ * Decodes Redis field pairs without first collapsing them into an object. This is the consumer-side
+ * trust boundary: duplicate field names must remain observable and fail validation.
+ */
+export function decodeDeliveryStreamFieldPairs(
+  pairs: readonly DeliveryStreamFieldPair[],
+  maximumEnvelopeBytes: number,
+): DeliveryEnvelope {
+  if (!Number.isSafeInteger(maximumEnvelopeBytes) || maximumEnvelopeBytes < 1)
+    throw new Error("Maximum delivery envelope bytes must be a positive safe integer");
+  const fields: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const [name, value] of pairs) {
+    if (seen.has(name)) throw new Error("Redis stream entry has duplicate fields");
+    if (!(DELIVERY_STREAM_FIELD_NAMES as readonly string[]).includes(name))
+      throw new Error("Redis stream entry has unknown fields");
+    seen.add(name);
+    fields[name] = value;
+  }
+  if (pairs.length !== DELIVERY_STREAM_FIELD_NAMES.length)
+    throw new Error("Redis stream entry has an invalid field count");
+  for (const name of DELIVERY_STREAM_FIELD_NAMES)
+    if (!seen.has(name)) throw new Error("Redis stream entry is missing required fields");
+
+  const event = fields.event;
+  if (event === undefined || new TextEncoder().encode(event).byteLength > maximumEnvelopeBytes)
+    throw new Error("Redis stream delivery envelope exceeds the configured byte limit");
+  return decodeDeliveryStreamFields(fields);
+}
 export const joinBoardRequestSchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION),

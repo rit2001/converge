@@ -3,6 +3,7 @@ import {
   boardAccessRevokedEventSchema,
   boardSnapshotSchema,
   createBoardRequestSchema,
+  decodeDeliveryStreamFieldPairs,
   decodeDeliveryStreamFields,
   deliveryEnvelopeSchema,
   deliveryStreamFieldsSchema,
@@ -272,6 +273,19 @@ describe("protocol schemas", () => {
     expect(redisStreamEntryIdSchema.safeParse("0-0").success).toBe(false);
     expect(redisStreamEntryIdSchema.safeParse("not-an-id").success).toBe(false);
     expect(redisStreamEntryIdSchema.safeParse("18446744073709551616-0").success).toBe(false);
+
+    const pairs = Object.entries(fields);
+    expect(decodeDeliveryStreamFieldPairs(pairs, 128 * 1024)).toEqual(envelope);
+    expect(() => decodeDeliveryStreamFieldPairs([...pairs, pairs[0]!], 128 * 1024)).toThrow(
+      /field count|duplicate/i,
+    );
+    expect(() =>
+      decodeDeliveryStreamFieldPairs(
+        pairs.map(([name, value]) => [name === "eventType" ? "surprise" : name, value]),
+        128 * 1024,
+      ),
+    ).toThrow(/unknown/i);
+    expect(() => decodeDeliveryStreamFieldPairs(pairs, 1)).toThrow(/byte limit/i);
   });
 
   it("prevents callers from supplying server-owned delivery metadata", () => {

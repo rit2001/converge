@@ -53,6 +53,9 @@ importers:
       fastify:
         specifier: 5.5.0
         version: 5.5.0
+      redis:
+        specifier: 6.2.0
+        version: 6.2.0
       socket.io:
         specifier: 4.8.1
         version: 4.8.1
@@ -219,6 +222,9 @@ importers:
 
   tests/failure:
     dependencies:
+      '@converge/api':
+        specifier: workspace:*
+        version: link:../../apps/api
       '@converge/database':
         specifier: workspace:*
         version: link:../../packages/database

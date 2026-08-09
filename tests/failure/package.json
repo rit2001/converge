@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@converge/api": "workspace:*",
     "@converge/database": "workspace:*",
     "@converge/observability": "workspace:*",
     "@converge/protocol": "workspace:*",
