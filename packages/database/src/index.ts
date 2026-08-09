@@ -475,3 +475,5 @@ export class BoardRepository {
 }
 
 export type DatabasePool = pg.Pool;
+
+export * from "./outbox-repository.js";
