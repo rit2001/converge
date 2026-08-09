@@ -1,11 +1,43 @@
-import { createClient } from "redis";
+import { createClient, RESP_TYPES } from "redis";
 import type {
   REDIS_DELIVERY_BLOCK_MS,
   REDIS_DELIVERY_READ_COUNT,
   DeliveryConsumerTransport,
+  DeliveryStreamInitialization,
   DeliveryStreamMetadata,
   RawDeliveryStreamEntry,
 } from "./delivery-consumer.js";
+
+export const DELIVERY_STREAM_INITIALIZATION_TYPE = "converge.stream.initialized.v1" as const;
+export const DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD = "controlType" as const;
+export const DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD = "generation" as const;
+
+const UINT64_MAXIMUM = 18_446_744_073_709_551_615n;
+const INITIALIZE_STREAM_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  local first = redis.call('XRANGE', KEYS[1], '-', '+', 'COUNT', 1)
+  if #first == 1 then
+    local fields = first[1][2]
+    if #fields == 4 and
+       fields[1] == '${DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD}' and
+       fields[2] == '${DELIVERY_STREAM_INITIALIZATION_TYPE}' and
+       fields[3] == '${DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD}' then
+      return {0, first[1][1], fields[4]}
+    end
+  end
+  return {0, '', ''}
+end
+local sentinel_id = redis.call(
+  'XADD',
+  KEYS[1],
+  '*',
+  '${DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD}',
+  '${DELIVERY_STREAM_INITIALIZATION_TYPE}',
+  '${DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD}',
+  ARGV[1]
+)
+return {1, sentinel_id, ARGV[1]}
+`;
 
 function createResp2Client(redisUrl: string) {
   return createClient({
@@ -14,6 +46,10 @@ function createResp2Client(redisUrl: string) {
     // map and would erase duplicate field names before the consumer can reject them.
     RESP: 2,
     socket: { reconnectStrategy: false },
+  }).withTypeMapping({
+    // XINFO counters are RESP integers. Mapping them at the decoder boundary prevents values above
+    // Number.MAX_SAFE_INTEGER from being rounded before continuity validation can use BigInt.
+    [RESP_TYPES.NUMBER]: String,
   });
 }
 
@@ -27,8 +63,22 @@ function asArray(value: unknown, message: string): unknown[] {
 }
 
 function asString(value: unknown, message: string): string {
-  if (typeof value !== "string" && typeof value !== "number") throw new Error(message);
-  return String(value);
+  if (typeof value !== "string") throw new Error(message);
+  return value;
+}
+
+export function parseRedisUint64Reply(value: unknown, message: string): string {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(message);
+    return String(value);
+  }
+  if (typeof value === "bigint") {
+    if (value < 0n || value > UINT64_MAXIMUM) throw new Error(message);
+    return value.toString();
+  }
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) throw new Error(message);
+  if (BigInt(value) > UINT64_MAXIMUM) throw new Error(message);
+  return value;
 }
 
 function asBulkString(value: unknown, message: string): string {
@@ -111,6 +161,67 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
     return this.connectPromise;
   }
 
+  async initializeStream(input: {
+    generationToken: string;
+    signal: AbortSignal;
+  }): Promise<DeliveryStreamInitialization> {
+    const response = asArray(
+      await this.requireControl().sendCommand(
+        ["EVAL", INITIALIZE_STREAM_SCRIPT, "1", this.streamKey, input.generationToken],
+        { abortSignal: input.signal },
+      ),
+      "Redis stream initializer returned an invalid response",
+    );
+    if (response.length !== 3)
+      throw new Error("Redis stream initializer returned an invalid response");
+    const created = parseRedisUint64Reply(
+      response[0],
+      "Redis stream initializer returned an invalid creation flag",
+    );
+    const sentinelId = asBulkString(
+      response[1],
+      "Redis stream initializer returned an invalid sentinel ID",
+    );
+    const generationToken = asBulkString(
+      response[2],
+      "Redis stream initializer returned an invalid generation token",
+    );
+    if (created === "0") {
+      if (sentinelId === "" && generationToken === "")
+        return { created: false, sentinelId: null, generationToken: null };
+      if (sentinelId !== "" && generationToken !== "")
+        return { created: false, sentinelId, generationToken };
+      throw new Error("Redis stream initializer returned inconsistent existing evidence");
+    }
+    if (created !== "1" || sentinelId === "" || generationToken !== input.generationToken)
+      throw new Error("Redis stream initializer returned inconsistent evidence");
+    return { created: true, sentinelId, generationToken };
+  }
+
+  async verifyInitialization(input: {
+    sentinelId: string;
+    generationToken: string;
+    signal: AbortSignal;
+  }): Promise<boolean> {
+    const response = asArray(
+      await this.requireControl().sendCommand(
+        ["XRANGE", this.streamKey, input.sentinelId, input.sentinelId, "COUNT", "1"],
+        { abortSignal: input.signal },
+      ),
+      "Redis initialization verification returned an invalid response",
+    );
+    if (response.length !== 1) return false;
+    const sentinel = parseEntry(response[0]);
+    return (
+      sentinel.id === input.sentinelId &&
+      sentinel.fields.length === 2 &&
+      sentinel.fields[0]?.[0] === DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD &&
+      sentinel.fields[0]?.[1] === DELIVERY_STREAM_INITIALIZATION_TYPE &&
+      sentinel.fields[1]?.[0] === DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD &&
+      sentinel.fields[1]?.[1] === input.generationToken
+    );
+  }
+
   async inspect(input: { signal: AbortSignal }): Promise<DeliveryStreamMetadata> {
     const control = this.requireControl();
     const incarnation = parseRunId(
@@ -125,14 +236,14 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
       const exists = await control.sendCommand(["EXISTS", this.streamKey], {
         abortSignal: input.signal,
       });
-      if (asString(exists, "Redis EXISTS returned an invalid response") === "0")
+      if (parseRedisUint64Reply(exists, "Redis EXISTS returned an invalid response") === "0")
         return absentMetadata(incarnation);
       throw error;
     }
     const info = flatRecord(response, "Redis XINFO STREAM returned an invalid response");
     return {
       exists: true,
-      length: asString(info.get("length"), "Redis XINFO STREAM omitted length"),
+      length: parseRedisUint64Reply(info.get("length"), "Redis XINFO STREAM omitted length"),
       firstEntryId: parseEntryId(info.get("first-entry")),
       lastEntryId: parseEntryId(info.get("last-entry")),
       lastGeneratedId: asString(
@@ -143,7 +254,10 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
         info.get("max-deleted-entry-id") ?? ZERO_STREAM_ID,
         "Redis XINFO STREAM returned an invalid max-deleted-entry-id",
       ),
-      entriesAdded: asString(info.get("entries-added"), "Redis XINFO STREAM omitted entries-added"),
+      entriesAdded: parseRedisUint64Reply(
+        info.get("entries-added"),
+        "Redis XINFO STREAM omitted entries-added",
+      ),
       incarnation,
     };
   }

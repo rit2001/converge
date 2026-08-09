@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   decodeDeliveryStreamFieldPairs,
   redisStreamEntryIdSchema,
@@ -12,6 +12,7 @@ export const REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND = 100_000 as const;
 
 const ZERO_STREAM_ID = "0-0";
 const STREAM_ID_PATTERN = /^(0|[1-9]\d*)-(0|[1-9]\d*)$/;
+const REDIS_UINT64_MAXIMUM = 18_446_744_073_709_551_615n;
 const textEncoder = new TextEncoder();
 
 export interface RawDeliveryStreamEntry {
@@ -30,8 +31,23 @@ export interface DeliveryStreamMetadata {
   incarnation: string;
 }
 
+export interface DeliveryStreamInitialization {
+  created: boolean;
+  sentinelId: string | null;
+  generationToken: string | null;
+}
+
 export interface DeliveryConsumerTransport {
   connect(): Promise<void>;
+  initializeStream(input: {
+    generationToken: string;
+    signal: AbortSignal;
+  }): Promise<DeliveryStreamInitialization>;
+  verifyInitialization(input: {
+    sentinelId: string;
+    generationToken: string;
+    signal: AbortSignal;
+  }): Promise<boolean>;
   inspect(input: { signal: AbortSignal }): Promise<DeliveryStreamMetadata>;
   readAfter(input: {
     cursor: string;
@@ -71,6 +87,7 @@ export const defaultDeliveryConsumerConfiguration: Readonly<DeliveryConsumerConf
 export type DeliveryConsumerErrorCode =
   | "INVALID_CONFIGURATION"
   | "INVALID_STREAM_METADATA"
+  | "STREAM_INITIALIZATION_FAILED"
   | "INVALID_REDIS_ENTRY_ID"
   | "NON_MONOTONIC_REDIS_ENTRY_ID"
   | "INVALID_STREAM_ENTRY"
@@ -231,13 +248,12 @@ function parseStreamId(value: string, allowZero: boolean): readonly [bigint, big
   const match = STREAM_ID_PATTERN.exec(value);
   const milliseconds = match?.[1];
   const sequence = match?.[2];
-  const maximum = 18_446_744_073_709_551_615n;
   if (
     milliseconds === undefined ||
     sequence === undefined ||
     (!allowZero && value === ZERO_STREAM_ID) ||
-    BigInt(milliseconds) > maximum ||
-    BigInt(sequence) > maximum
+    BigInt(milliseconds) > REDIS_UINT64_MAXIMUM ||
+    BigInt(sequence) > REDIS_UINT64_MAXIMUM
   )
     throw new Error("Invalid Redis stream ID");
   return [BigInt(milliseconds), BigInt(sequence)];
@@ -253,7 +269,9 @@ export function compareRedisStreamIds(left: string, right: string): number {
 
 function parseCounter(value: string): bigint {
   if (!/^(0|[1-9]\d*)$/.test(value)) throw new Error("Invalid Redis stream counter");
-  return BigInt(value);
+  const counter = BigInt(value);
+  if (counter > REDIS_UINT64_MAXIMUM) throw new Error("Invalid Redis stream counter");
+  return counter;
 }
 
 function captureEmptyBoundary(metadata: DeliveryStreamMetadata): EmptyStreamBoundary | undefined {
@@ -426,9 +444,43 @@ export class RedisDeliveryConsumer {
     try {
       validateConfiguration(this.configuration);
       await this.notifyLifecycle({ state: "starting" });
+      this.assertGeneration(generation);
       await this.transport.connect();
       this.assertGeneration(generation);
+      const startupGenerationToken = randomUUID();
+      const initialization = await this.transport.initializeStream({
+        generationToken: startupGenerationToken,
+        signal: this.abortController.signal,
+      });
+      this.assertGeneration(generation);
       const metadata = await this.inspectStrict(generation);
+      const sentinelId = initialization.sentinelId;
+      const generationToken = initialization.generationToken;
+      if (initialization.created && generationToken !== startupGenerationToken)
+        throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
+      if ((sentinelId === null) !== (generationToken === null))
+        throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
+      if (sentinelId !== null && generationToken !== null) {
+        if (
+          !redisStreamEntryIdSchema.safeParse(sentinelId).success ||
+          generationToken.length === 0 ||
+          !metadata.exists
+        )
+          throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
+        const verified = await this.transport.verifyInitialization({
+          sentinelId,
+          generationToken,
+          signal: this.abortController.signal,
+        });
+        this.assertGeneration(generation);
+        if (!verified) throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
+      } else if (initialization.created) {
+        throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
+      } else if (!metadata.exists) {
+        // The atomic initializer observed an existing stream. Its disappearance before strict
+        // inspection is therefore a recreation boundary, not a fresh absent-stream startup.
+        throw new FatalConsumerError("STREAM_INITIALIZATION_FAILED");
+      }
       this.cursor = metadata.lastGeneratedId;
       this.witness = {
         metadata,
@@ -442,6 +494,7 @@ export class RedisDeliveryConsumer {
       void this.loopPromise.catch(() => undefined);
       await established.promise;
     } catch (error) {
+      if (this.stopping || error instanceof StaleGenerationError) return;
       if (error instanceof FatalConsumerError)
         await this.notifyLifecycle({ state: "error", cursor: this.cursor, code: error.code });
       else

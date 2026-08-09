@@ -360,12 +360,22 @@ provisional retention policy during M2.4B wiring; it is not part of M2.4A.
 ### Plain `XREAD` startup and cursor algorithm
 
 1. Reject Socket.IO handshakes while connecting to PostgreSQL and Redis.
-2. Read `XINFO STREAM converge:delivery:v1` and retain its current last-generated ID, using `0-0` for
-   a missing/empty stream.
-3. Store that tail as the process's last fully processed global stream cursor.
-4. Issue `XREAD COUNT 100 BLOCK 5000 STREAMS converge:delivery:v1 <cursor>` on a dedicated connection
+2. Atomically initialize a truly absent stream with one reserved
+   `converge.stream.initialized.v1` entry carrying a caller-supplied random generation token. The
+   Redis-side operation leaves an existing stream unchanged, so concurrent APIs create at most one
+   sentinel and a worker that wins the race never receives a sentinel behind its delivery entry.
+3. Strictly inspect the resulting stream. The creator also verifies the exact sentinel ID and token
+   before continuing; ambiguous initialization or a sentinel deleted before verification fails
+   startup closed.
+4. Retain the validated last-generated ID for both existing non-empty streams and existing empty but
+   previously generated streams. The latter also retain the empty-boundary continuity witness. An
+   absent stream never becomes available from an unwitnessed `0-0` cursor.
+5. Store that last-generated ID as the process's last fully processed global stream cursor and startup
+   tail. The initialization sentinel is control evidence, not an outbox delivery event, and is never
+   passed to delivery or quarantine handling.
+6. Issue `XREAD COUNT 100 BLOCK 5000 STREAMS converge:delivery:v1 <cursor>` on a dedicated connection
    with lifecycle/error handlers already installed.
-5. Report Socket.IO readiness only after the loop is issued and capable of retaining/processing its
+7. Report Socket.IO readiness only after the loop is issued and capable of retaining/processing its
    response.
 
 The tail-capture/read-start race cannot lose an event. The supplied `XREAD` ID is an exclusive lower
@@ -526,7 +536,10 @@ cursor, issues a new `XREAD` after that tail, and only then becomes ready. Misse
 replayed to new sockets; reconnecting clients reconstruct PostgreSQL snapshot-plus-tail state.
 
 A restarted API inherits neither cursor nor sockets. It follows the startup tail-capture algorithm and
-needs no old Redis group, acknowledgement, pending-entry, or reclamation state.
+needs no old Redis group, acknowledgement, pending-entry, or reclamation state. Recovery of an
+already-observed stream never runs the initializer: disappearance remains cursor loss and cannot be
+accepted as a replacement generation. Delivery remains at least once; the sentinel does not change
+worker publication or downstream stable-event-ID deduplication requirements.
 
 ### Batched PostgreSQL watchdog
 

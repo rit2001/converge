@@ -6,7 +6,12 @@ import {
   type DeliveryConsumerLifecycleEvent,
   type DeliveryContext,
 } from "@converge/api/delivery-consumer";
-import { RedisDeliveryConsumerTransport } from "@converge/api/redis-delivery-transport";
+import {
+  DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+  DELIVERY_STREAM_INITIALIZATION_TYPE,
+  DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+  RedisDeliveryConsumerTransport,
+} from "@converge/api/redis-delivery-transport";
 import {
   encodeDeliveryStreamFields,
   membershipRevokedDeliveryEnvelopeSchema,
@@ -41,6 +46,14 @@ class FailFirstReadTransport implements DeliveryConsumerTransport {
     return this.delegate.connect();
   }
 
+  initializeStream(input: Parameters<DeliveryConsumerTransport["initializeStream"]>[0]) {
+    return this.delegate.initializeStream(input);
+  }
+
+  verifyInitialization(input: Parameters<DeliveryConsumerTransport["verifyInitialization"]>[0]) {
+    return this.delegate.verifyInitialization(input);
+  }
+
   inspect(input: Parameters<DeliveryConsumerTransport["inspect"]>[0]) {
     return this.delegate.inspect(input);
   }
@@ -73,6 +86,14 @@ class ControlledFirstReadFailureTransport implements DeliveryConsumerTransport {
     return this.delegate.connect();
   }
 
+  initializeStream(input: Parameters<DeliveryConsumerTransport["initializeStream"]>[0]) {
+    return this.delegate.initializeStream(input);
+  }
+
+  verifyInitialization(input: Parameters<DeliveryConsumerTransport["verifyInitialization"]>[0]) {
+    return this.delegate.verifyInitialization(input);
+  }
+
   inspect(input: Parameters<DeliveryConsumerTransport["inspect"]>[0]) {
     return this.delegate.inspect(input);
   }
@@ -93,6 +114,154 @@ class ControlledFirstReadFailureTransport implements DeliveryConsumerTransport {
   }
 
   close(): Promise<void> {
+    return this.delegate.close();
+  }
+}
+
+class FirstReadBarrierTransport implements DeliveryConsumerTransport {
+  private readonly entered = deferred<void>();
+  private readonly released = deferred<void>();
+  private firstRead = true;
+
+  constructor(private readonly delegate: RedisDeliveryConsumerTransport) {}
+
+  connect(): Promise<void> {
+    return this.delegate.connect();
+  }
+
+  initializeStream(input: Parameters<DeliveryConsumerTransport["initializeStream"]>[0]) {
+    return this.delegate.initializeStream(input);
+  }
+
+  verifyInitialization(input: Parameters<DeliveryConsumerTransport["verifyInitialization"]>[0]) {
+    return this.delegate.verifyInitialization(input);
+  }
+
+  inspect(input: Parameters<DeliveryConsumerTransport["inspect"]>[0]) {
+    return this.delegate.inspect(input);
+  }
+
+  async readAfter(input: Parameters<DeliveryConsumerTransport["readAfter"]>[0]) {
+    if (this.firstRead) {
+      this.firstRead = false;
+      this.entered.resolve();
+      await this.released.promise;
+    }
+    return this.delegate.readAfter(input);
+  }
+
+  waitUntilEntered(): Promise<void> {
+    return this.entered.promise;
+  }
+
+  release(): void {
+    this.released.resolve();
+  }
+
+  cancelRead(): Promise<void> {
+    return this.delegate.cancelRead();
+  }
+
+  close(): Promise<void> {
+    this.release();
+    return this.delegate.close();
+  }
+}
+
+class InitializationVerificationBarrierTransport implements DeliveryConsumerTransport {
+  private readonly entered = deferred<void>();
+  private readonly released = deferred<void>();
+
+  constructor(private readonly delegate: RedisDeliveryConsumerTransport) {}
+
+  connect(): Promise<void> {
+    return this.delegate.connect();
+  }
+
+  initializeStream(input: Parameters<DeliveryConsumerTransport["initializeStream"]>[0]) {
+    return this.delegate.initializeStream(input);
+  }
+
+  async verifyInitialization(
+    input: Parameters<DeliveryConsumerTransport["verifyInitialization"]>[0],
+  ) {
+    this.entered.resolve();
+    await this.released.promise;
+    return this.delegate.verifyInitialization(input);
+  }
+
+  inspect(input: Parameters<DeliveryConsumerTransport["inspect"]>[0]) {
+    return this.delegate.inspect(input);
+  }
+
+  readAfter(input: Parameters<DeliveryConsumerTransport["readAfter"]>[0]) {
+    return this.delegate.readAfter(input);
+  }
+
+  waitUntilEntered(): Promise<void> {
+    return this.entered.promise;
+  }
+
+  release(): void {
+    this.released.resolve();
+  }
+
+  cancelRead(): Promise<void> {
+    return this.delegate.cancelRead();
+  }
+
+  close(): Promise<void> {
+    this.release();
+    return this.delegate.close();
+  }
+}
+
+class FirstPostReadInspectionBarrierTransport implements DeliveryConsumerTransport {
+  private readonly entered = deferred<void>();
+  private readonly released = deferred<void>();
+  private inspectionCount = 0;
+
+  constructor(private readonly delegate: RedisDeliveryConsumerTransport) {}
+
+  connect(): Promise<void> {
+    return this.delegate.connect();
+  }
+
+  initializeStream(input: Parameters<DeliveryConsumerTransport["initializeStream"]>[0]) {
+    return this.delegate.initializeStream(input);
+  }
+
+  verifyInitialization(input: Parameters<DeliveryConsumerTransport["verifyInitialization"]>[0]) {
+    return this.delegate.verifyInitialization(input);
+  }
+
+  async inspect(input: Parameters<DeliveryConsumerTransport["inspect"]>[0]) {
+    this.inspectionCount += 1;
+    if (this.inspectionCount === 2) {
+      this.entered.resolve();
+      await this.released.promise;
+    }
+    return this.delegate.inspect(input);
+  }
+
+  readAfter(input: Parameters<DeliveryConsumerTransport["readAfter"]>[0]) {
+    return this.delegate.readAfter(input);
+  }
+
+  waitUntilEntered(): Promise<void> {
+    return this.entered.promise;
+  }
+
+  release(): void {
+    this.released.resolve();
+  }
+
+  cancelRead(): Promise<void> {
+    return this.delegate.cancelRead();
+  }
+
+  close(): Promise<void> {
+    this.release();
     return this.delegate.close();
   }
 }
@@ -145,6 +314,20 @@ async function appendAt(
   const result = await publisher.sendCommand(["XADD", key, id, ...streamFieldArguments(value)]);
   if (typeof result !== "string") throw new Error("Redis XADD did not return an entry ID");
   return result;
+}
+
+async function rawStreamEntries(
+  key: string,
+): Promise<readonly { id: string; fields: readonly string[] }[]> {
+  const response = await publisher.sendCommand(["XRANGE", key, "-", "+"]);
+  if (!Array.isArray(response)) throw new Error("Redis XRANGE returned an invalid response");
+  return response.map((raw) => {
+    if (!Array.isArray(raw) || raw.length !== 2 || typeof raw[0] !== "string")
+      throw new Error("Redis XRANGE returned an invalid entry");
+    if (!Array.isArray(raw[1]) || raw[1].some((field) => typeof field !== "string"))
+      throw new Error("Redis XRANGE returned invalid fields");
+    return { id: raw[0], fields: raw[1] as string[] };
+  });
 }
 
 function deliveryGate(): {
@@ -225,6 +408,202 @@ afterAll(() => {
 });
 
 describe("real Redis independent delivery consumers", () => {
+  it("preserves XINFO entries-added above Number.MAX_SAFE_INTEGER", async () => {
+    const key = uniqueStreamKey();
+    await publisher.sendCommand(["XADD", key, "1-0", "control", "test"]);
+    await publisher.sendCommand(["XSETID", key, "1-0", "ENTRIESADDED", "9007199254740993"]);
+    const transport = new RedisDeliveryConsumerTransport(redisUrl, key);
+
+    try {
+      await transport.connect();
+      const metadata = await transport.inspect({ signal: new AbortController().signal });
+      expect(metadata.entriesAdded).toBe("9007199254740993");
+    } finally {
+      await transport.close();
+    }
+  });
+
+  it("atomically initializes an absent stream once for two independent consumers", async () => {
+    const key = uniqueStreamKey();
+    const firstGate = deliveryGate();
+    const secondGate = deliveryGate();
+    const first = new RedisDeliveryConsumer(new RedisDeliveryConsumerTransport(redisUrl, key), {
+      deliver: firstGate.deliver,
+      quarantine: () => Promise.resolve(),
+      lifecycle: () => undefined,
+    });
+    const second = new RedisDeliveryConsumer(new RedisDeliveryConsumerTransport(redisUrl, key), {
+      deliver: secondGate.deliver,
+      quarantine: () => Promise.resolve(),
+      lifecycle: () => undefined,
+    });
+    consumers.add(first);
+    consumers.add(second);
+
+    await Promise.all([first.start(), second.start()]);
+    const initialized = await rawStreamEntries(key);
+    expect(initialized).toHaveLength(1);
+    expect(initialized[0]?.fields).toEqual([
+      DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+      DELIVERY_STREAM_INITIALIZATION_TYPE,
+      DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+      expect.any(String),
+    ]);
+    expect(first.lastHandledCursor).toBe(initialized[0]?.id);
+    expect(second.lastHandledCursor).toBe(initialized[0]?.id);
+
+    const published = envelope(1);
+    const publishedId = await append(key, published);
+    const [firstDelivery, secondDelivery] = await Promise.all([
+      withDeadline(firstGate.promise),
+      withDeadline(secondGate.promise),
+    ]);
+    expect(firstDelivery).toEqual({ redisEntryId: publishedId, envelope: published });
+    expect(secondDelivery).toEqual({ redisEntryId: publishedId, envelope: published });
+  });
+
+  it("fails startup when its initialization sentinel is deleted before validation", async () => {
+    const key = uniqueStreamKey();
+    const transport = new InitializationVerificationBarrierTransport(
+      new RedisDeliveryConsumerTransport(redisUrl, key),
+    );
+    const lifecycle: DeliveryConsumerLifecycleEvent[] = [];
+    const consumer = new RedisDeliveryConsumer(transport, {
+      deliver: () => Promise.resolve(),
+      quarantine: () => Promise.resolve(),
+      lifecycle: (event) => {
+        lifecycle.push(event);
+      },
+    });
+    consumers.add(consumer);
+
+    const startup = consumer.start();
+    await withDeadline(transport.waitUntilEntered());
+    await publisher.sendCommand(["DEL", key]);
+    transport.release();
+
+    await expect(startup).rejects.toThrow("STREAM_INITIALIZATION_FAILED");
+    expect(lifecycle.some(({ state }) => state === "established")).toBe(false);
+    expect(lifecycle.at(-1)).toMatchObject({
+      state: "error",
+      code: "STREAM_INITIALIZATION_FAILED",
+    });
+  });
+
+  it("rejects a stale first-read result when the initialized stream is recreated before inspection", async () => {
+    const key = uniqueStreamKey();
+    const transport = new FirstPostReadInspectionBarrierTransport(
+      new RedisDeliveryConsumerTransport(redisUrl, key),
+    );
+    const delivered: DeliveryContext[] = [];
+    const loss = cursorLossGate();
+    const consumer = new RedisDeliveryConsumer(transport, {
+      deliver: (context) => {
+        delivered.push(context);
+        return Promise.resolve();
+      },
+      quarantine: () => Promise.resolve(),
+      lifecycle: loss.lifecycle,
+    });
+    consumers.add(consumer);
+
+    await consumer.start();
+    const startupCursor = consumer.lastHandledCursor;
+    await append(key, envelope(1));
+    await withDeadline(transport.waitUntilEntered());
+    await publisher.sendCommand(["DEL", key]);
+    await append(key, envelope(2));
+    transport.release();
+
+    await expect(withDeadline(loss.promise)).resolves.toMatchObject({
+      state: "cursor_lost",
+      cursor: startupCursor,
+      reason: "STREAM_RECREATED",
+    });
+    expect(delivered).toEqual([]);
+    expect(consumer.lastHandledCursor).toBe(startupCursor);
+  });
+
+  it("accepts later delivery after the initialization sentinel is trimmed behind the cursor", async () => {
+    const key = uniqueStreamKey();
+    const firstObserved = deferred<DeliveryContext>();
+    const secondObserved = deferred<DeliveryContext>();
+    const delivered: DeliveryContext[] = [];
+    const lifecycle: DeliveryConsumerLifecycleEvent[] = [];
+    const consumer = new RedisDeliveryConsumer(new RedisDeliveryConsumerTransport(redisUrl, key), {
+      deliver: (context) => {
+        delivered.push(context);
+        (delivered.length === 1 ? firstObserved : secondObserved).resolve(context);
+        return Promise.resolve();
+      },
+      quarantine: () => Promise.resolve(),
+      lifecycle: (event) => {
+        lifecycle.push(event);
+      },
+    });
+    consumers.add(consumer);
+
+    await consumer.start();
+    const sentinelId = consumer.lastHandledCursor;
+    const first = envelope(1);
+    const firstId = await append(key, first);
+    await withDeadline(firstObserved.promise);
+    await eventually(() => expect(consumer.lastHandledCursor).toBe(firstId));
+
+    await publisher.sendCommand(["XTRIM", key, "MINID", firstId]);
+    const second = envelope(2);
+    const secondId = await append(key, second);
+    await withDeadline(secondObserved.promise);
+    await eventually(() => expect(consumer.lastHandledCursor).toBe(secondId));
+
+    expect(delivered).toEqual([
+      { redisEntryId: firstId, envelope: first },
+      { redisEntryId: secondId, envelope: second },
+    ]);
+    expect((await rawStreamEntries(key)).some(({ id }) => id === sentinelId)).toBe(false);
+    expect(lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+  });
+
+  it("delivers an append between final startup inspection and first XREAD delegation exactly once", async () => {
+    const key = uniqueStreamKey();
+    const transport = new FirstReadBarrierTransport(
+      new RedisDeliveryConsumerTransport(redisUrl, key),
+    );
+    const observed = deferred<DeliveryContext>();
+    const delivered: DeliveryContext[] = [];
+    const quarantined: unknown[] = [];
+    const lifecycle: DeliveryConsumerLifecycleEvent[] = [];
+    const consumer = new RedisDeliveryConsumer(transport, {
+      deliver: (context) => {
+        delivered.push(context);
+        observed.resolve(context);
+        return Promise.resolve();
+      },
+      quarantine: (event) => {
+        quarantined.push(event);
+        return Promise.resolve();
+      },
+      lifecycle: (event) => {
+        lifecycle.push(event);
+      },
+    });
+    consumers.add(consumer);
+
+    const startup = consumer.start();
+    await withDeadline(transport.waitUntilEntered());
+    const value = envelope(1);
+    const id = await append(key, value);
+    transport.release();
+    await startup;
+    await withDeadline(observed.promise);
+    await eventually(() => expect(consumer.lastHandledCursor).toBe(id));
+
+    expect(delivered).toEqual([{ redisEntryId: id, envelope: value }]);
+    expect(consumer.lastHandledCursor).toBe(id);
+    expect(quarantined).toEqual([]);
+    expect(lifecycle.some(({ state }) => state === "cursor_lost")).toBe(false);
+  });
+
   it("delivers the same post-tail entry to two independent plain-XREAD consumers", async () => {
     const key = uniqueStreamKey();
     const historical = envelope(1);
@@ -247,6 +626,7 @@ describe("real Redis independent delivery consumers", () => {
     await Promise.all([first.start(), second.start()]);
     expect(first.lastHandledCursor).toBe(historicalId);
     expect(second.lastHandledCursor).toBe(historicalId);
+    expect((await rawStreamEntries(key)).map(({ id }) => id)).toEqual([historicalId]);
 
     const published = envelope(2);
     const publishedId = await append(key, published);
@@ -280,6 +660,7 @@ describe("real Redis independent delivery consumers", () => {
     });
     consumers.add(consumer);
     await consumer.start();
+    const startupCursor = consumer.lastHandledCursor;
     const value = envelope(1);
     const fields = encodeDeliveryStreamFields(value);
 
@@ -308,9 +689,9 @@ describe("real Redis independent delivery consumers", () => {
       state: "error",
       entryId,
       code: "INVALID_STREAM_ENTRY",
-      cursor: "0-0",
+      cursor: startupCursor,
     });
-    expect(consumer.lastHandledCursor).toBe("0-0");
+    expect(consumer.lastHandledCursor).toBe(startupCursor);
     expect(delivered).toEqual([]);
   });
 

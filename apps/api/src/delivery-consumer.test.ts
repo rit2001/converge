@@ -18,6 +18,7 @@ import {
   type DeliveryConsumerLifecycleEvent,
   type DeliveryConsumerScheduler,
   type DeliveryConsumerTransport,
+  type DeliveryStreamInitialization,
   type DeliveryStreamMetadata,
   type RawDeliveryStreamEntry,
 } from "./delivery-consumer.js";
@@ -109,6 +110,17 @@ function emptyMetadata(): DeliveryStreamMetadata {
   };
 }
 
+function initializedSentinelMetadata(): DeliveryStreamMetadata {
+  return metadata({
+    length: "1",
+    firstEntryId: "0-1",
+    lastEntryId: "0-1",
+    lastGeneratedId: "0-1",
+    maxDeletedEntryId: "0-0",
+    entriesAdded: "1",
+  });
+}
+
 function existingEmptyMetadata(
   input: Partial<DeliveryStreamMetadata> = {},
 ): DeliveryStreamMetadata {
@@ -130,6 +142,10 @@ class FakeTransport implements DeliveryConsumerTransport {
   inspectCalls = 0;
   cancelCalls = 0;
   closeCalls = 0;
+  initializeCalls = 0;
+  verifyCalls = 0;
+  verificationResult = true;
+  initializeBarrier: Promise<void> | undefined;
   activeReads = 0;
   maximumActiveReads = 0;
   onRead: ((cursor: string) => void) | undefined;
@@ -146,6 +162,28 @@ class FakeTransport implements DeliveryConsumerTransport {
   connect(): Promise<void> {
     this.connectCalls += 1;
     return Promise.resolve();
+  }
+
+  async initializeStream(input: {
+    generationToken: string;
+  }): Promise<DeliveryStreamInitialization> {
+    this.initializeCalls += 1;
+    await this.initializeBarrier;
+    const startupMetadata = this.inspections[this.inspectIndex];
+    if (!(startupMetadata instanceof Error) && startupMetadata?.exists === false) {
+      this.inspections[this.inspectIndex] = initializedSentinelMetadata();
+      return {
+        created: true,
+        sentinelId: "0-1",
+        generationToken: input.generationToken,
+      };
+    }
+    return { created: false, sentinelId: null, generationToken: null };
+  }
+
+  verifyInitialization(): Promise<boolean> {
+    this.verifyCalls += 1;
+    return Promise.resolve(this.verificationResult);
   }
 
   inspect(): Promise<DeliveryStreamMetadata> {
@@ -305,6 +343,108 @@ async function eventually(assertion: () => void): Promise<void> {
 }
 
 describe("RedisDeliveryConsumer", () => {
+  it("uses a verified initialization sentinel as the absent-stream startup cursor and tail", async () => {
+    const transport = new FakeTransport(emptyMetadata());
+    const test = harness(transport);
+
+    await test.consumer.start();
+
+    expect(transport.initializeCalls).toBe(1);
+    expect(transport.verifyCalls).toBe(1);
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
+    expect(test.delivered).toEqual([]);
+    expect(test.quarantined).toEqual([]);
+    expect(test.lifecycle).toContainEqual({
+      state: "established",
+      cursor: "0-1",
+      initialTail: "0-1",
+    });
+    await test.consumer.stop();
+  });
+
+  it("fails startup when the created initialization sentinel disappears before validation", async () => {
+    const transport = new FakeTransport(emptyMetadata());
+    transport.verificationResult = false;
+    const test = harness(transport);
+
+    await expect(test.consumer.start()).rejects.toThrow("STREAM_INITIALIZATION_FAILED");
+
+    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.delivered).toEqual([]);
+    expect(test.lifecycle).toEqual([
+      { state: "starting" },
+      { state: "error", cursor: "0-0", code: "STREAM_INITIALIZATION_FAILED" },
+    ]);
+    await test.consumer.stop();
+  });
+
+  it("ignores a late initializer result after shutdown invalidates startup", async () => {
+    const initializationGate = deferred<void>();
+    const transport = new FakeTransport(emptyMetadata());
+    transport.initializeBarrier = initializationGate.promise;
+    const test = harness(transport);
+
+    const startup = test.consumer.start();
+    await eventually(() => expect(transport.initializeCalls).toBe(1));
+    await test.consumer.stop();
+    initializationGate.resolve();
+    await expect(startup).resolves.toBeUndefined();
+
+    expect(transport.inspectCalls).toBe(0);
+    expect(transport.verifyCalls).toBe(0);
+    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.lifecycle.map(({ state }) => state)).toEqual(["starting", "stopping", "stopped"]);
+  });
+
+  it("fails closed when an absent startup stream is created, deleted, and recreated before inspection", async () => {
+    const replacement = metadata({
+      firstEntryId: "2-0",
+      lastEntryId: "2-0",
+      lastGeneratedId: "2-0",
+      entriesAdded: "1",
+    });
+    const transport = new FakeTransport(emptyMetadata(), replacement);
+    const test = harness(transport);
+    await test.consumer.start();
+
+    // XREAD has already observed A from the initialized incarnation, but XINFO sees only B from the
+    // replacement stream. Neither the stale A result nor replacement metadata may be accepted.
+    transport.resolveRead([entry("1-0", envelope(1))]);
+    await eventually(() =>
+      expect(
+        test.consumer.lastHandledCursor === "2-0" ||
+          test.lifecycle.some(({ state }) => state === "cursor_lost"),
+      ).toBe(true),
+    );
+
+    expect(test.lifecycle.at(-1)).toMatchObject({ state: "cursor_lost" });
+    expect(test.delivered).toEqual([]);
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
+    await test.consumer.stop();
+  });
+
+  it("does not emit unavailable after stop wins an in-flight startup", async () => {
+    const startingGate = deferred<void>();
+    const transport = new FakeTransport(emptyMetadata());
+    const test = harness(transport, {
+      lifecycle: async (event) => {
+        test.lifecycle.push(event);
+        if (event.state === "starting") await startingGate.promise;
+      },
+    });
+
+    const startupOutcome = test.consumer.start().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await eventually(() => expect(test.lifecycle.map(({ state }) => state)).toEqual(["starting"]));
+    await test.consumer.stop();
+    startingGate.resolve();
+    await startupOutcome;
+
+    expect(test.lifecycle.map(({ state }) => state)).toEqual(["starting", "stopping", "stopped"]);
+  });
+
   it("uses the conservative default global board-state capacity", () => {
     expect(defaultDeliveryConsumerConfiguration.maximumBoardStates).toBe(1_000);
   });
@@ -1101,7 +1241,7 @@ describe("RedisDeliveryConsumer", () => {
     transport.resolveRead([poison(entry("1-0", envelope(1)))]);
     await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("error"));
     expect(test.delivered).toEqual([]);
-    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
     expect(test.consumer.activeBoardStateCount).toBe(0);
     await test.consumer.stop();
   });
@@ -1116,7 +1256,7 @@ describe("RedisDeliveryConsumer", () => {
     await test.consumer.start();
     transport.resolveRead([entry("1-0", envelope(1))]);
     await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("error"));
-    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
     await test.consumer.stop();
   });
 
@@ -1154,7 +1294,7 @@ describe("RedisDeliveryConsumer", () => {
         code: "GLOBAL_QUEUE_OVERFLOW",
       }),
     );
-    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
     expect(test.delivered).toEqual([]);
     await test.consumer.stop();
   });
@@ -1166,7 +1306,7 @@ describe("RedisDeliveryConsumer", () => {
     await test.consumer.start();
     transport.resolveRead([entry("1-0", envelope(1))]);
     await eventually(() => expect(transport.readCalls).toHaveLength(1));
-    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
     gate.reject(new Error("local handling failed"));
     await eventually(() =>
       expect(test.lifecycle.at(-1)).toMatchObject({
@@ -1174,7 +1314,7 @@ describe("RedisDeliveryConsumer", () => {
         code: "DELIVERY_CALLBACK_FAILED",
       }),
     );
-    expect(test.consumer.lastHandledCursor).toBe("0-0");
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
     await test.consumer.stop();
   });
 
@@ -1615,7 +1755,7 @@ describe("RedisDeliveryConsumer", () => {
     const transport = new FakeTransport(emptyMetadata());
     const test = harness(transport);
     await test.consumer.start();
-    expect(transport.readCalls).toEqual([{ cursor: "0-0", count: 100, blockMs: 5_000 }]);
+    expect(transport.readCalls).toEqual([{ cursor: "0-1", count: 100, blockMs: 5_000 }]);
     expect(Object.keys(transport)).not.toContain("group");
     await test.consumer.stop();
   });
