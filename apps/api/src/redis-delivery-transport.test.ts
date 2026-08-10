@@ -55,16 +55,45 @@ vi.mock("redis", () => ({
       sendCommand: async (command: readonly string[]) => {
         await Promise.resolve();
         redisMock.record(command);
-        if (command[0] === "EVAL" && command[1]?.includes("exact_entries_added"))
+        if (command[0] === "INFO") return `# Server\r\nrun_id:${"a".repeat(40)}\r\n`;
+        if (command[0] === "XINFO")
           return [
+            "length",
             redisMock.reply("1"),
-            "a".repeat(40),
-            "0",
-            "",
-            "",
-            "1-0",
-            "1-0",
+            "radix-tree-keys",
+            redisMock.reply("1"),
+            "radix-tree-nodes",
+            redisMock.reply("2"),
+            "last-generated-id",
+            "5-0",
+            "max-deleted-entry-id",
+            "0-0",
+            "entries-added",
             "9007199254740993",
+            "recorded-first-entry-id",
+            "5-0",
+            "groups",
+            redisMock.reply("0"),
+            "first-entry",
+            [
+              "5-0",
+              [
+                "controlType",
+                "converge.stream.initialized.v1",
+                "generation",
+                "10000000-0000-4000-8000-000000000001",
+              ],
+            ],
+            "last-entry",
+            [
+              "5-0",
+              [
+                "controlType",
+                "converge.stream.initialized.v1",
+                "generation",
+                "10000000-0000-4000-8000-000000000001",
+              ],
+            ],
           ];
         if (command[0] === "EVAL" && command.length === 6) return [redisMock.reply("1")];
         if (command[0] === "EVAL")
@@ -77,6 +106,8 @@ vi.mock("redis", () => ({
 }));
 
 import {
+  REDIS_DELIVERY_XINFO_AUTHORIZED_RESPONSE_MAX_BYTES,
+  REDIS_DELIVERY_XINFO_FIXED_SCALAR_MAX_BYTES,
   RedisDeliveryConsumerTransport,
   parseRedisUint64Reply,
 } from "./redis-delivery-transport.js";
@@ -92,6 +123,11 @@ describe("RedisDeliveryConsumerTransport", () => {
 
     expect(DELIVERY_STREAM_INITIALIZATION_ENTRY_MAX_BYTES).toBe(87);
     expect(encodedBytes).toBe(DELIVERY_STREAM_INITIALIZATION_ENTRY_MAX_BYTES);
+  });
+
+  it("keeps the authorized XINFO response surface calculable", () => {
+    expect(REDIS_DELIVERY_XINFO_FIXED_SCALAR_MAX_BYTES).toBe(360);
+    expect(REDIS_DELIVERY_XINFO_AUTHORIZED_RESPONSE_MAX_BYTES).toBe(264_964);
   });
 
   it("uses one atomic Redis-side initializer and verifies the exact sentinel", async () => {
@@ -231,12 +267,10 @@ describe("RedisDeliveryConsumerTransport", () => {
     const metadata = await transport.inspect({ signal: new AbortController().signal });
 
     expect(metadata.entriesAdded).toBe("9007199254740993");
-    const inspection = redisMock
-      .commands()
-      .find(([name, script]) => name === "EVAL" && script?.includes("exact_entries_added"));
-    expect(inspection?.[1]).toContain("first_id = first_entry[1]");
-    expect(inspection?.[1]).not.toContain("first_entry[2]");
-    expect(redisMock.commands().some(([name]) => name === "XINFO")).toBe(false);
+    expect(redisMock.commands().map(([name]) => name)).toEqual(["INFO", "XINFO", "INFO"]);
+    expect(redisMock.commands().some((command) => command.join(" ").includes("XGROUP"))).toBe(
+      false,
+    );
     await transport.close();
   });
 });

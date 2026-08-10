@@ -1,5 +1,14 @@
 import { createClient, RESP_TYPES } from "redis";
-import { redisStreamEntryIdSchema } from "@converge/protocol";
+import {
+  DELIVERY_ENVELOPE_MAX_BYTES,
+  DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES,
+  DELIVERY_STREAM_ENTRY_MAX_BYTES,
+  REDIS_STREAM_ENTRY_ID_MAX_BYTES,
+  decodeDeliveryStreamFieldPairs,
+  deliveryStreamFieldsSchema,
+  redisStreamEntryIdSchema,
+  validateDeliveryStreamEntrySize,
+} from "@converge/protocol";
 import type {
   REDIS_DELIVERY_BLOCK_MS,
   REDIS_DELIVERY_READ_COUNT,
@@ -12,6 +21,7 @@ import {
   DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
   DELIVERY_STREAM_INITIALIZATION_TYPE,
   DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+  DELIVERY_STREAM_INITIALIZATION_ENTRY_MAX_BYTES,
   isCanonicalDeliveryStreamGeneration,
 } from "./delivery-stream-sentinel.js";
 
@@ -22,7 +32,40 @@ export {
 } from "./delivery-stream-sentinel.js";
 
 const UINT64_MAXIMUM = 18_446_744_073_709_551_615n;
-const INVALID_PROJECTION_STATUS = "2";
+const XINFO_STREAM_FIELD_NAMES = Object.freeze([
+  "length",
+  "radix-tree-keys",
+  "radix-tree-nodes",
+  "last-generated-id",
+  "max-deleted-entry-id",
+  "entries-added",
+  "recorded-first-entry-id",
+  "groups",
+  "first-entry",
+  "last-entry",
+] as const);
+const XINFO_STREAM_COUNTER_FIELDS = Object.freeze([
+  "length",
+  "radix-tree-keys",
+  "radix-tree-nodes",
+  "entries-added",
+  "groups",
+] as const);
+const XINFO_STREAM_ID_FIELDS = Object.freeze([
+  "last-generated-id",
+  "max-deleted-entry-id",
+  "recorded-first-entry-id",
+] as const);
+const REDIS_UINT64_MAX_DECIMAL_BYTES = 20;
+export const REDIS_DELIVERY_XINFO_FIXED_SCALAR_MAX_BYTES =
+  XINFO_STREAM_FIELD_NAMES.reduce((total, field) => total + field.length, 0) +
+  XINFO_STREAM_COUNTER_FIELDS.length * REDIS_UINT64_MAX_DECIMAL_BYTES +
+  XINFO_STREAM_ID_FIELDS.length * REDIS_STREAM_ENTRY_ID_MAX_BYTES;
+export const REDIS_DELIVERY_XINFO_RESP_OVERHEAD_MAX_BYTES = 2_048;
+export const REDIS_DELIVERY_XINFO_AUTHORIZED_RESPONSE_MAX_BYTES =
+  2 * DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES +
+  REDIS_DELIVERY_XINFO_FIXED_SCALAR_MAX_BYTES +
+  REDIS_DELIVERY_XINFO_RESP_OVERHEAD_MAX_BYTES;
 const INITIALIZE_STREAM_SCRIPT = `
 local function is_canonical_generation(value)
   if type(value) ~= 'string' or string.len(value) ~= 36 then
@@ -112,133 +155,6 @@ if #fields ~= 4 or
 return {1}
 `;
 
-const INSPECT_STREAM_SCRIPT = `
-local function invalid() return {2} end
-
-local function is_bounded_id(value)
-  if type(value) ~= 'string' or string.len(value) < 3 or string.len(value) > 41 then return false end
-  local milliseconds, sequence = string.match(value, '^(%d+)%-(%d+)$')
-  if not milliseconds or not sequence then return false end
-  if (#milliseconds > 1 and string.sub(milliseconds, 1, 1) == '0') or
-     (#sequence > 1 and string.sub(sequence, 1, 1) == '0') then return false end
-  if #milliseconds > 20 or #sequence > 20 then return false end
-  local maximum = '18446744073709551615'
-  if (#milliseconds == 20 and milliseconds > maximum) or
-     (#sequence == 20 and sequence > maximum) then return false end
-  return true
-end
-
-local function add_small(decimal, addition)
-  local output = {}
-  local carry = addition
-  for index = #decimal, 1, -1 do
-    local sum = string.byte(decimal, index) - 48 + (carry % 10)
-    carry = math.floor(carry / 10)
-    if sum >= 10 then
-      sum = sum - 10
-      carry = carry + 1
-    end
-    output[index] = string.char(48 + sum)
-  end
-  while carry > 0 do
-    table.insert(output, 1, string.char(48 + (carry % 10)))
-    carry = math.floor(carry / 10)
-  end
-  return table.concat(output)
-end
-
-local function exact_entries_added(stream_info, last_generated_id, group_suffix)
-  local entries_added
-  for index = 1, #stream_info, 2 do
-    if stream_info[index] == 'entries-added' then entries_added = stream_info[index + 1] end
-  end
-  if type(entries_added) ~= 'number' or entries_added < 0 then return nil end
-  if entries_added <= 9007199254740991 then return string.format('%.0f', entries_added) end
-
-  -- Redis Lua 5.1 receives RESP integers as doubles. Recover the exact low bits from a temporary
-  -- group lag whose ENTRIESREAD baseline is deliberately below the rounded double value.
-  local baseline = string.format('%.0f', entries_added - 8192)
-  local group = 'converge:metadata:' .. group_suffix
-  local created = redis.pcall(
-    'XGROUP', 'CREATE', KEYS[1], group, last_generated_id, 'ENTRIESREAD', baseline
-  )
-  if type(created) ~= 'table' or created.err then return nil end
-  local groups = redis.pcall('XINFO', 'GROUPS', KEYS[1])
-  local lag
-  if type(groups) == 'table' and not groups.err then
-    for _, candidate in ipairs(groups) do
-      local name
-      local candidate_lag
-      for index = 1, #candidate, 2 do
-        if candidate[index] == 'name' then name = candidate[index + 1] end
-        if candidate[index] == 'lag' then candidate_lag = candidate[index + 1] end
-      end
-      if name == group then lag = candidate_lag end
-    end
-  end
-  local destroyed = redis.pcall('XGROUP', 'DESTROY', KEYS[1], group)
-  if destroyed ~= 1 or type(lag) ~= 'number' or lag < 0 or lag > 16384 or lag % 1 ~= 0 then
-    return nil
-  end
-  return add_small(baseline, lag)
-end
-
-if type(ARGV[1]) ~= 'string' or
-   string.len(ARGV[1]) ~= 36 or
-   not string.match(ARGV[1], '^[0-9a-f%-]+$') then return invalid() end
-
-local server = redis.pcall('INFO', 'SERVER')
-if type(server) ~= 'string' then return invalid() end
-local incarnation = string.match(server, '\\nrun_id:([0-9a-f]+)\\r?\\n') or
-                    string.match(server, '^run_id:([0-9a-f]+)\\r?\\n')
-if not incarnation or #incarnation ~= 40 then return invalid() end
-if redis.call('EXISTS', KEYS[1]) == 0 then return {0, incarnation} end
-
-local info = redis.pcall('XINFO', 'STREAM', KEYS[1])
-if type(info) ~= 'table' or info.err then return invalid() end
-local length
-local first_entry
-local last_entry
-local last_generated_id
-local max_deleted_entry_id = '0-0'
-for index = 1, #info, 2 do
-  local name = info[index]
-  local value = info[index + 1]
-  if name == 'length' then length = value end
-  if name == 'first-entry' then first_entry = value end
-  if name == 'last-entry' then last_entry = value end
-  if name == 'last-generated-id' then last_generated_id = value end
-  if name == 'max-deleted-entry-id' then max_deleted_entry_id = value end
-end
-if type(length) ~= 'number' or length < 0 or length > 9007199254740991 or length % 1 ~= 0 or
-   not is_bounded_id(last_generated_id) or not is_bounded_id(max_deleted_entry_id) then
-  return invalid()
-end
-
-local first_id = ''
-local last_id = ''
-if length == 0 then
-  if first_entry or last_entry then return invalid() end
-else
-  if type(first_entry) ~= 'table' or type(last_entry) ~= 'table' or
-     not is_bounded_id(first_entry[1]) or not is_bounded_id(last_entry[1]) then return invalid() end
-  first_id = first_entry[1]
-  last_id = last_entry[1]
-end
-local entries_added = exact_entries_added(info, last_generated_id, ARGV[1])
-if not entries_added or #entries_added > 20 then return invalid() end
-return {
-  1,
-  incarnation,
-  string.format('%.0f', length),
-  first_id,
-  last_id,
-  last_generated_id,
-  max_deleted_entry_id,
-  entries_added
-}
-`;
-
 function createResp2Client(redisUrl: string) {
   return createClient({
     url: redisUrl,
@@ -247,8 +163,8 @@ function createResp2Client(redisUrl: string) {
     RESP: 2,
     socket: { reconnectStrategy: false },
   }).withTypeMapping({
-    // Preserve script statuses as strings. The metadata script itself emits counters as bounded
-    // decimal bulk strings because Redis Lua receives XINFO integer replies as doubles.
+    // Preserve script statuses and direct XINFO counters as exact canonical decimal strings.
+    // No metadata counter passes through JavaScript Number or Redis Lua's double representation.
     [RESP_TYPES.NUMBER]: String,
   });
 }
@@ -299,6 +215,145 @@ function parseEntry(value: unknown): RawDeliveryStreamEntry {
       asBulkString(rawFields[index + 1], "Redis returned an invalid stream field value"),
     ]);
   return { id, fields };
+}
+
+function flatRecord(value: unknown, message: string): Map<string, unknown> {
+  const values = asArray(value, message);
+  if (values.length % 2 !== 0) throw new Error(message);
+  const result = new Map<string, unknown>();
+  for (let index = 0; index < values.length; index += 2) {
+    const key = asString(values[index], message);
+    if (result.has(key)) throw new Error(message);
+    result.set(key, values[index + 1]);
+  }
+  return result;
+}
+
+function parseRunId(info: unknown): string {
+  if (typeof info !== "string") throw new Error("Redis INFO SERVER returned invalid evidence");
+  const runId = /^run_id:([0-9a-f]{40})$/m.exec(info)?.[1];
+  if (!runId) throw new Error("Redis INFO SERVER returned invalid evidence");
+  return runId;
+}
+
+interface BoundedMetadataEntry {
+  entry: RawDeliveryStreamEntry;
+  encodedBytes: number;
+}
+
+function invalidXinfoEvidence(): Error {
+  return new Error("Redis XINFO STREAM returned invalid bounded evidence");
+}
+
+function isInitializationSentinel(entry: RawDeliveryStreamEntry): boolean {
+  return (
+    entry.fields.length === 2 &&
+    entry.fields[0]?.[0] === DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD &&
+    entry.fields[0]?.[1] === DELIVERY_STREAM_INITIALIZATION_TYPE &&
+    entry.fields[1]?.[0] === DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD &&
+    isCanonicalDeliveryStreamGeneration(entry.fields[1]?.[1])
+  );
+}
+
+function parseBoundedMetadataEntry(value: unknown): BoundedMetadataEntry | null {
+  if (value === null) return null;
+  let entry: RawDeliveryStreamEntry;
+  try {
+    entry = parseEntry(value);
+  } catch {
+    throw invalidXinfoEvidence();
+  }
+  if (!redisStreamEntryIdSchema.safeParse(entry.id).success) throw invalidXinfoEvidence();
+  const idBytes = Buffer.byteLength(entry.id, "utf8");
+  if (isInitializationSentinel(entry))
+    return {
+      entry,
+      encodedBytes: idBytes + DELIVERY_STREAM_INITIALIZATION_ENTRY_MAX_BYTES,
+    };
+
+  try {
+    decodeDeliveryStreamFieldPairs(entry.fields, DELIVERY_ENVELOPE_MAX_BYTES);
+  } catch {
+    throw invalidXinfoEvidence();
+  }
+  const fields = deliveryStreamFieldsSchema.safeParse(Object.fromEntries(entry.fields));
+  if (!fields.success) throw invalidXinfoEvidence();
+  const size = validateDeliveryStreamEntrySize(fields.data);
+  if (!size.valid || size.entryBytes > DELIVERY_STREAM_ENTRY_MAX_BYTES)
+    throw invalidXinfoEvidence();
+  return { entry, encodedBytes: idBytes + size.entryBytes };
+}
+
+function entriesEqual(left: RawDeliveryStreamEntry, right: RawDeliveryStreamEntry): boolean {
+  return (
+    left.id === right.id &&
+    left.fields.length === right.fields.length &&
+    left.fields.every(
+      ([name, value], index) =>
+        right.fields[index]?.[0] === name && right.fields[index]?.[1] === value,
+    )
+  );
+}
+
+function requiredXinfoValue(info: Map<string, unknown>, field: string): unknown {
+  if (!info.has(field)) throw invalidXinfoEvidence();
+  return info.get(field);
+}
+
+function parseXinfoMetadata(response: unknown, incarnation: string): DeliveryStreamMetadata {
+  let info: Map<string, unknown>;
+  try {
+    info = flatRecord(response, "Redis XINFO STREAM returned invalid bounded evidence");
+  } catch {
+    throw invalidXinfoEvidence();
+  }
+  if (
+    info.size !== XINFO_STREAM_FIELD_NAMES.length ||
+    XINFO_STREAM_FIELD_NAMES.some((field) => !info.has(field))
+  )
+    throw invalidXinfoEvidence();
+
+  const counters = new Map<string, string>();
+  for (const field of XINFO_STREAM_COUNTER_FIELDS)
+    counters.set(
+      field,
+      parseRedisUint64Reply(requiredXinfoValue(info, field), "Redis XINFO counter is invalid"),
+    );
+  if (counters.get("groups") !== "0") throw invalidXinfoEvidence();
+
+  const ids = new Map<string, string>();
+  for (const field of XINFO_STREAM_ID_FIELDS) {
+    const id = asBulkString(requiredXinfoValue(info, field), "Redis XINFO stream ID is invalid");
+    if (!redisStreamEntryIdSchema.safeParse(id).success && id !== ZERO_STREAM_ID)
+      throw invalidXinfoEvidence();
+    ids.set(field, id);
+  }
+
+  const first = parseBoundedMetadataEntry(requiredXinfoValue(info, "first-entry"));
+  const last = parseBoundedMetadataEntry(requiredXinfoValue(info, "last-entry"));
+  const length = counters.get("length");
+  if (!length || (length === "0") !== (first === null && last === null))
+    throw invalidXinfoEvidence();
+  if (length !== "0" && (first === null || last === null)) throw invalidXinfoEvidence();
+  if (first && last && first.entry.id === last.entry.id && !entriesEqual(first.entry, last.entry))
+    throw invalidXinfoEvidence();
+
+  // Account a single retained entry once when Redis repeats it as both first-entry and last-entry.
+  const uniqueEntryBytes =
+    (first?.encodedBytes ?? 0) +
+    (last && last.entry.id !== first?.entry.id ? last.encodedBytes : 0);
+  if (uniqueEntryBytes > 2 * DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES) throw invalidXinfoEvidence();
+
+  return {
+    exists: true,
+    length,
+    firstEntryId: first?.entry.id ?? null,
+    lastEntryId: last?.entry.id ?? null,
+    lastGeneratedId: ids.get("last-generated-id") ?? ZERO_STREAM_ID,
+    maxDeletedEntryId: ids.get("max-deleted-entry-id") ?? ZERO_STREAM_ID,
+    entriesAdded: counters.get("entries-added") ?? "0",
+    incarnation,
+  };
 }
 
 function absentMetadata(incarnation: string): DeliveryStreamMetadata {
@@ -417,63 +472,33 @@ export class RedisDeliveryConsumerTransport implements DeliveryConsumerTransport
 
   async inspect(input: { signal: AbortSignal }): Promise<DeliveryStreamMetadata> {
     const control = this.requireControl();
-    const response = asArray(
-      await control.sendCommand(
-        ["EVAL", INSPECT_STREAM_SCRIPT, "1", this.streamKey, crypto.randomUUID()],
-        {
-          abortSignal: input.signal,
-        },
-      ),
-      "Redis stream metadata projection returned an invalid response",
+    const incarnation = parseRunId(
+      await control.sendCommand(["INFO", "SERVER"], { abortSignal: input.signal }),
     );
-    const status = parseRedisUint64Reply(
-      response[0],
-      "Redis stream metadata projection returned an invalid status",
-    );
-    if (status === INVALID_PROJECTION_STATUS)
-      throw new Error("Redis stream metadata projection returned invalid evidence");
-    const incarnation = asBulkString(
-      response[1],
-      "Redis stream metadata projection omitted the incarnation",
-    );
-    if (status === "0") {
-      if (response.length !== 2)
-        throw new Error("Redis stream metadata projection returned inconsistent absence evidence");
+    let response: unknown;
+    try {
+      response = await control.sendCommand(["XINFO", "STREAM", this.streamKey], {
+        abortSignal: input.signal,
+      });
+    } catch (error) {
+      const exists = parseRedisUint64Reply(
+        await control.sendCommand(["EXISTS", this.streamKey], { abortSignal: input.signal }),
+        "Redis EXISTS returned invalid evidence",
+      );
+      if (exists !== "0") throw error;
+      const confirmedIncarnation = parseRunId(
+        await control.sendCommand(["INFO", "SERVER"], { abortSignal: input.signal }),
+      );
+      if (confirmedIncarnation !== incarnation)
+        throw new Error("Redis metadata commands observed conflicting server incarnations");
       return absentMetadata(incarnation);
     }
-    if (status !== "1" || response.length !== 8)
-      throw new Error("Redis stream metadata projection returned invalid evidence");
-    const length = parseRedisUint64Reply(
-      response[2],
-      "Redis stream metadata projection omitted length",
+    const confirmedIncarnation = parseRunId(
+      await control.sendCommand(["INFO", "SERVER"], { abortSignal: input.signal }),
     );
-    const firstEntryId = asBulkString(
-      response[3],
-      "Redis stream metadata projection omitted the first entry ID",
-    );
-    const lastEntryId = asBulkString(
-      response[4],
-      "Redis stream metadata projection omitted the last entry ID",
-    );
-    return {
-      exists: true,
-      length,
-      firstEntryId: firstEntryId === "" ? null : firstEntryId,
-      lastEntryId: lastEntryId === "" ? null : lastEntryId,
-      lastGeneratedId: asBulkString(
-        response[5],
-        "Redis stream metadata projection omitted last-generated-id",
-      ),
-      maxDeletedEntryId: asBulkString(
-        response[6],
-        "Redis stream metadata projection omitted max-deleted-entry-id",
-      ),
-      entriesAdded: parseRedisUint64Reply(
-        response[7],
-        "Redis stream metadata projection omitted entries-added",
-      ),
-      incarnation,
-    };
+    if (confirmedIncarnation !== incarnation)
+      throw new Error("Redis metadata commands observed conflicting server incarnations");
+    return parseXinfoMetadata(response, incarnation);
   }
 
   async readAfter(input: {

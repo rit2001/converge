@@ -354,16 +354,22 @@ clamping when `maximumEnvelopeBytes` is below the 128 KiB producer contract, the
 is below 100, or the global byte limit cannot hold
 `100 × (configured envelope + 165 + 41)`. This calculation does not constrain unauthorized writes.
 
-Ordinary metadata inspection no longer returns payload-bearing `first-entry`/`last-entry` arrays.
-A bounded Lua projection runs `INFO`/`XINFO` inside Redis, validates IDs and shapes, and returns only
-a fixed status tuple, the 40-byte server incarnation, exact decimal counters, and required IDs.
-Sentinel initialization and verification validate field count, ordered names, fixed control type,
-36-byte generation length, and canonical UUID-v4 syntax inside Redis; invalid or oversized evidence
-returns only a constant status. Because Redis Lua 5.1 represents RESP integers as doubles, the
-projection preserves `entries-added` above `Number.MAX_SAFE_INTEGER` by atomically creating and
-destroying a bounded temporary group whose small lag recovers the rounded low bits. All output
-branches are structurally and byte bounded. This removes avoidable metadata materialization in
-JavaScript; it does not solve a live oversized `XREAD` from an unauthorized writer.
+Ordinary metadata inspection is read-only. It issues `INFO SERVER`, direct `XINFO STREAM`, then
+`INFO SERVER` again; a conflicting incarnation fails closed. node-redis maps every RESP integer to a
+canonical decimal string, so `entries-added` and every other counter remain uint64-exact without Lua
+numeric conversion or temporary consumer-group writes. Sentinel initialization and verification
+remain bounded Lua scripts that validate field count, ordered names, fixed control type, 36-byte
+generation length, and canonical UUID-v4 syntax before returning token evidence.
+
+Direct `XINFO STREAM` materializes its payload-bearing `first-entry` and `last-entry` arrays. Under the
+trusted authorized-writer contract, each is strictly validated after decoding as either the fixed
+87-byte sentinel or a complete worker entry capped at 131,237 field/name bytes plus a 41-byte ID.
+Malformed or oversized evidence fails with a bounded constant diagnostic. When first and last have
+the same ID, their structures must match and application accounting includes that entry only once.
+The conservative maximum normal authorized XINFO response is 264,964 bytes:
+`2 × 131,278 + 360 + 2,048` for two maximum decoded entry occurrences, fixed metadata names/scalars,
+and RESP2 aggregate/header allowance. This calculation is not a node-redis decoder limit and does not
+protect against a malicious Redis server or unauthorized writer.
 
 The initial internal payload union is exact and versioned:
 

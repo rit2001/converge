@@ -111,7 +111,7 @@ decoded batch bound of 13,127,800 bytes (or 13,179,256 bytes with the conservati
 Invalid relationships between the producer maximum, count, and queue limits are rejected, not
 clamped.
 
-### Trusted writer boundary and metadata projection
+### Trusted writer boundary and read-only metadata inspection
 
 The Redis delivery service is trusted infrastructure: private, authenticated, not public/browser
 reachable, and writable only by the worker for validated delivery entries and the API for the fixed
@@ -119,11 +119,21 @@ sentinel. Production must add private networking, TLS where supported, separate 
 credentials where supported, credential rotation, and monitoring for unexpected writers, malformed
 entries, and stream growth. Local Compose does not yet claim these controls.
 
-`XINFO STREAM` includes complete first/last field/value tuples. The API therefore calls it only inside
-a Lua projection and returns to JavaScript a fixed tuple of status, validated scalar IDs, exact
-counters, and server incarnation. Sentinel scripts validate exact field count/order/names, fixed
-control type, and canonical 36-byte UUID-v4 generation before returning token evidence. Oversized or
-invalid evidence produces a constant bounded status; ordinary inspection never returns entry fields.
+`XINFO STREAM` includes complete first/last field/value tuples. The API issues it directly through the
+RESP2 node-redis client with RESP integers mapped to canonical decimal strings, so `entries-added` and
+the other uint64 counters never pass through JavaScript `Number` or Redis Lua's double conversion.
+`INFO SERVER` runs before and after `XINFO`; a conflicting server incarnation fails closed. Ordinary
+inspection is read-only and never creates, updates, or destroys a consumer group.
+
+Direct `XINFO` materializes first/last payloads before application checks. Under the trusted-writer
+boundary, each is either the fixed 87-byte sentinel or a worker entry capped at 131,237 field/name
+bytes plus a 41-byte stream ID. The API strictly validates each decoded structure and its complete
+UTF-8 size, emits only bounded diagnostics on failure, and counts one entry once when first and last
+have the same ID and fields. The conservative normal authorized response surface is 264,964 bytes:
+`2 × 131,278` maximum decoded entries, 360 bytes of fixed metadata names/scalars, and 2,048 bytes of
+RESP2 aggregate/header allowance. This is not a node-redis allocation limit. Sentinel scripts still
+validate exact field count/order/names, fixed control type, and canonical 36-byte UUID-v4 generation
+before returning token evidence.
 
 The installed `redis@6.2.0` decoder has no supported maximum decoded bulk-string option and `XREAD`
 materializes complete entries before application validation. Compose Redis 8.2 has no `XREAD

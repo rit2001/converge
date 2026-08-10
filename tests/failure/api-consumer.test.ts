@@ -20,6 +20,7 @@ import { createClient, type RedisClientType } from "redis";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 const streamKeys = new Set<string>();
+const aclUsers = new Set<string>();
 const consumers = new Set<RedisDeliveryConsumer>();
 let publisher: RedisClientType;
 
@@ -330,6 +331,45 @@ async function rawStreamEntries(
   });
 }
 
+async function createRestrictedApiRedisUrl(
+  key: string,
+  options: { allowSentinelWrite?: boolean } = {},
+): Promise<string> {
+  const username = `converge_m24a_${randomUUID().replaceAll("-", "")}`;
+  const password = randomUUID().replaceAll("-", "");
+  aclUsers.add(username);
+  await publisher.sendCommand([
+    "ACL",
+    "SETUSER",
+    username,
+    "reset",
+    "on",
+    `>${password}`,
+    `~${key}`,
+    "+ping",
+    "+hello",
+    "+client|setinfo",
+    "+eval",
+    "+info",
+    "+exists",
+    "+xinfo",
+    "+xrange",
+    "+xread",
+    options.allowSentinelWrite === false ? "-xadd" : "+xadd",
+    "-xgroup",
+  ]);
+  const restricted = new URL(redisUrl);
+  restricted.username = username;
+  restricted.password = password;
+  return restricted.toString();
+}
+
+async function consumerGroups(key: string): Promise<unknown[]> {
+  const groups = await publisher.sendCommand(["XINFO", "GROUPS", key]);
+  if (!Array.isArray(groups)) throw new Error("Redis XINFO GROUPS returned invalid evidence");
+  return groups;
+}
+
 function deliveryGate(): {
   promise: Promise<DeliveryContext>;
   deliver: (context: DeliveryContext) => Promise<void>;
@@ -401,6 +441,8 @@ afterEach(async () => {
   consumers.clear();
   if (streamKeys.size > 0) await publisher.sendCommand(["DEL", ...streamKeys]);
   streamKeys.clear();
+  if (aclUsers.size > 0) await publisher.sendCommand(["ACL", "DELUSER", ...aclUsers]);
+  aclUsers.clear();
 });
 
 afterAll(() => {
@@ -408,7 +450,7 @@ afterAll(() => {
 });
 
 describe("real Redis independent delivery consumers", () => {
-  it("projects only bounded evidence for oversized malformed first/last metadata entries", async () => {
+  it("rejects oversized malformed first/last XINFO evidence with a bounded diagnostic", async () => {
     const key = uniqueStreamKey();
     const oversized = `must-not-cross-js:${"x".repeat(512 * 1024)}`;
     await publisher.sendCommand([
@@ -440,16 +482,18 @@ describe("real Redis independent delivery consumers", () => {
       );
       expect((initializationError as Error).message.length).toBeLessThan(100);
 
-      const metadata = await transport.inspect({ signal: new AbortController().signal });
-      const projected = JSON.stringify(metadata);
-      expect(metadata).toMatchObject({
-        length: "2",
-        firstEntryId: "1-0",
-        lastEntryId: "2-0",
-        entriesAdded: "2",
-      });
-      expect(projected.length).toBeLessThan(512);
-      expect(projected).not.toContain("must-not-cross-js");
+      let inspectionError: unknown;
+      try {
+        await transport.inspect({ signal: new AbortController().signal });
+      } catch (error) {
+        inspectionError = error;
+      }
+      expect(inspectionError).toBeInstanceOf(Error);
+      expect((inspectionError as Error).message).toBe(
+        "Redis XINFO STREAM returned invalid bounded evidence",
+      );
+      expect((inspectionError as Error).message.length).toBeLessThan(100);
+      expect((inspectionError as Error).message).not.toContain("must-not-cross-js");
     } finally {
       await transport.close();
     }
@@ -457,7 +501,7 @@ describe("real Redis independent delivery consumers", () => {
 
   it("preserves XINFO entries-added above Number.MAX_SAFE_INTEGER", async () => {
     const key = uniqueStreamKey();
-    await publisher.sendCommand(["XADD", key, "1-0", "control", "test"]);
+    await appendAt(key, "1-0", envelope(1));
     await publisher.sendCommand(["XSETID", key, "1-0", "ENTRIESADDED", "9007199254740993"]);
     const transport = new RedisDeliveryConsumerTransport(redisUrl, key);
 
@@ -468,6 +512,145 @@ describe("real Redis independent delivery consumers", () => {
     } finally {
       await transport.close();
     }
+  });
+
+  it("keeps exact high-counter inspection compatible with an API ACL that denies XGROUP", async () => {
+    const key = uniqueStreamKey();
+    await appendAt(key, "1-0", envelope(1));
+    await publisher.sendCommand(["XSETID", key, "1-0", "ENTRIESADDED", "9007199254740993"]);
+    const restrictedRedisUrl = await createRestrictedApiRedisUrl(key, {
+      allowSentinelWrite: false,
+    });
+    const transport = new RedisDeliveryConsumerTransport(restrictedRedisUrl, key);
+
+    expect(await consumerGroups(key)).toEqual([]);
+    try {
+      await transport.connect();
+      await expect(
+        transport.inspect({ signal: new AbortController().signal }),
+      ).resolves.toMatchObject({ entriesAdded: "9007199254740993" });
+    } finally {
+      await transport.close();
+    }
+    expect(await consumerGroups(key)).toEqual([]);
+  });
+
+  it("issues no XGROUP mutation while inspecting an exact high counter", async () => {
+    const key = uniqueStreamKey();
+    await appendAt(key, "1-0", envelope(1));
+    await publisher.sendCommand(["XSETID", key, "1-0", "ENTRIESADDED", "9007199254740993"]);
+    const monitored: string[] = [];
+    const monitor = createClient({ url: redisUrl });
+    monitor.on("error", () => undefined);
+    const transport = new RedisDeliveryConsumerTransport(redisUrl, key);
+
+    try {
+      await monitor.connect();
+      await monitor.monitor((reply) => monitored.push(String(reply)));
+      await transport.connect();
+      await transport.inspect({ signal: new AbortController().signal });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await monitor.reset();
+    } finally {
+      if (monitor.isOpen) monitor.destroy();
+      await transport.close();
+    }
+
+    const commandsForKey = monitored.filter((command) => command.includes(key));
+    expect(
+      commandsForKey.filter((command) => /"XGROUP" "(?:CREATE|DESTROY)"/i.test(command)),
+    ).toEqual([]);
+    expect(await consumerGroups(key)).toEqual([]);
+  });
+
+  it("uses only the fixed sentinel write when a restricted API initializes an absent stream", async () => {
+    const key = uniqueStreamKey();
+    const restrictedRedisUrl = await createRestrictedApiRedisUrl(key);
+    const monitored: string[] = [];
+    const monitor = createClient({ url: redisUrl });
+    monitor.on("error", () => undefined);
+    const consumer = new RedisDeliveryConsumer(
+      new RedisDeliveryConsumerTransport(restrictedRedisUrl, key),
+      {
+        deliver: () => Promise.resolve(),
+        quarantine: () => Promise.resolve(),
+        lifecycle: () => undefined,
+      },
+    );
+    consumers.add(consumer);
+
+    try {
+      await monitor.connect();
+      await monitor.monitor((reply) => monitored.push(String(reply)));
+      await consumer.start();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await monitor.reset();
+    } finally {
+      if (monitor.isOpen) monitor.destroy();
+    }
+
+    const entries = await rawStreamEntries(key);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.fields).toEqual([
+      DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+      DELIVERY_STREAM_INITIALIZATION_TYPE,
+      DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    ]);
+    const luaWrites = monitored.filter(
+      (command) =>
+        command.includes(key) &&
+        command.includes("[0 lua]") &&
+        /"(?:XADD|XGROUP|XSETID|XDEL|XTRIM|DEL|SET)"/i.test(command),
+    );
+    expect(luaWrites).toHaveLength(1);
+    expect(luaWrites[0]).toMatch(/"XADD"/i);
+    expect(await consumerGroups(key)).toEqual([]);
+  });
+
+  it("starts, recovers, and resumes delivery with XGROUP denied", async () => {
+    const key = uniqueStreamKey();
+    const historicalId = await appendAt(key, "1-0", envelope(1));
+    const restrictedRedisUrl = await createRestrictedApiRedisUrl(key, {
+      allowSentinelWrite: false,
+    });
+    const transport = new ControlledFirstReadFailureTransport(
+      new RedisDeliveryConsumerTransport(restrictedRedisUrl, key),
+    );
+    const delivered = deliveryGate();
+    const recovered = deferred<void>();
+    const lifecycle: DeliveryConsumerLifecycleEvent[] = [];
+    const consumer = new RedisDeliveryConsumer(transport, {
+      deliver: delivered.deliver,
+      quarantine: () => Promise.resolve(),
+      lifecycle: (event) => {
+        lifecycle.push(event);
+        if (event.state === "recovered") recovered.resolve();
+      },
+    });
+    consumers.add(consumer);
+
+    await consumer.start();
+    expect(consumer.lastHandledCursor).toBe(historicalId);
+    transport.failFirstRead();
+    await withDeadline(recovered.promise);
+    const value = envelope(2);
+    const id = await append(key, value);
+    await expect(withDeadline(delivered.promise)).resolves.toEqual({
+      redisEntryId: id,
+      envelope: value,
+    });
+
+    expect(lifecycle.map(({ state }) => state)).toEqual([
+      "starting",
+      "established",
+      "unavailable",
+      "recovering",
+      "recovered",
+    ]);
+    expect(await consumerGroups(key)).toEqual([]);
   });
 
   it("atomically initializes an absent stream once for two independent consumers", async () => {
@@ -761,18 +944,27 @@ describe("real Redis independent delivery consumers", () => {
     const key = uniqueStreamKey();
     const historical = envelope(1);
     const historicalId = await append(key, historical);
+    const restrictedRedisUrl = await createRestrictedApiRedisUrl(key, {
+      allowSentinelWrite: false,
+    });
     const firstGate = deliveryGate();
     const secondGate = deliveryGate();
-    const first = new RedisDeliveryConsumer(new RedisDeliveryConsumerTransport(redisUrl, key), {
-      deliver: firstGate.deliver,
-      quarantine: () => Promise.resolve(),
-      lifecycle: () => undefined,
-    });
-    const second = new RedisDeliveryConsumer(new RedisDeliveryConsumerTransport(redisUrl, key), {
-      deliver: secondGate.deliver,
-      quarantine: () => Promise.resolve(),
-      lifecycle: () => undefined,
-    });
+    const first = new RedisDeliveryConsumer(
+      new RedisDeliveryConsumerTransport(restrictedRedisUrl, key),
+      {
+        deliver: firstGate.deliver,
+        quarantine: () => Promise.resolve(),
+        lifecycle: () => undefined,
+      },
+    );
+    const second = new RedisDeliveryConsumer(
+      new RedisDeliveryConsumerTransport(restrictedRedisUrl, key),
+      {
+        deliver: secondGate.deliver,
+        quarantine: () => Promise.resolve(),
+        lifecycle: () => undefined,
+      },
+    );
     consumers.add(first);
     consumers.add(second);
 
@@ -792,9 +984,10 @@ describe("real Redis independent delivery consumers", () => {
     expect(secondDelivery).toEqual({ redisEntryId: publishedId, envelope: published });
     expect(firstDelivery.envelope.eventId).not.toBe(historical.eventId);
     expect(secondDelivery.envelope.eventId).not.toBe(historical.eventId);
+    expect(await consumerGroups(key)).toEqual([]);
   });
 
-  it("preserves duplicate Redis fields long enough to fail closed", async () => {
+  it("fails closed when XINFO materializes duplicate Redis fields", async () => {
     const key = uniqueStreamKey();
     let resolveError!: (event: DeliveryConsumerLifecycleEvent) => void;
     const lifecycleError = new Promise<DeliveryConsumerLifecycleEvent>((resolve) => {
@@ -808,7 +1001,7 @@ describe("real Redis independent delivery consumers", () => {
       },
       quarantine: () => Promise.resolve(),
       lifecycle: (event) => {
-        if (event.state === "error") resolveError(event);
+        if (event.state === "unavailable") resolveError(event);
       },
     });
     consumers.add(consumer);
@@ -817,7 +1010,7 @@ describe("real Redis independent delivery consumers", () => {
     const value = envelope(1);
     const fields = encodeDeliveryStreamFields(value);
 
-    const entryId = await publisher.sendCommand([
+    await publisher.sendCommand([
       "XADD",
       key,
       "*",
@@ -839,9 +1032,8 @@ describe("real Redis independent delivery consumers", () => {
     const failure = await withDeadline(lifecycleError);
 
     expect(failure).toMatchObject({
-      state: "error",
-      entryId,
-      code: "INVALID_STREAM_ENTRY",
+      state: "unavailable",
+      code: "REDIS_UNAVAILABLE",
       cursor: startupCursor,
     });
     expect(consumer.lastHandledCursor).toBe(startupCursor);

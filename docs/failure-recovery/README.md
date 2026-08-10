@@ -10,9 +10,10 @@ recovery, and snapshot-tail recovery remain deferred to Milestone 2.
 The M2 delivery parser assumes a trusted, private Redis broker and an exact authorized-writer set:
 workers append validated bounded delivery entries, and APIs append only the fixed bounded
 initialization sentinel. Workers measure every field name/value and the complete entry before
-`XADD`; oversized rejection does not mark the PostgreSQL outbox row published. API metadata and
-sentinel inspection execute inside bounded Lua projections so arbitrary first/last payload fields do
-not cross into JavaScript.
+`XADD`; oversized rejection does not mark the PostgreSQL outbox row published. API metadata inspection
+is read-only and decodes exact RESP integer strings directly from `XINFO STREAM`; sentinel creation and
+verification remain bounded Lua operations. XINFO first/last payload fields are materialized and then
+strictly checked against the authorized producer size/shape contracts.
 
 Consumer envelope checks occur after node-redis has decoded `XREAD`. They still prevent handler
 delivery, cursor advancement, and unbounded retained BoardState/queue accounting for malformed or
