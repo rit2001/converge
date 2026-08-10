@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  DELIVERY_ENVELOPE_MAX_BYTES,
+  DELIVERY_STREAM_METADATA_MAX_BYTES,
+  REDIS_STREAM_ENTRY_ID_MAX_BYTES,
   decodeDeliveryStreamFieldPairs,
   redisStreamEntryIdSchema,
   type DeliveryEnvelope,
@@ -12,6 +15,20 @@ export const REDIS_DELIVERY_BLOCK_MS = 5_000 as const;
 export const REDIS_DELIVERY_MAX_BOARD_STATES_UPPER_BOUND = 100_000 as const;
 export const REDIS_DELIVERY_RECONNECT_DELAY_MIN_MS = 1 as const;
 export const REDIS_DELIVERY_RECONNECT_DELAY_MAX_MS = 2_147_483_647 as const;
+export const REDIS_DELIVERY_VALID_BATCH_MAX_DECODED_BYTES =
+  REDIS_DELIVERY_READ_COUNT *
+  (DELIVERY_ENVELOPE_MAX_BYTES +
+    DELIVERY_STREAM_METADATA_MAX_BYTES +
+    REDIS_STREAM_ENTRY_ID_MAX_BYTES);
+// RESP2 aggregate markers and bulk-length headers are additional transient decoder overhead. This
+// conservative wire estimate describes authorized producer output; it is not a node-redis limit.
+export const REDIS_DELIVERY_VALID_BATCH_MAX_WIRE_BYTES =
+  REDIS_DELIVERY_READ_COUNT *
+    (DELIVERY_ENVELOPE_MAX_BYTES +
+      DELIVERY_STREAM_METADATA_MAX_BYTES +
+      REDIS_STREAM_ENTRY_ID_MAX_BYTES +
+      512) +
+  256;
 
 const ZERO_STREAM_ID = "0-0";
 const STREAM_ID_PATTERN = /^(0|[1-9]\d*)-(0|[1-9]\d*)$/;
@@ -76,7 +93,9 @@ export interface DeliveryConsumerConfiguration {
 }
 
 export const defaultDeliveryConsumerConfiguration: Readonly<DeliveryConsumerConfiguration> = {
-  maximumEnvelopeBytes: 128 * 1024,
+  // Semantic producer-contract and post-decoding validation limit. node-redis has already
+  // materialized XREAD bulk strings when this limit executes.
+  maximumEnvelopeBytes: DELIVERY_ENVELOPE_MAX_BYTES,
   globalQueueMaximumEvents: 1_000,
   globalQueueMaximumBytes: 16 * 1024 * 1024,
   boardQuarantineMaximumEvents: 100,
@@ -332,8 +351,15 @@ function validateConfiguration(configuration: DeliveryConsumerConfiguration): vo
       throw new FatalConsumerError("INVALID_CONFIGURATION");
   if (
     configuration.maximumEnvelopeBytes === 0 ||
+    configuration.maximumEnvelopeBytes < DELIVERY_ENVELOPE_MAX_BYTES ||
     configuration.globalQueueMaximumEvents === 0 ||
+    configuration.globalQueueMaximumEvents < REDIS_DELIVERY_READ_COUNT ||
     configuration.globalQueueMaximumBytes === 0 ||
+    configuration.globalQueueMaximumBytes <
+      REDIS_DELIVERY_READ_COUNT *
+        (configuration.maximumEnvelopeBytes +
+          DELIVERY_STREAM_METADATA_MAX_BYTES +
+          REDIS_STREAM_ENTRY_ID_MAX_BYTES) ||
     configuration.boardQuarantineMaximumEvents === 0 ||
     configuration.boardQuarantineMaximumBytes === 0 ||
     configuration.boardDedupeMaximumEvents === 0 ||

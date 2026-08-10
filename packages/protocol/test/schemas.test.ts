@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  DELIVERY_ENVELOPE_MAX_BYTES,
+  DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES,
+  DELIVERY_STREAM_ENTRY_MAX_BYTES,
+  DELIVERY_STREAM_METADATA_MAX_BYTES,
+  REDIS_STREAM_ENTRY_ID_MAX_BYTES,
   boardAccessRevokedEventSchema,
   boardSnapshotSchema,
   createBoardRequestSchema,
@@ -21,6 +26,7 @@ import {
   removeBoardMemberResponseSchema,
   redisStreamEntryIdSchema,
   SCHEMA_VERSION,
+  validateDeliveryStreamEntrySize,
 } from "../src/index.js";
 
 const command = {
@@ -52,6 +58,15 @@ const rectangle = {
 };
 
 describe("protocol schemas", () => {
+  it("keeps the complete delivery-stream producer byte contract calculable", () => {
+    expect(DELIVERY_STREAM_METADATA_MAX_BYTES).toBe(165);
+    expect(DELIVERY_STREAM_ENTRY_MAX_BYTES).toBe(
+      DELIVERY_ENVELOPE_MAX_BYTES + DELIVERY_STREAM_METADATA_MAX_BYTES,
+    );
+    expect(DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES).toBe(
+      DELIVERY_STREAM_ENTRY_MAX_BYTES + REDIS_STREAM_ENTRY_ID_MAX_BYTES,
+    );
+  });
   it("accepts a bounded versioned durable command", () => {
     expect(durableCommandSchema.parse(command)).toEqual(command);
   });
@@ -261,6 +276,7 @@ describe("protocol schemas", () => {
       schemaVersion: envelope.schemaVersion,
     };
     expect(deliveryStreamFieldsSchema.parse(fields)).toEqual(fields);
+    expect(validateDeliveryStreamEntrySize(fields)).toMatchObject({ valid: true });
     expect(decodeDeliveryStreamFields(fields)).toEqual(envelope);
     expect(encodeDeliveryStreamFields(deliveryEnvelopeSchema.parse(reorderedEnvelope)).event).toBe(
       fields.event,

@@ -10,6 +10,7 @@ import {
   deliveryEnvelopeSchema,
   encodeDeliveryStreamFields,
   redisStreamEntryIdSchema,
+  validateDeliveryStreamEntrySize,
 } from "@converge/protocol";
 import {
   RedisXaddAmbiguousError,
@@ -97,8 +98,6 @@ class DeliveryPreparationError extends Error {
   }
 }
 
-const textEncoder = new TextEncoder();
-
 async function withTimeout<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
@@ -153,10 +152,11 @@ function prepareClaim(claim: ClaimedOutboxEvent, maximumEnvelopeBytes: number) {
       "Delivery envelope could not be serialized.",
     );
   }
-  if (textEncoder.encode(fields.event).byteLength > maximumEnvelopeBytes)
+  const entrySize = validateDeliveryStreamEntrySize(fields, maximumEnvelopeBytes);
+  if (!entrySize.valid)
     throw new DeliveryPreparationError(
       "DELIVERY_ENVELOPE_TOO_LARGE",
-      "Delivery envelope exceeds the configured byte limit.",
+      "Delivery stream entry exceeds the configured byte limit.",
     );
   return fields;
 }

@@ -229,34 +229,34 @@ All values are strictly validated configuration, provisional safety bounds, and 
 claims nor SLOs. Changing a value cannot weaken ordering, authorization, fencing, hash, or fail-closed
 invariants.
 
-| Control                        | Initial value                                                    | Why safe as a starting point                                                   | Configuration key                                                                                 | Validation/tuning evidence                             | Benchmark or SLO?                |
-| ------------------------------ | ---------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------------------------------- |
-| Outbox claim batch             | 32 rows; at most one per board                                   | Bounds one claim transaction and leased work.                                  | `OUTBOX_CLAIM_BATCH_SIZE`                                                                         | Claim duration, `outbox_pending_total`, F05/F06        | No; provisional bound.           |
-| Worker publish concurrency     | 8 unrelated boards                                               | Preserves one-per-board ordering and bounds Redis/DB concurrency.              | `OUTBOX_PUBLISH_CONCURRENCY`                                                                      | Publish latency/failures and F05/F06                   | No; provisional bound.           |
-| Outbox lease                   | 60 seconds                                                       | Exceeds the publication timeout while allowing reclamation.                    | `OUTBOX_LEASE_MS`                                                                                 | Lease-expiry count and F02/F04                         | No; provisional bound.           |
-| Redis publication timeout      | 5 seconds                                                        | Prevents a worker slot from waiting without bound.                             | `REDIS_PUBLISH_TIMEOUT_MS`                                                                        | `outbox_publish_failures_total` and F07/F08            | No; provisional bound.           |
-| Empty-outbox poll              | 250 ms with ±20% jitter                                          | Bounds idle database polling and replica synchronization.                      | `OUTBOX_IDLE_POLL_MS`, `OUTBOX_POLL_JITTER_RATIO`                                                 | Claim-query rate and empty-poll test                   | No; provisional bound.           |
-| Retry backoff                  | Full jitter; 250 ms base, 30-second cap                          | Avoids retry synchronization and unbounded delay growth.                       | `OUTBOX_RETRY_BASE_MS`, `OUTBOX_RETRY_CAP_MS`, `OUTBOX_RETRY_JITTER`                              | Retry-delay histogram and F07/F19                      | No; provisional bound.           |
-| Retry/operator-block threshold | 20 claims                                                        | Terminates infinite automatic retry without skipping board order.              | `OUTBOX_MAX_ATTEMPTS`                                                                             | Blocked-row gauge and F19/F20                          | No; provisional policy.          |
-| Delivery envelope              | 128 KiB                                                          | Bounds parsing around the existing 64 KiB command limit.                       | `DELIVERY_ENVELOPE_MAX_BYTES`                                                                     | Rejection count and F11                                | No; provisional bound.           |
-| Redis `XREAD` count            | 100 entries                                                      | Bounds one returned batch and deterministic processing work.                   | `REDIS_XREAD_COUNT`                                                                               | Batch-size histogram and tail-race/batch-failure tests | No; provisional bound.           |
-| Redis `XREAD` block            | 5 seconds                                                        | Periodically returns control for shutdown/readiness without busy polling.      | `REDIS_XREAD_BLOCK_MS`                                                                            | Empty-read/reconnect rate and F09                      | No; provisional bound.           |
-| Stream retention               | Approximate 100,000 entries and 24-hour `MINID` age cap          | Bounds Redis while explicit overrun recovery preserves correctness.            | `REDIS_STREAM_MAXLEN`, `REDIS_STREAM_MAX_AGE_MS`                                                  | Stream length/age, overrun count, F14                  | No; not a retention SLO.         |
-| API global event queue         | 1,000 entries or 16 MiB                                          | Bounds process memory during bursts.                                           | `REDIS_API_QUEUE_MAX_EVENTS`, `REDIS_API_QUEUE_MAX_BYTES`                                         | Queue high-water marks and overflow test               | No; provisional bound.           |
-| API retained board states      | 1,000 boards                                                     | Globally bounds the number of per-board dedupe/quarantine allocations.         | Consumer `maximumBoardStates` (`REDIS_DELIVERY_MAX_BOARD_STATES` when environment wiring lands)   | LRU/capacity/high-cardinality unit tests               | No; provisional bound.           |
-| Per-board quarantine buffer    | 100 entries or 2 MiB                                             | Isolates a board gap without unbounded reordering memory.                      | `DELIVERY_BOARD_BUFFER_MAX_EVENTS`, `DELIVERY_BOARD_BUFFER_MAX_BYTES`                             | Board-buffer high-water marks and F25                  | No; provisional bound.           |
-| Per-board dedupe window        | 256 event ID/sequence pairs                                      | Handles ordinary retry duplicates with bounded board memory.                   | `DELIVERY_DEDUPE_WINDOW_EVENTS`                                                                   | Duplicate distance and F03/F10                         | No; provisional bound.           |
-| Fail-closed socket lifecycle   | 2 seconds maximum                                                | Readiness drops first; forced closure bounds stale socket lifetime.            | `SOCKET_FAIL_CLOSED_TIMEOUT_MS`                                                                   | Disconnect duration and F09/F23                        | No; provisional safety deadline. |
-| Board-head watchdog            | One query of 100 active boards every 5 seconds, ±20% jitter      | Bounds DB load per replica and avoids synchronized polling.                    | `DELIVERY_WATCHDOG_INTERVAL_MS`, `DELIVERY_WATCHDOG_BATCH_SIZE`, `DELIVERY_WATCHDOG_JITTER_RATIO` | Query count/duration and F27/F31                       | No; not a detection SLO.         |
-| Operation tail batch           | 100 operations                                                   | Preserves the accepted M1 synchronization bound.                               | `SYNC_BATCH_SIZE`                                                                                 | Catch-up batches and existing synchronization tests    | No; inherited safety bound.      |
-| Snapshot operation trigger     | 1,000 operations since verified snapshot                         | Bounds tail growth by a configurable count trigger.                            | `SNAPSHOT_OPERATION_INTERVAL`                                                                     | Tail length and snapshot trigger test                  | No; provisional policy.          |
-| Snapshot time trigger          | 24 changed hours                                                 | Creates recovery points for slowly changing boards.                            | `SNAPSHOT_MAX_CHANGED_AGE_MS`                                                                     | Snapshot age and scheduler test                        | No; provisional policy.          |
-| Snapshot retained-byte trigger | 8 MiB estimated operation payload                                | Adds a size-sensitive trigger independent of operation count.                  | `SNAPSHOT_TAIL_BYTES_TRIGGER`                                                                     | Retained-tail bytes and scheduler test                 | No; provisional policy.          |
-| Snapshot payload maximum       | 16 MiB                                                           | Refuses unbounded in-memory serialization; leaves the log intact.              | `SNAPSHOT_MAX_BYTES`                                                                              | `snapshot_size_bytes` and oversize failure test        | No; provisional bound.           |
-| Snapshot retention             | Minimum 2 verified snapshots plus floor and all pinned snapshots | Retains a newest/floor fallback and future version anchors.                    | `SNAPSHOT_MIN_RETAINED`                                                                           | Retention invariant and corruption test                | No; provisional minimum.         |
-| Compaction safety margin       | One verified snapshot generation behind newest                   | Prevents the newest checkpoint from immediately becoming the deletion floor.   | `COMPACTION_SNAPSHOT_SAFETY_GENERATIONS`                                                          | Floor distance and F16/F21/F22                         | No; provisional safety margin.   |
-| Compaction enablement          | Disabled                                                         | Prevents deletion before recovery, corruption, backup, and failure gates pass. | `COMPACTION_ENABLED`                                                                              | M2.7 stop gate and compaction suite                    | No; approved release gate.       |
-| Production Socket.IO transport | WebSocket only                                                   | Avoids unproven sticky-session dependence during horizontal scaling.           | `SOCKET_IO_TRANSPORTS=websocket`                                                                  | Multi-instance Playwright and reconnect tests          | No; deployment policy.           |
+| Control                        | Initial value                                                    | Why safe as a starting point                                                                                            | Configuration key                                                                                 | Validation/tuning evidence                             | Benchmark or SLO?                |
+| ------------------------------ | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------------------------------- |
+| Outbox claim batch             | 32 rows; at most one per board                                   | Bounds one claim transaction and leased work.                                                                           | `OUTBOX_CLAIM_BATCH_SIZE`                                                                         | Claim duration, `outbox_pending_total`, F05/F06        | No; provisional bound.           |
+| Worker publish concurrency     | 8 unrelated boards                                               | Preserves one-per-board ordering and bounds Redis/DB concurrency.                                                       | `OUTBOX_PUBLISH_CONCURRENCY`                                                                      | Publish latency/failures and F05/F06                   | No; provisional bound.           |
+| Outbox lease                   | 60 seconds                                                       | Exceeds the publication timeout while allowing reclamation.                                                             | `OUTBOX_LEASE_MS`                                                                                 | Lease-expiry count and F02/F04                         | No; provisional bound.           |
+| Redis publication timeout      | 5 seconds                                                        | Prevents a worker slot from waiting without bound.                                                                      | `REDIS_PUBLISH_TIMEOUT_MS`                                                                        | `outbox_publish_failures_total` and F07/F08            | No; provisional bound.           |
+| Empty-outbox poll              | 250 ms with ±20% jitter                                          | Bounds idle database polling and replica synchronization.                                                               | `OUTBOX_IDLE_POLL_MS`, `OUTBOX_POLL_JITTER_RATIO`                                                 | Claim-query rate and empty-poll test                   | No; provisional bound.           |
+| Retry backoff                  | Full jitter; 250 ms base, 30-second cap                          | Avoids retry synchronization and unbounded delay growth.                                                                | `OUTBOX_RETRY_BASE_MS`, `OUTBOX_RETRY_CAP_MS`, `OUTBOX_RETRY_JITTER`                              | Retry-delay histogram and F07/F19                      | No; provisional bound.           |
+| Retry/operator-block threshold | 20 claims                                                        | Terminates infinite automatic retry without skipping board order.                                                       | `OUTBOX_MAX_ATTEMPTS`                                                                             | Blocked-row gauge and F19/F20                          | No; provisional policy.          |
+| Delivery envelope              | 128 KiB; complete entry at most 131,237 bytes                    | Producer checks every UTF-8 field/name and the total before `XADD`; consumer repeats the semantic check after decoding. | `DELIVERY_ENVELOPE_MAX_BYTES`                                                                     | Rejection count and F11                                | No; provisional bound.           |
+| Redis `XREAD` count            | 100 entries                                                      | Bounds one returned batch and deterministic processing work.                                                            | `REDIS_XREAD_COUNT`                                                                               | Batch-size histogram and tail-race/batch-failure tests | No; provisional bound.           |
+| Redis `XREAD` block            | 5 seconds                                                        | Periodically returns control for shutdown/readiness without busy polling.                                               | `REDIS_XREAD_BLOCK_MS`                                                                            | Empty-read/reconnect rate and F09                      | No; provisional bound.           |
+| Stream retention               | Approximate 100,000 entries and 24-hour `MINID` age cap          | Bounds Redis while explicit overrun recovery preserves correctness.                                                     | `REDIS_STREAM_MAXLEN`, `REDIS_STREAM_MAX_AGE_MS`                                                  | Stream length/age, overrun count, F14                  | No; not a retention SLO.         |
+| API global event queue         | 1,000 entries or 16 MiB                                          | Bounds process memory during bursts.                                                                                    | `REDIS_API_QUEUE_MAX_EVENTS`, `REDIS_API_QUEUE_MAX_BYTES`                                         | Queue high-water marks and overflow test               | No; provisional bound.           |
+| API retained board states      | 1,000 boards                                                     | Globally bounds the number of per-board dedupe/quarantine allocations.                                                  | Consumer `maximumBoardStates` (`REDIS_DELIVERY_MAX_BOARD_STATES` when environment wiring lands)   | LRU/capacity/high-cardinality unit tests               | No; provisional bound.           |
+| Per-board quarantine buffer    | 100 entries or 2 MiB                                             | Isolates a board gap without unbounded reordering memory.                                                               | `DELIVERY_BOARD_BUFFER_MAX_EVENTS`, `DELIVERY_BOARD_BUFFER_MAX_BYTES`                             | Board-buffer high-water marks and F25                  | No; provisional bound.           |
+| Per-board dedupe window        | 256 event ID/sequence pairs                                      | Handles ordinary retry duplicates with bounded board memory.                                                            | `DELIVERY_DEDUPE_WINDOW_EVENTS`                                                                   | Duplicate distance and F03/F10                         | No; provisional bound.           |
+| Fail-closed socket lifecycle   | 2 seconds maximum                                                | Readiness drops first; forced closure bounds stale socket lifetime.                                                     | `SOCKET_FAIL_CLOSED_TIMEOUT_MS`                                                                   | Disconnect duration and F09/F23                        | No; provisional safety deadline. |
+| Board-head watchdog            | One query of 100 active boards every 5 seconds, ±20% jitter      | Bounds DB load per replica and avoids synchronized polling.                                                             | `DELIVERY_WATCHDOG_INTERVAL_MS`, `DELIVERY_WATCHDOG_BATCH_SIZE`, `DELIVERY_WATCHDOG_JITTER_RATIO` | Query count/duration and F27/F31                       | No; not a detection SLO.         |
+| Operation tail batch           | 100 operations                                                   | Preserves the accepted M1 synchronization bound.                                                                        | `SYNC_BATCH_SIZE`                                                                                 | Catch-up batches and existing synchronization tests    | No; inherited safety bound.      |
+| Snapshot operation trigger     | 1,000 operations since verified snapshot                         | Bounds tail growth by a configurable count trigger.                                                                     | `SNAPSHOT_OPERATION_INTERVAL`                                                                     | Tail length and snapshot trigger test                  | No; provisional policy.          |
+| Snapshot time trigger          | 24 changed hours                                                 | Creates recovery points for slowly changing boards.                                                                     | `SNAPSHOT_MAX_CHANGED_AGE_MS`                                                                     | Snapshot age and scheduler test                        | No; provisional policy.          |
+| Snapshot retained-byte trigger | 8 MiB estimated operation payload                                | Adds a size-sensitive trigger independent of operation count.                                                           | `SNAPSHOT_TAIL_BYTES_TRIGGER`                                                                     | Retained-tail bytes and scheduler test                 | No; provisional policy.          |
+| Snapshot payload maximum       | 16 MiB                                                           | Refuses unbounded in-memory serialization; leaves the log intact.                                                       | `SNAPSHOT_MAX_BYTES`                                                                              | `snapshot_size_bytes` and oversize failure test        | No; provisional bound.           |
+| Snapshot retention             | Minimum 2 verified snapshots plus floor and all pinned snapshots | Retains a newest/floor fallback and future version anchors.                                                             | `SNAPSHOT_MIN_RETAINED`                                                                           | Retention invariant and corruption test                | No; provisional minimum.         |
+| Compaction safety margin       | One verified snapshot generation behind newest                   | Prevents the newest checkpoint from immediately becoming the deletion floor.                                            | `COMPACTION_SNAPSHOT_SAFETY_GENERATIONS`                                                          | Floor distance and F16/F21/F22                         | No; provisional safety margin.   |
+| Compaction enablement          | Disabled                                                         | Prevents deletion before recovery, corruption, backup, and failure gates pass.                                          | `COMPACTION_ENABLED`                                                                              | M2.7 stop gate and compaction suite                    | No; approved release gate.       |
+| Production Socket.IO transport | WebSocket only                                                   | Avoids unproven sticky-session dependence during horizontal scaling.                                                    | `SOCKET_IO_TRANSPORTS=websocket`                                                                  | Multi-instance Playwright and reconnect tests          | No; deployment policy.           |
 
 A worker must not wait in its own queue long enough to risk lease expiry; it claims only when a
 publish slot exists. A long-running publish may renew its lease through a token-fenced database
@@ -305,6 +305,65 @@ continue.
 The stream key, envelope, independent plain-`XREAD` cursor, retention, and alternatives are normative
 in ADR 005. Consumer groups are deliberately absent: each API reads every event independently and
 keeps only an in-memory global Redis stream cursor for its current process lifetime.
+
+### Trusted Redis broker and writer boundary
+
+Delivery Redis is trusted infrastructure, not an untrusted parser boundary. It must be private and
+network-restricted, authenticated, unreachable from browsers and public clients, and writable only
+by explicitly authorized Converge processes. The authorized writer list is exact:
+
+- `apps/worker` may append strictly validated delivery entries;
+- `apps/api` may append only the fixed initialization sentinel; and
+- no other service, user, browser, or public HTTP/Socket path may write the delivery stream.
+
+The repository does not claim that these controls are active in local Compose. A hosted deployment
+must provide private networking, no public Redis endpoint, TLS where supported, separate
+least-privilege API and worker ACL users where the provider supports them, a credential-rotation
+procedure, and monitoring for unexpected writers, malformed entries, and abnormal stream growth.
+Redis credential or server compromise is an infrastructure-security incident outside the application
+parser's in-process memory-safety guarantee.
+
+This boundary is necessary because Compose currently runs Redis 8.2 and the installed `redis@6.2.0`
+client returns complete `XREAD` field/value pairs. Inspection of
+`@redis/client/dist/lib/RESP/decoder` and its public options confirms that node-redis has no supported
+configured maximum decoded bulk-string size for `XREAD`; bulk strings are materialized before
+application checks run. Redis 8.2 `XREAD` supports `COUNT` and `BLOCK`, not the future `MAXSIZE`
+option. Redis 8.10 `MAXSIZE` is a soft total-reply target and still returns at least one entry when
+that first entry alone is over the target. Therefore neither post-decoding checks nor future
+`MAXSIZE` protect this process from a malicious Redis server or compromised writer credential.
+
+Converge does not introduce a custom RESP client, upgrade Redis solely for `MAXSIZE`, or split
+payloads into a second store. Those choices add protocol/security ownership or publication
+consistency without removing the single-oversized-entry residual risk. The enforceable design is a
+trusted-writer boundary plus producer-side bounds.
+
+Every worker validates the envelope and durable identity before Redis I/O, then UTF-8-measures all
+six field names and values before `XADD`. The envelope value is at most 131,072 bytes; fixed names
+plus maximum schema-bounded metadata are at most 165 bytes (`52` name bytes plus
+`1 + 36 + 36 + 16 + 24` value bytes), so a worker entry is at most 131,237 bytes. No field may exceed
+its schema/configured limit. Rejection uses a bounded constant diagnostic, never calls `XADD`, never
+marks PostgreSQL published, and follows the existing non-retryable block policy. The API sentinel is
+exactly two fields (`controlType`, `generation`), has a fixed control value, accepts only a 36-byte
+canonical UUID-v4 token, and is exactly 87 encoded field/name bytes.
+
+With a maximum Redis ID of 41 bytes, a decoded valid worker entry is at most 131,278 bytes. Fixed
+`XREAD COUNT 100` therefore yields at most 13,127,800 decoded entry bytes from authorized workers; a
+conservative RESP2 estimate allowing 512 protocol bytes per entry plus 256 fixed bytes is 13,179,256
+bytes. The 16 MiB global queue accommodates this batch. Configuration fails closed rather than
+clamping when `maximumEnvelopeBytes` is below the 128 KiB producer contract, the global event limit
+is below 100, or the global byte limit cannot hold
+`100 × (configured envelope + 165 + 41)`. This calculation does not constrain unauthorized writes.
+
+Ordinary metadata inspection no longer returns payload-bearing `first-entry`/`last-entry` arrays.
+A bounded Lua projection runs `INFO`/`XINFO` inside Redis, validates IDs and shapes, and returns only
+a fixed status tuple, the 40-byte server incarnation, exact decimal counters, and required IDs.
+Sentinel initialization and verification validate field count, ordered names, fixed control type,
+36-byte generation length, and canonical UUID-v4 syntax inside Redis; invalid or oversized evidence
+returns only a constant status. Because Redis Lua 5.1 represents RESP integers as doubles, the
+projection preserves `entries-added` above `Number.MAX_SAFE_INTEGER` by atomically creating and
+destroying a bounded temporary group whose small lag recovers the rounded low bits. All output
+branches are structurally and byte bounded. This removes avoidable metadata materialization in
+JavaScript; it does not solve a live oversized `XREAD` from an unauthorized writer.
 
 The initial internal payload union is exact and versioned:
 
@@ -711,6 +770,9 @@ hard safety bounds.
   lease tokens are not exposed to clients.
 - Redis must be private, authenticated where the platform supports it, encrypted in transit outside
   the local network, and unavailable from the public web.
+- This Redis requirement is a deployment obligation, not a description of local Compose. Hosted
+  Redis also needs separate least-privilege API/worker ACL credentials where supported, documented
+  rotation, and alerts for unexpected writers, malformed entries, and stream growth.
 - A direct SQL membership change is unsupported unless the operator also uses the ordered event
   procedure or performs global session invalidation.
 
@@ -757,6 +819,9 @@ two APIs/workers without relying on production services.
 - Railway Hobby where viable: `apps/api`, `apps/worker`, PostgreSQL, and Redis.
 - API and worker use separate start commands/deployments from the same monorepo revision.
 - Private service networking and injected `DATABASE_URL`/`REDIS_URL` are required.
+- Redis has no public endpoint; enable TLS and separate least-privilege writer credentials/ACL users
+  where supported, document credential rotation, and alert on unexpected delivery writers,
+  malformed entries, and retention/growth anomalies.
 - API readiness, graceful socket shutdown, worker lease behavior, Redis persistence settings, volume
   durability, connection limits, WebSocket-only behavior, and Hobby service limits must be
   verified against then-current platform documentation before deployment.

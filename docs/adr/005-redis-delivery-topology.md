@@ -68,8 +68,12 @@ uses retained PostgreSQL outbox data or requires reauthentication and snapshot-p
 
 ## Event format and retention
 
-Each Redis entry has one field, `event`, containing a strict JSON envelope no larger than 128 KiB.
-This leaves bounded envelope overhead around the existing 64 KiB command limit:
+Each worker Redis entry has exactly six ordered fields: `schemaVersion`, `eventId`, `boardId`,
+`deliverySeq`, `eventType`, and `event`. `event` contains a strict JSON envelope no larger than 128
+KiB. Before `XADD`, the worker measures UTF-8 bytes for every field name/value and the complete entry.
+The fixed names and bounded metadata add at most 165 bytes, so the complete entry maximum is 131,237
+bytes. The API's only write is a fixed two-field initialization sentinel of 87 bytes. No HTTP or
+Socket handler accepts raw stream fields.
 
 ```json
 {
@@ -100,6 +104,34 @@ Each API keeps a bounded global in-memory queue of at most 1,000 envelopes or 16
 board may quarantine at most 100 envelopes or 2 MiB. Crossing a global bound makes the API
 Socket.IO-unready and fail-closes all sockets; crossing a board bound fail-closes that board and drops
 its quarantine for PostgreSQL recovery. Memory never grows to preserve live-delivery availability.
+
+`maximumEnvelopeBytes` is a producer-contract and post-decoding semantic limit. It is not a network
+or node-redis decoder allocation limit. `XREAD COUNT 100` plus the producer maximum gives a normal
+decoded batch bound of 13,127,800 bytes (or 13,179,256 bytes with the conservative RESP2 allowance).
+Invalid relationships between the producer maximum, count, and queue limits are rejected, not
+clamped.
+
+### Trusted writer boundary and metadata projection
+
+The Redis delivery service is trusted infrastructure: private, authenticated, not public/browser
+reachable, and writable only by the worker for validated delivery entries and the API for the fixed
+sentinel. Production must add private networking, TLS where supported, separate least-privilege ACL
+credentials where supported, credential rotation, and monitoring for unexpected writers, malformed
+entries, and stream growth. Local Compose does not yet claim these controls.
+
+`XINFO STREAM` includes complete first/last field/value tuples. The API therefore calls it only inside
+a Lua projection and returns to JavaScript a fixed tuple of status, validated scalar IDs, exact
+counters, and server incarnation. Sentinel scripts validate exact field count/order/names, fixed
+control type, and canonical 36-byte UUID-v4 generation before returning token evidence. Oversized or
+invalid evidence produces a constant bounded status; ordinary inspection never returns entry fields.
+
+The installed `redis@6.2.0` decoder has no supported maximum decoded bulk-string option and `XREAD`
+materializes complete entries before application validation. Compose Redis 8.2 has no `XREAD
+MAXSIZE`. Redis 8.10's `MAXSIZE` is soft and returns at least one entry even if that entry alone
+exceeds it. A custom RESP client, a Redis upgrade solely for `MAXSIZE`, and a second payload store were
+rejected: `MAXSIZE` does not remove the malicious-first-entry risk, and the others expand this slice's
+protocol or consistency scope. Compromised writer credentials or Redis server remain an explicit
+infrastructure incident, not an application parser memory-safety case.
 
 ## Ordering, gaps, and duplicates
 
@@ -138,8 +170,8 @@ and disconnects all active sockets through a two-second bounded lifecycle. A sur
 its last fully processed global stream cursor but clears socket rooms and board-local state after
 disconnection.
 
-On recovery it compares the retained cursor with `XINFO STREAM` first-entry,
-last-entry/last-generated, and max-deleted-entry metadata, and treats a Redis server-incarnation
+On recovery it compares the retained cursor with the bounded Redis-side projection of `XINFO STREAM`
+first-entry ID, last-entry/last-generated, and max-deleted-entry metadata, and treats a Redis server-incarnation
 change as uncertain. A missing or recreated stream, a last-generated ID behind the cursor, or
 deletion/trimming beyond the cursor is delivery-integrity loss. The API never silently jumps forward
 while sockets are active. It remains
@@ -207,7 +239,8 @@ delivery pressure without becoming authoritative.
 
 The design has one new deployable process (`apps/worker`) and no extra microservices. It duplicates
 stream reads across API replicas by design. It provides at-least-once delivery and explicit recovery,
-not exactly-once delivery. Redis memory and all in-process batches are bounded. A Redis failure can
+not exactly-once delivery. Authorized producer output and all post-decoding in-process state are
+bounded; a malicious broker/writer can still force node-redis allocation before validation. A Redis failure can
 reduce live availability, but it cannot erase committed board state and must not preserve stale
 authorization.
 
@@ -223,3 +256,9 @@ authorization.
 - [Redis Streams](https://redis.io/docs/latest/develop/data-types/streams/): exclusive `XREAD`
   cursors, retained-entry reads, stream metadata, trimming, and the distinction between independent
   reads and within-group work distribution.
+- [Redis `XINFO STREAM`](https://redis.io/docs/latest/commands/xinfo-stream/): summary replies include
+  complete first and last entry field/value tuples.
+- [Redis Lua API](https://redis.io/docs/latest/develop/interact/programmability/lua-api/): RESP integer
+  replies become Lua numbers under embedded Lua 5.1.
+- [Redis `MAXCOUNT`/`MAXSIZE` change](https://github.com/redis/redis/pull/15282): Redis 8.10 soft
+  XREAD reply-size behavior, including returning the first oversized entry.

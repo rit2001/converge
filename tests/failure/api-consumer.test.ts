@@ -408,6 +408,53 @@ afterAll(() => {
 });
 
 describe("real Redis independent delivery consumers", () => {
+  it("projects only bounded evidence for oversized malformed first/last metadata entries", async () => {
+    const key = uniqueStreamKey();
+    const oversized = `must-not-cross-js:${"x".repeat(512 * 1024)}`;
+    await publisher.sendCommand([
+      "XADD",
+      key,
+      "1-0",
+      DELIVERY_STREAM_INITIALIZATION_TYPE_FIELD,
+      DELIVERY_STREAM_INITIALIZATION_TYPE,
+      DELIVERY_STREAM_INITIALIZATION_TOKEN_FIELD,
+      oversized,
+    ]);
+    await publisher.sendCommand(["XADD", key, "2-0", "malformed", oversized]);
+    const transport = new RedisDeliveryConsumerTransport(redisUrl, key);
+
+    try {
+      await transport.connect();
+      let initializationError: unknown;
+      try {
+        await transport.initializeStream({
+          generationToken: "10000000-0000-4000-8000-000000000001",
+          signal: new AbortController().signal,
+        });
+      } catch (error) {
+        initializationError = error;
+      }
+      expect(initializationError).toBeInstanceOf(Error);
+      expect((initializationError as Error).message).toBe(
+        "Redis stream initializer returned invalid sentinel evidence",
+      );
+      expect((initializationError as Error).message.length).toBeLessThan(100);
+
+      const metadata = await transport.inspect({ signal: new AbortController().signal });
+      const projected = JSON.stringify(metadata);
+      expect(metadata).toMatchObject({
+        length: "2",
+        firstEntryId: "1-0",
+        lastEntryId: "2-0",
+        entriesAdded: "2",
+      });
+      expect(projected.length).toBeLessThan(512);
+      expect(projected).not.toContain("must-not-cross-js");
+    } finally {
+      await transport.close();
+    }
+  });
+
   it("preserves XINFO entries-added above Number.MAX_SAFE_INTEGER", async () => {
     const key = uniqueStreamKey();
     await publisher.sendCommand(["XADD", key, "1-0", "control", "test"]);

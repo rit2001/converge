@@ -8,8 +8,12 @@ import type {
 } from "@converge/database";
 import type { StructuredLogger } from "@converge/observability";
 import {
+  DELIVERY_ENVELOPE_MAX_BYTES,
+  DELIVERY_STREAM_ENTRY_MAX_BYTES,
   decodeDeliveryStreamFields,
+  encodeDeliveryStreamFields,
   membershipRevokedDeliveryEnvelopeSchema,
+  validateDeliveryStreamEntrySize,
   type DeliveryStreamFields,
 } from "@converge/protocol";
 import { RedisXaddRejectedError, type DeliveryStream } from "./redis-stream.js";
@@ -49,6 +53,22 @@ function claim(sequence = 1, boardId = crypto.randomUUID()): ClaimedOutboxEvent 
     leaseToken: crypto.randomUUID(),
     leasedUntil: new Date("2026-08-09T12:01:00.000Z"),
   };
+}
+
+function claimWithEnvelopeBytes(targetBytes: number): ClaimedOutboxEvent {
+  const value = claim(Number.MAX_SAFE_INTEGER);
+  const baseTimestamp = "2026-08-09T12:00:00.0Z";
+  const baseline = JSON.stringify({ ...value.envelope, occurredAt: baseTimestamp }).length;
+  const additionalDigits = targetBytes - baseline;
+  if (additionalDigits < 0) throw new Error("Target envelope is smaller than the test fixture");
+  const occurredAt = `2026-08-09T12:00:00.${"0".repeat(additionalDigits + 1)}Z`;
+  const envelope = membershipRevokedDeliveryEnvelopeSchema.parse({
+    ...value.envelope,
+    occurredAt,
+  });
+  if (new TextEncoder().encode(JSON.stringify(envelope)).byteLength !== targetBytes)
+    throw new Error("Test fixture did not reach the requested encoded envelope size");
+  return { ...value, envelope };
 }
 
 const applied = (eventId: string, status: "published" | "retry_wait" | "blocked") =>
@@ -388,8 +408,64 @@ describe("outbox worker", () => {
     expect(repository.failures[0]).toMatchObject({
       retryable: false,
       errorCode: "DELIVERY_ENVELOPE_TOO_LARGE",
-      errorMessage: "Delivery envelope exceeds the configured byte limit.",
+      errorMessage: "Delivery stream entry exceeds the configured byte limit.",
     });
+  });
+
+  it("accepts the maximum complete valid worker stream entry", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    const event = claimWithEnvelopeBytes(DELIVERY_ENVELOPE_MAX_BYTES);
+    repository.claims.push(event);
+    stream.results.push("2000-1");
+    const worker = new OutboxWorker(repository, stream, configuration, logger, scheduler);
+
+    expect((await worker.runCycle()).outcomes).toEqual(["published"]);
+    const fields = encodeDeliveryStreamFields(event.envelope);
+    expect(validateDeliveryStreamEntrySize(fields)).toEqual({
+      valid: true,
+      entryBytes: DELIVERY_STREAM_ENTRY_MAX_BYTES,
+    });
+    expect(stream.appended).toEqual([fields]);
+    expect(repository.published).toHaveLength(1);
+  });
+
+  it("rejects a complete entry one byte over its configured limit before XADD", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    repository.claims.push(claimWithEnvelopeBytes(DELIVERY_ENVELOPE_MAX_BYTES));
+    const worker = new OutboxWorker(
+      repository,
+      stream,
+      { ...configuration, maximumEnvelopeBytes: DELIVERY_ENVELOPE_MAX_BYTES - 1 },
+      logger,
+      scheduler,
+    );
+
+    expect((await worker.runCycle()).outcomes).toEqual(["blocked"]);
+    expect(stream.appended).toEqual([]);
+    expect(repository.published).toEqual([]);
+    expect(repository.failures[0]).toMatchObject({
+      retryable: false,
+      errorCode: "DELIVERY_ENVELOPE_TOO_LARGE",
+    });
+  });
+
+  it("rejects an oversized individual event field before XADD or publication finalization", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    repository.claims.push(claimWithEnvelopeBytes(DELIVERY_ENVELOPE_MAX_BYTES));
+    const worker = new OutboxWorker(
+      repository,
+      stream,
+      { ...configuration, maximumEnvelopeBytes: DELIVERY_ENVELOPE_MAX_BYTES - 1024 },
+      logger,
+      scheduler,
+    );
+
+    expect((await worker.runCycle()).outcomes).toEqual(["blocked"]);
+    expect(stream.appended).toEqual([]);
+    expect(repository.published).toEqual([]);
   });
 
   it("keeps a valid XADD positive when age trimming fails", async () => {

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const SCHEMA_VERSION = 1 as const;
 export const MAX_SYNC_BATCH_SIZE = 100 as const;
+export const DELIVERY_ENVELOPE_MAX_BYTES = 128 * 1024;
 
 export const idSchema = z.string().uuid();
 export const sequenceSchema = z.number().int().nonnegative().safe();
@@ -385,7 +386,67 @@ export const DELIVERY_STREAM_FIELD_NAMES = Object.freeze([
   "event",
 ] as const);
 
+const DELIVERY_STREAM_FIELD_VALUE_MAX_BYTES = Object.freeze({
+  schemaVersion: String(SCHEMA_VERSION).length,
+  eventId: 36,
+  boardId: 36,
+  deliverySeq: String(Number.MAX_SAFE_INTEGER).length,
+  eventType: "board.membership.revoked".length,
+} as const);
+
+export const DELIVERY_STREAM_METADATA_MAX_BYTES =
+  DELIVERY_STREAM_FIELD_NAMES.reduce((total, name) => total + name.length, 0) +
+  Object.values(DELIVERY_STREAM_FIELD_VALUE_MAX_BYTES).reduce(
+    (total, maximum) => total + maximum,
+    0,
+  );
+
+export const DELIVERY_STREAM_ENTRY_MAX_BYTES =
+  DELIVERY_ENVELOPE_MAX_BYTES + DELIVERY_STREAM_METADATA_MAX_BYTES;
+export const REDIS_STREAM_ENTRY_ID_MAX_BYTES = 20 + 1 + 20;
+export const DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES =
+  DELIVERY_STREAM_ENTRY_MAX_BYTES + REDIS_STREAM_ENTRY_ID_MAX_BYTES;
+
 export type DeliveryStreamFieldPair = readonly [name: string, value: string];
+
+export type DeliveryStreamEntrySizeValidation =
+  | { valid: true; entryBytes: number }
+  | { valid: false; reason: "FIELD_TOO_LARGE" | "ENTRY_TOO_LARGE" };
+
+const deliveryTextEncoder = new TextEncoder();
+
+function utf8Bytes(value: string): number {
+  return deliveryTextEncoder.encode(value).byteLength;
+}
+
+/**
+ * Measures the complete producer entry before XADD. The configured envelope limit applies to the
+ * serialized `event` value; all other values have tighter protocol-schema maxima. Field names are
+ * included because Redis stores and returns them with every stream entry.
+ */
+export function validateDeliveryStreamEntrySize(
+  fields: DeliveryStreamFields,
+  maximumEnvelopeBytes = DELIVERY_ENVELOPE_MAX_BYTES,
+): DeliveryStreamEntrySizeValidation {
+  if (!Number.isSafeInteger(maximumEnvelopeBytes) || maximumEnvelopeBytes < 1)
+    return { valid: false, reason: "FIELD_TOO_LARGE" };
+
+  let entryBytes = 0;
+  for (const name of DELIVERY_STREAM_FIELD_NAMES) {
+    const nameBytes = utf8Bytes(name);
+    const value = fields[name];
+    const valueBytes = utf8Bytes(value);
+    const maximumValueBytes =
+      name === "event" ? maximumEnvelopeBytes : DELIVERY_STREAM_FIELD_VALUE_MAX_BYTES[name];
+    if (nameBytes !== name.length || valueBytes > maximumValueBytes)
+      return { valid: false, reason: "FIELD_TOO_LARGE" };
+    entryBytes += nameBytes + valueBytes;
+  }
+
+  if (entryBytes > maximumEnvelopeBytes + DELIVERY_STREAM_METADATA_MAX_BYTES)
+    return { valid: false, reason: "ENTRY_TOO_LARGE" };
+  return { valid: true, entryBytes };
+}
 
 /**
  * Decodes Redis field pairs without first collapsing them into an object. This is the consumer-side

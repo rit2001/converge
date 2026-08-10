@@ -1,5 +1,9 @@
 import type { StructuredLogger } from "@converge/observability";
-import type { DeliveryStreamFields } from "@converge/protocol";
+import {
+  deliveryStreamFieldsSchema,
+  validateDeliveryStreamEntrySize,
+  type DeliveryStreamFields,
+} from "@converge/protocol";
 import { createClient, type RedisClientType } from "redis";
 
 export interface DeliveryStream {
@@ -54,6 +58,9 @@ export class RedisDeliveryStream implements DeliveryStream {
 
   async append(fields: DeliveryStreamFields, signal: AbortSignal): Promise<unknown> {
     if (!this.client.isReady) throw new RedisXaddRejectedError("Redis was unavailable before XADD");
+    const validatedFields = deliveryStreamFieldsSchema.safeParse(fields);
+    if (!validatedFields.success || !validateDeliveryStreamEntrySize(validatedFields.data).valid)
+      throw new RedisXaddRejectedError("Redis delivery entry was rejected before XADD");
     const client = this.client;
     try {
       return await client.sendCommand(
@@ -65,17 +72,17 @@ export class RedisDeliveryStream implements DeliveryStream {
           String(this.maximumLength),
           "*",
           "schemaVersion",
-          fields.schemaVersion,
+          validatedFields.data.schemaVersion,
           "eventId",
-          fields.eventId,
+          validatedFields.data.eventId,
           "boardId",
-          fields.boardId,
+          validatedFields.data.boardId,
           "deliverySeq",
-          fields.deliverySeq,
+          validatedFields.data.deliverySeq,
           "eventType",
-          fields.eventType,
+          validatedFields.data.eventType,
           "event",
-          fields.event,
+          validatedFields.data.event,
         ],
         { abortSignal: signal },
       );

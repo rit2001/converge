@@ -55,36 +55,20 @@ vi.mock("redis", () => ({
       sendCommand: async (command: readonly string[]) => {
         await Promise.resolve();
         redisMock.record(command);
-        if (command[0] === "INFO") return "run_id:test-run\r\n";
-        if (command[0] === "XINFO")
+        if (command[0] === "EVAL" && command[1]?.includes("exact_entries_added"))
           return [
-            "length",
-            redisMock.reply("0"),
-            "last-generated-id",
+            redisMock.reply("1"),
+            "a".repeat(40),
+            "0",
+            "",
+            "",
             "1-0",
-            "max-deleted-entry-id",
             "1-0",
-            "entries-added",
-            redisMock.reply("9007199254740993"),
-            "first-entry",
-            null,
-            "last-entry",
-            null,
+            "9007199254740993",
           ];
+        if (command[0] === "EVAL" && command.length === 6) return [redisMock.reply("1")];
         if (command[0] === "EVAL")
           return redisMock.initializerReply() ?? [redisMock.reply("1"), "5-0", command.at(-1)];
-        if (command[0] === "XRANGE")
-          return [
-            [
-              "5-0",
-              [
-                "controlType",
-                "converge.stream.initialized.v1",
-                "generation",
-                "10000000-0000-4000-8000-000000000001",
-              ],
-            ],
-          ];
         throw new Error(`Unexpected Redis command ${command[0]}`);
       },
     };
@@ -96,9 +80,19 @@ import {
   RedisDeliveryConsumerTransport,
   parseRedisUint64Reply,
 } from "./redis-delivery-transport.js";
+import { DELIVERY_STREAM_INITIALIZATION_ENTRY_MAX_BYTES } from "./delivery-stream-sentinel.js";
 
 describe("RedisDeliveryConsumerTransport", () => {
   const canonicalGeneration = "10000000-0000-4000-8000-000000000001";
+
+  it("keeps the initialization sentinel fixed and byte bounded", () => {
+    const encodedBytes = new TextEncoder().encode(
+      "controlType" + "converge.stream.initialized.v1" + "generation" + canonicalGeneration,
+    ).byteLength;
+
+    expect(DELIVERY_STREAM_INITIALIZATION_ENTRY_MAX_BYTES).toBe(87);
+    expect(encodedBytes).toBe(DELIVERY_STREAM_INITIALIZATION_ENTRY_MAX_BYTES);
+  });
 
   it("uses one atomic Redis-side initializer and verifies the exact sentinel", async () => {
     redisMock.reset();
@@ -132,7 +126,8 @@ describe("RedisDeliveryConsumerTransport", () => {
       "converge:test:m24a:initializer",
       canonicalGeneration,
     ]);
-    expect(redisMock.commands().filter(([name]) => name === "EVAL")).toHaveLength(1);
+    expect(redisMock.commands().filter(([name]) => name === "EVAL")).toHaveLength(2);
+    expect(redisMock.commands().some(([name]) => name === "XRANGE")).toBe(false);
     await transport.close();
   });
 
@@ -173,7 +168,7 @@ describe("RedisDeliveryConsumerTransport", () => {
         signal: new AbortController().signal,
       }),
     ).rejects.toThrow("invalid generation token");
-    expect(redisMock.commands().some(([name]) => name === "XRANGE")).toBe(false);
+    expect(redisMock.commands().some(([name]) => name === "EVAL")).toBe(false);
     await transport.close();
   });
 
@@ -236,6 +231,12 @@ describe("RedisDeliveryConsumerTransport", () => {
     const metadata = await transport.inspect({ signal: new AbortController().signal });
 
     expect(metadata.entriesAdded).toBe("9007199254740993");
+    const inspection = redisMock
+      .commands()
+      .find(([name, script]) => name === "EVAL" && script?.includes("exact_entries_added"));
+    expect(inspection?.[1]).toContain("first_id = first_entry[1]");
+    expect(inspection?.[1]).not.toContain("first_entry[2]");
+    expect(redisMock.commands().some(([name]) => name === "XINFO")).toBe(false);
     await transport.close();
   });
 });

@@ -11,6 +11,7 @@ import {
   REDIS_DELIVERY_READ_COUNT,
   REDIS_DELIVERY_RECONNECT_DELAY_MAX_MS,
   REDIS_DELIVERY_RECONNECT_DELAY_MIN_MS,
+  REDIS_DELIVERY_VALID_BATCH_MAX_DECODED_BYTES,
   RedisDeliveryConsumer,
   compareRedisStreamIds,
   defaultDeliveryConsumerConfiguration,
@@ -1564,13 +1565,18 @@ describe("RedisDeliveryConsumer", () => {
 
   it("rejects oversized entries without advancing", async () => {
     const transport = new FakeTransport(emptyMetadata());
-    const test = harness(
-      transport,
-      {},
-      { ...defaultDeliveryConsumerConfiguration, maximumEnvelopeBytes: 4 },
-    );
+    const test = harness(transport);
     await test.consumer.start();
-    transport.resolveRead([entry("1-0", envelope(1))]);
+    const oversized = entry("1-0", envelope(1));
+    oversized.fields = oversized.fields.map(([name, value]) =>
+      name === "event"
+        ? ([
+            name,
+            "x".repeat(defaultDeliveryConsumerConfiguration.maximumEnvelopeBytes + 1),
+          ] as const)
+        : ([name, value] as const),
+    );
+    transport.resolveRead([oversized]);
     await eventually(() => expect(test.lifecycle.at(-1)?.state).toBe("error"));
     expect(test.consumer.lastHandledCursor).toBe("0-1");
     await test.consumer.stop();
@@ -1597,13 +1603,16 @@ describe("RedisDeliveryConsumer", () => {
 
   it("fails closed before processing when the bounded global queue overflows", async () => {
     const transport = new FakeTransport(emptyMetadata());
-    const test = harness(
-      transport,
-      {},
-      { ...defaultDeliveryConsumerConfiguration, globalQueueMaximumEvents: 1 },
-    );
+    const test = harness(transport);
     await test.consumer.start();
-    transport.resolveRead([entry("1-0", envelope(1)), entry("2-0", envelope(2))]);
+    transport.resolveRead([
+      {
+        id: "1-0",
+        fields: [
+          ["event", "x".repeat(defaultDeliveryConsumerConfiguration.globalQueueMaximumBytes)],
+        ],
+      },
+    ]);
     await eventually(() =>
       expect(test.lifecycle.at(-1)).toMatchObject({
         state: "error",
@@ -1613,6 +1622,20 @@ describe("RedisDeliveryConsumer", () => {
     expect(test.consumer.lastHandledCursor).toBe("0-1");
     expect(test.delivered).toEqual([]);
     await test.consumer.stop();
+  });
+
+  it.each([
+    {
+      maximumEnvelopeBytes: defaultDeliveryConsumerConfiguration.maximumEnvelopeBytes - 1,
+    },
+    { globalQueueMaximumEvents: REDIS_DELIVERY_READ_COUNT - 1 },
+    { globalQueueMaximumBytes: REDIS_DELIVERY_VALID_BATCH_MAX_DECODED_BYTES - 1 },
+  ])("rejects a consumer limit below the authorized producer/read contract", async (override) => {
+    const transport = new FakeTransport(emptyMetadata());
+    const test = harness(transport, {}, { ...defaultDeliveryConsumerConfiguration, ...override });
+
+    await expect(test.consumer.start()).rejects.toThrow("INVALID_CONFIGURATION");
+    expect(transport.connectCalls).toBe(0);
   });
 
   it("does not advance before awaited delivery and keeps the cursor on callback failure", async () => {

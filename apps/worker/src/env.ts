@@ -1,3 +1,4 @@
+import { DELIVERY_ENVELOPE_MAX_BYTES } from "@converge/protocol";
 import { z } from "zod";
 
 const redisUrlSchema = z
@@ -25,8 +26,8 @@ const environmentShape = {
     .number()
     .int()
     .min(1)
-    .max(128 * 1024)
-    .default(128 * 1024),
+    .max(DELIVERY_ENVELOPE_MAX_BYTES)
+    .default(DELIVERY_ENVELOPE_MAX_BYTES),
   REDIS_STREAM_KEY: z
     .string()
     .regex(/^[A-Za-z0-9:._-]{1,128}$/)
