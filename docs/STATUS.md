@@ -47,13 +47,19 @@ and distributed membership revocation. Deployment remains deferred.
 ## Milestone 2.6 snapshot status
 
 Automatic bounded snapshot creation is now activated in `apps/worker` independently from Redis
-outbox publication. Final snapshot-plus-tail recovery acceptance remains pending.
+outbox publication. M2.6 acceptance is complete against an isolated PostgreSQL database migrated
+through 0008, the real snapshot repositories/coordinator and worker supervision, a dynamic real API,
+and a real authenticated BoardTransport. The accepted boundaries cover Redis-independent bootstrap,
+threshold capture, verified snapshot-plus-tail replay, one-attempt overflow refresh, corrupt-newest
+fallback, terminal blocked evidence, retryable lock contention, atomic/stale-session fencing, and
+snapshot/writer and duplicate-capture races. Compaction and recovery-floor advancement remain
+deferred.
 
 ## Deferred by design
 
 - Production activation of transactional-outbox dispatch (the repository, worker publisher, and
   crash-boundary failure evidence are implemented)
-- Final snapshot recovery acceptance and operation-log compaction
+- Operation-log compaction and recovery-floor advancement
 - Historical per-sequence authoritative hashes
 - Production OAuth
 - Invitations, share links, and full membership administration

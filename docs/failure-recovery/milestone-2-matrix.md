@@ -118,6 +118,29 @@ enforced by both activated APIs, unrelated principal/board sockets remain author
 strict revocation `XADD` advances both transport cursors without a second harmful transition. The
 suite retains the at-least-once model and compares recovered client hashes with PostgreSQL authority.
 
+## M2.6 final acceptance evidence
+
+The six-test isolated M2.6 acceptance suite marks the snapshot portions of F15, F16, F36, F41, F42,
+F43, and F44 accepted. It migrates one temporary PostgreSQL database through 0008, uses the real
+snapshot/candidate/recovery repositories and coordinator, supervises automatic bootstrap through the
+real worker application while an injected Redis stream remains unavailable, serves a real API on a
+dynamic port, and drives authenticated Socket.IO/HTTP recovery through the real BoardTransport and
+isolated pending-command persistence.
+
+Deterministic scheduler and advisory-lock barriers prove below/at-threshold selection, immutable
+genesis and exact-head capture, a complete before-or-after writer boundary, and at most one durable
+snapshot during duplicate capture. Snapshot-plus-tail recovery publishes only the fully reconstructed
+client state and matches stored snapshot, reconstructed, client, and PostgreSQL-authoritative hashes.
+The 101-operation boundary creates one on-demand exact-head snapshot without changing either head or
+logical board state, and an unchanged repeat creates none.
+
+Controlled corruption proves verified older-chain fallback, durable invalidation, non-reconsideration,
+and terminal `RECOVERY_BLOCKED` behavior without legacy fallback or pending-command loss. A
+deterministically busy refresh returns retryable `INTERNAL_ERROR`; after lock release one bounded
+retry recovers and drains the preserved command. A post-verification/pre-apply barrier proves stale
+session results cannot mutate a replacement session. This evidence does not cover operation deletion,
+recovery floors, compaction, Redis durability, deployment, or performance.
+
 ## Acceptance rules
 
 - Tests assert at-least-once publication and idempotent effects; they must not assert or describe
