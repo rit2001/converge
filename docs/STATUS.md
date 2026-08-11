@@ -44,11 +44,16 @@ isolated real PostgreSQL/Redis topology with two independently configured APIs, 
 worker, deterministic watchdog time, a single-connection Redis interruption, PostgreSQL catch-up,
 and distributed membership revocation. Deployment remains deferred.
 
+## Milestone 2.6 snapshot status
+
+Automatic bounded snapshot creation is now activated in `apps/worker` independently from Redis
+outbox publication. Final snapshot-plus-tail recovery acceptance remains pending.
+
 ## Deferred by design
 
 - Production activation of transactional-outbox dispatch (the repository, worker publisher, and
   crash-boundary failure evidence are implemented)
-- Snapshot creation, historical recovery, and operation-log compaction
+- Final snapshot recovery acceptance and operation-log compaction
 - Historical per-sequence authoritative hashes
 - Production OAuth
 - Invitations, share links, and full membership administration

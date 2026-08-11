@@ -24,6 +24,19 @@ describe("worker environment", () => {
       REDIS_STREAM_KEY: "converge:delivery:v1",
       REDIS_STREAM_MAXLEN: 100_000,
       REDIS_STREAM_MAX_AGE_MS: 24 * 60 * 60 * 1000,
+      SNAPSHOT_POLL_INTERVAL_MS: 30_000,
+      SNAPSHOT_POLL_JITTER_PERCENT: 20,
+      SNAPSHOT_CANDIDATE_SCAN_LIMIT: 100,
+      SNAPSHOT_CANDIDATE_BATCH_SIZE: 16,
+      SNAPSHOT_MAX_CONCURRENCY: 2,
+      SNAPSHOT_OPERATION_THRESHOLD: 1_000,
+      SNAPSHOT_CHANGED_AGE_MS: 86_400_000,
+      SNAPSHOT_OPERATION_BYTES_THRESHOLD: 8_388_608,
+      SNAPSHOT_MAX_PAYLOAD_BYTES: 16_777_216,
+      SNAPSHOT_RETRY_BASE_MS: 5_000,
+      SNAPSHOT_RETRY_CAP_MS: 300_000,
+      SNAPSHOT_BUSY_RETRY_MS: 5_000,
+      SNAPSHOT_FAILURE_FINGERPRINT_LIMIT: 1_000,
     });
   });
 
@@ -35,6 +48,14 @@ describe("worker environment", () => {
       ["DELIVERY_ENVELOPE_MAX_BYTES", String(128 * 1024 + 1)],
       ["REDIS_STREAM_MAXLEN", "0"],
       ["REDIS_URL", "https://example.test"],
+      ["SNAPSHOT_POLL_INTERVAL_MS", "0"],
+      ["SNAPSHOT_POLL_JITTER_PERCENT", "21"],
+      ["SNAPSHOT_CANDIDATE_SCAN_LIMIT", "101"],
+      ["SNAPSHOT_CANDIDATE_BATCH_SIZE", "17"],
+      ["SNAPSHOT_MAX_CONCURRENCY", "3"],
+      ["SNAPSHOT_MAX_PAYLOAD_BYTES", "16777217"],
+      ["SNAPSHOT_RETRY_CAP_MS", "300001"],
+      ["SNAPSHOT_FAILURE_FINGERPRINT_LIMIT", "1001"],
     ];
     for (const [field, value] of invalidValues)
       expect(() => parseWorkerEnvironment({ ...required, [field]: value })).toThrowError(
@@ -47,6 +68,27 @@ describe("worker environment", () => {
         REDIS_PUBLISH_TIMEOUT_MS: "5000",
       }),
     ).toThrowError(new WorkerEnvironmentConfigurationError(["OUTBOX_LEASE_MS"]));
+    expect(() =>
+      parseWorkerEnvironment({
+        ...required,
+        SNAPSHOT_CANDIDATE_SCAN_LIMIT: "1",
+        SNAPSHOT_CANDIDATE_BATCH_SIZE: "2",
+      }),
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["SNAPSHOT_CANDIDATE_BATCH_SIZE"]));
+    expect(() =>
+      parseWorkerEnvironment({
+        ...required,
+        SNAPSHOT_CANDIDATE_BATCH_SIZE: "1",
+        SNAPSHOT_MAX_CONCURRENCY: "2",
+      }),
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["SNAPSHOT_MAX_CONCURRENCY"]));
+    expect(() =>
+      parseWorkerEnvironment({
+        ...required,
+        SNAPSHOT_RETRY_BASE_MS: "5001",
+        SNAPSHOT_RETRY_CAP_MS: "5000",
+      }),
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["SNAPSHOT_RETRY_BASE_MS"]));
   });
 
   it("reports only field names for secret-bearing configuration errors", () => {
@@ -69,5 +111,25 @@ describe("worker environment", () => {
     const passThrough = new Set(turbo.globalPassThroughEnv as string[]);
 
     expect(workerEnvironmentVariableNames.filter((name) => !passThrough.has(name))).toEqual([]);
+  });
+
+  it("documents every snapshot variable with its parsed default", async () => {
+    const example = await readFile(new URL("../../../.env.example", import.meta.url), "utf8");
+    const entries = new Map(
+      example
+        .split("\n")
+        .filter((line) => line && !line.startsWith("#"))
+        .map((line) => {
+          const separator = line.indexOf("=");
+          return [line.slice(0, separator), line.slice(separator + 1)] as const;
+        }),
+    );
+    const parsed = parseWorkerEnvironment(required);
+    const snapshotNames = workerEnvironmentVariableNames.filter((name) =>
+      name.startsWith("SNAPSHOT_"),
+    ) as Array<keyof typeof parsed>;
+
+    expect(snapshotNames).toHaveLength(13);
+    for (const name of snapshotNames) expect(entries.get(name)).toBe(String(parsed[name]));
   });
 });
