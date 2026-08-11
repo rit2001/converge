@@ -31,6 +31,22 @@ export interface BoardDeliveryHeadWatchdogObserver {
   lifecycle(event: BoardDeliveryHeadWatchdogLifecycleEvent): Promise<void> | void;
 }
 
+export interface BoardDeliveryHeadWatchdogOwner {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export interface BoardDeliveryHeadWatchdogFactoryInput {
+  repository: BoardDeliveryHeadRepository;
+  activeBoards: ActiveBoardProvider;
+  deliveryProgress: DeliveryProgressProvider;
+  observer: BoardDeliveryHeadWatchdogObserver;
+}
+
+export type BoardDeliveryHeadWatchdogFactory = (
+  input: BoardDeliveryHeadWatchdogFactoryInput,
+) => BoardDeliveryHeadWatchdogOwner;
+
 export interface BoardDeliveryHeadWatchdogScheduler {
   now(): number;
   random(): number;
@@ -233,7 +249,16 @@ export class BoardDeliveryHeadWatchdog {
     }
     if (!this.isCurrent(generation)) return;
     this.reconcileActiveBoards(active);
-    if (active.length === 0) return;
+    if (active.length === 0) {
+      if (this.unavailable && !this.databaseFailureNotified) {
+        await this.notify({ state: "recovered" }, generation);
+        if (this.isCurrent(generation)) {
+          this.unavailable = false;
+          this.databaseFailureNotified = false;
+        }
+      }
+      return;
+    }
 
     const batch = this.selectBatch(active);
     const checkController = new AbortController();

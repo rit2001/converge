@@ -35,6 +35,14 @@ import {
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
 import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
+import {
+  BoardDeliveryHeadWatchdog,
+  BoardDeliveryHeadWatchdogError,
+  defaultBoardDeliveryHeadWatchdogConfiguration,
+  type BoardDeliveryHeadWatchdogFactory,
+  type BoardDeliveryHeadWatchdogLifecycleEvent,
+  type BoardDeliveryHeadWatchdogOwner,
+} from "./board-delivery-head-watchdog.js";
 import type {
   DeliveryRuntimeFactory,
   DeliveryRuntimeLifecycleEvent,
@@ -225,6 +233,7 @@ export interface BuildAppOptions {
   deliveryCoordinator?: BoardDeliveryCoordinator;
   deliveryHooks?: DeliveryHooks;
   deliveryMode?: ApplicationDeliveryMode;
+  createBoardDeliveryHeadWatchdog?: BoardDeliveryHeadWatchdogFactory;
   repositoryHooks?: BoardRepositoryHooks;
   loggerStream?: Writable;
 }
@@ -358,6 +367,52 @@ export async function buildApp(
   });
 
   const boardRoom = (boardId: string): string => `board:${boardId}`;
+  const trackedBoards = new Map<string, { references: number; handledDeliverySeq: number }>();
+  const socketBoards = new Map<string, Set<string>>();
+  const socketTracksBoard = (socketId: string, boardId: string): boolean =>
+    socketBoards.get(socketId)?.has(boardId) ?? false;
+  const trackBoardJoin = (socketId: string, boardId: string, baseline?: number): void => {
+    if (socketTracksBoard(socketId, boardId)) return;
+    let board = trackedBoards.get(boardId);
+    if (!board) {
+      if (baseline === undefined || !Number.isSafeInteger(baseline) || baseline < 0)
+        throw new Error(
+          "An authoritative delivery baseline is required for first board activation",
+        );
+      if (trackedBoards.size >= defaultBoardDeliveryHeadWatchdogConfiguration.maximumActiveBoards)
+        throw new BoardDeliveryHeadWatchdogError("ACTIVE_BOARD_CAPACITY_EXCEEDED");
+      board = { references: 0, handledDeliverySeq: baseline };
+      trackedBoards.set(boardId, board);
+    }
+    if (!Number.isSafeInteger(board.references + 1))
+      throw new BoardDeliveryHeadWatchdogError("ACTIVE_BOARD_CAPACITY_EXCEEDED");
+    board.references += 1;
+    const memberships = socketBoards.get(socketId) ?? new Set<string>();
+    memberships.add(boardId);
+    socketBoards.set(socketId, memberships);
+  };
+  const releaseBoardJoin = (socketId: string, boardId: string): void => {
+    const memberships = socketBoards.get(socketId);
+    if (!memberships?.delete(boardId)) return;
+    if (memberships.size === 0) socketBoards.delete(socketId);
+    const board = trackedBoards.get(boardId);
+    if (!board) return;
+    if (board.references <= 1) trackedBoards.delete(boardId);
+    else board.references -= 1;
+  };
+  const releaseSocketBoards = (socketId: string): void => {
+    const memberships = [...(socketBoards.get(socketId) ?? [])];
+    for (const boardId of memberships) releaseBoardJoin(socketId, boardId);
+  };
+  const advanceDeliveryProgress = (boardId: string, deliverySeq: number): void => {
+    const board = trackedBoards.get(boardId);
+    if (!board || !Number.isSafeInteger(deliverySeq) || deliverySeq < 0) return;
+    board.handledDeliverySeq = Math.max(board.handledDeliverySeq, deliverySeq);
+  };
+  const clearTrackedBoards = (): void => {
+    socketBoards.clear();
+    trackedBoards.clear();
+  };
   const evictBoardMember = async (boardId: string, revokedUserId: string): Promise<void> => {
     const event = boardAccessRevokedEventSchema.parse({
       schemaVersion: 1,
@@ -374,6 +429,7 @@ export async function buildApp(
         target.data.revokedBoards.add(boardId);
         target.emit("board:access-revoked", event);
         await target.leave(room);
+        releaseBoardJoin(target.id, boardId);
       }),
     );
   };
@@ -381,8 +437,13 @@ export async function buildApp(
   let deliveryRuntime: DeliveryRuntimeOwner | undefined;
   let deliveryRuntimeStartPromise: Promise<void> | undefined;
   let deliveryRuntimeStopPromise: Promise<void> | undefined;
+  let boardDeliveryHeadWatchdog: BoardDeliveryHeadWatchdogOwner | undefined;
+  let boardDeliveryHeadWatchdogStartPromise: Promise<void> | undefined;
+  let boardDeliveryHeadWatchdogStopPromise: Promise<void> | undefined;
   let socketIoClosePromise: Promise<void> | undefined;
   let distributedSocketReady = deliveryMode.mode === "local";
+  let consumerSocketReady = deliveryMode.mode === "local";
+  let watchdogSocketReady = true;
   let distributedReadinessTerminal = false;
   let applicationClosing = false;
   let acceptsDistributedDeliveries = false;
@@ -392,13 +453,22 @@ export async function buildApp(
   const requireSocketReadiness = (): void => {
     if (!socketsAreReady()) throw socketDeliveryUnavailableError();
   };
-  const makeSocketsUnready = (terminal: boolean): void => {
+  const refreshSocketReadiness = (): void => {
     if (deliveryMode.mode === "local") return;
     const wasReady = distributedSocketReady;
-    distributedSocketReady = false;
-    acceptsDistributedDeliveries = false;
-    if (terminal) distributedReadinessTerminal = true;
-    if (wasReady) io.local.disconnectSockets(true);
+    distributedSocketReady =
+      !applicationClosing &&
+      !distributedReadinessTerminal &&
+      consumerSocketReady &&
+      watchdogSocketReady;
+    acceptsDistributedDeliveries = distributedSocketReady;
+    if (wasReady && !distributedSocketReady) io.local.disconnectSockets(true);
+  };
+  const makeSocketsTerminallyUnready = (): void => {
+    if (deliveryMode.mode === "local") return;
+    distributedReadinessTerminal = true;
+    consumerSocketReady = false;
+    refreshSocketReadiness();
   };
   const observeDeliveryLifecycle = (event: DeliveryRuntimeLifecycleEvent): void => {
     if (deliveryMode.mode === "local" || applicationClosing) return;
@@ -406,22 +476,28 @@ export async function buildApp(
       case "established":
       case "recovered":
         if (distributedReadinessTerminal) return;
-        distributedSocketReady = true;
-        acceptsDistributedDeliveries = true;
+        consumerSocketReady = true;
+        refreshSocketReadiness();
         return;
       case "unavailable":
       case "recovering":
-        makeSocketsUnready(false);
+        consumerSocketReady = false;
+        refreshSocketReadiness();
         return;
       case "terminal":
       case "stopped":
-        makeSocketsUnready(true);
+        makeSocketsTerminallyUnready();
         return;
     }
   };
   const deliveryRuntimeObserver: DeliveryRuntimeObserver = {
     lifecycle: observeDeliveryLifecycle,
     quarantine: () => Promise.resolve(),
+  };
+  const observeWatchdogLifecycle = (event: BoardDeliveryHeadWatchdogLifecycleEvent): void => {
+    if (deliveryMode.mode === "local" || applicationClosing) return;
+    watchdogSocketReady = event.state === "recovered";
+    refreshSocketReadiness();
   };
 
   app.delete<{
@@ -490,6 +566,7 @@ export async function buildApp(
     const user = socket.data.principal;
     let windowStarted = Date.now();
     let commandsInWindow = 0;
+    socket.on("disconnect", () => releaseSocketBoards(socket.id));
     socket.on("board:join", async (raw, acknowledge) => {
       if (!socketsAreReady()) return;
       if (typeof acknowledge !== "function") {
@@ -499,22 +576,42 @@ export async function buildApp(
       try {
         requireSocketReadiness();
         const request = joinBoardRequestSchema.parse(raw);
-        await deliveryCoordinator.run(request.boardId, async () => {
+        const joinWatermark = await deliveryCoordinator.run(request.boardId, async () => {
           requireSocketReadiness();
           if (socket.data.revokedBoards.has(request.boardId))
             throw new RepositoryError("FORBIDDEN", "Board access was revoked");
           const role = await repository.roleFor(request.boardId, user.id);
           requireSocketReadiness();
           if (!role) throw new RepositoryError("FORBIDDEN", "Board membership required");
-          await socket.join(boardRoom(request.boardId));
+          const alreadyTracked = socketTracksBoard(socket.id, request.boardId);
+          let deliveryBaseline: number | undefined;
+          if (
+            deliveryMode.mode === "distributed" &&
+            !alreadyTracked &&
+            !trackedBoards.has(request.boardId)
+          ) {
+            const [head] = await repository.getBoardDeliveryHeads([request.boardId]);
+            requireSocketReadiness();
+            deliveryBaseline = head?.lastDeliverySeq;
+          }
+          const watermark = await repository.getBoardSequence(request.boardId, user.id);
+          requireSocketReadiness();
+          if (deliveryMode.mode === "distributed" && !alreadyTracked)
+            trackBoardJoin(socket.id, request.boardId, deliveryBaseline);
+          try {
+            await socket.join(boardRoom(request.boardId));
+          } catch (error) {
+            if (deliveryMode.mode === "distributed" && !alreadyTracked)
+              releaseBoardJoin(socket.id, request.boardId);
+            throw error;
+          }
+          return watermark;
         });
         await options.synchronizationHooks?.afterRoomJoin?.({
           boardId: request.boardId,
           userId: user.id,
           socketId: socket.id,
         });
-        requireSocketReadiness();
-        const joinWatermark = await repository.getBoardSequence(request.boardId, user.id);
         requireSocketReadiness();
         if (request.lastAppliedSeq > joinWatermark)
           throw new RepositoryError(
@@ -619,6 +716,10 @@ export async function buildApp(
     deliveryRuntimeStopPromise ??= deliveryRuntime?.stop() ?? Promise.resolve();
     return deliveryRuntimeStopPromise;
   };
+  const stopBoardDeliveryHeadWatchdogOnce = (): Promise<void> => {
+    boardDeliveryHeadWatchdogStopPromise ??= boardDeliveryHeadWatchdog?.stop() ?? Promise.resolve();
+    return boardDeliveryHeadWatchdogStopPromise;
+  };
   const closeSocketIoOnce = (): Promise<void> => {
     socketIoClosePromise ??= io.close();
     return socketIoClosePromise;
@@ -626,18 +727,24 @@ export async function buildApp(
   app.addHook("onReady", async () => {
     if (!deliveryRuntime) return;
     try {
+      boardDeliveryHeadWatchdogStartPromise ??=
+        boardDeliveryHeadWatchdog?.start() ?? Promise.resolve();
+      await boardDeliveryHeadWatchdogStartPromise;
       deliveryRuntimeStartPromise ??= deliveryRuntime.start();
       await deliveryRuntimeStartPromise;
     } catch (error) {
-      makeSocketsUnready(true);
+      makeSocketsTerminallyUnready();
       await stopDeliveryRuntimeOnce().catch(() => undefined);
+      await stopBoardDeliveryHeadWatchdogOnce().catch(() => undefined);
       throw error;
     }
   });
   app.addHook("preClose", async () => {
     applicationClosing = true;
-    makeSocketsUnready(true);
+    makeSocketsTerminallyUnready();
     await stopDeliveryRuntimeOnce();
+    await stopBoardDeliveryHeadWatchdogOnce();
+    clearTrackedBoards();
     await closeSocketIoOnce();
   });
 
@@ -647,6 +754,23 @@ export async function buildApp(
       throw new TypeError("Distributed delivery mode requires a runtime factory");
     }
     try {
+      const createWatchdog =
+        options.createBoardDeliveryHeadWatchdog ??
+        ((input) =>
+          new BoardDeliveryHeadWatchdog(
+            input.repository,
+            input.activeBoards,
+            input.deliveryProgress,
+            input.observer,
+          ));
+      boardDeliveryHeadWatchdog = createWatchdog({
+        repository,
+        activeBoards: { activeBoardIds: () => trackedBoards.keys() },
+        deliveryProgress: {
+          handledDeliverySequence: (boardId) => trackedBoards.get(boardId)?.handledDeliverySeq ?? 0,
+        },
+        observer: { lifecycle: observeWatchdogLifecycle },
+      });
       deliveryRuntime = deliveryMode.createRuntime(
         {
           operationCommitted: (envelope) => {
@@ -657,6 +781,7 @@ export async function buildApp(
               if (operation.boardId !== envelope.boardId)
                 throw new Error("Committed operation board does not match its delivery envelope");
               io.local.to(boardRoom(envelope.boardId)).emit("operation:committed", operation);
+              advanceDeliveryProgress(envelope.boardId, envelope.deliverySeq);
               return Promise.resolve();
             });
           },
@@ -665,7 +790,12 @@ export async function buildApp(
             return deliveryCoordinator.run(envelope.boardId, () => {
               if (!acceptsDistributedDeliveries) return Promise.resolve();
               const revocation = membershipRevokedDeliveryEnvelopeSchema.parse(envelope);
-              return evictBoardMember(revocation.boardId, revocation.payload.revokedUserId);
+              return evictBoardMember(revocation.boardId, revocation.payload.revokedUserId).then(
+                () => {
+                  if (acceptsDistributedDeliveries)
+                    advanceDeliveryProgress(revocation.boardId, revocation.deliverySeq);
+                },
+              );
             });
           },
         },
