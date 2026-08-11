@@ -4,7 +4,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type pg from "pg";
 import {
   BoardRepository,
+  BoardSnapshotCandidateRepository,
   BoardSnapshotRepository,
+  SNAPSHOT_OPERATION_THRESHOLD_DEFAULT,
+  SnapshotCandidateError,
   canonicalBoardSnapshot,
   createPool,
   hashBoardSnapshot,
@@ -25,6 +28,7 @@ let adminPool: ReturnType<typeof createPool>;
 let pool: ReturnType<typeof createPool>;
 let boards: BoardRepository;
 let snapshots: BoardSnapshotRepository;
+let candidates: BoardSnapshotCandidateRepository;
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
   let resolve!: () => void;
@@ -60,6 +64,34 @@ function operation(
   } as DurableCommand;
 }
 
+async function commitCreations(
+  boardId: string,
+  count: number,
+  startingSequence = 0,
+): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    const targetId = crypto.randomUUID();
+    await boards.commitOperation(
+      fixtureIds.user,
+      operation(boardId, startingSequence + index, "object.create", targetId, {
+        id: targetId,
+        kind: "rectangle",
+        x: index,
+        y: index,
+        width: 80,
+        height: 40,
+        rotation: 0,
+        fill: "#123456",
+        text: "",
+      }),
+    );
+  }
+}
+
+function afterAge(timestamp: string, ageMs = 86_400_000): Date {
+  return new Date(new Date(timestamp).getTime() + ageMs);
+}
+
 beforeAll(async () => {
   databaseName = `converge_snapshot_${process.pid}_${crypto
     .randomUUID()
@@ -80,10 +112,14 @@ beforeAll(async () => {
   pool = createPool(databaseUrl);
   boards = new BoardRepository(pool);
   snapshots = new BoardSnapshotRepository(pool);
+  candidates = new BoardSnapshotCandidateRepository(pool);
   const migrations = await pool.query<{ name: string }>(
     "SELECT name FROM converge_migrations ORDER BY name",
   );
   expect(migrations.rows.map(({ name }) => name)).toContain("0007_verified_board_snapshots.sql");
+  expect(migrations.rows.map(({ name }) => name)).toContain(
+    "0008_snapshot_invalidation_diagnostics.sql",
+  );
 });
 
 afterEach(async () => {
@@ -406,5 +442,289 @@ describe("verified board snapshots", () => {
     expect(first.snapshotSeq).toBe(0);
     expect(second.snapshotSeq).toBe(1);
     expect((await snapshots.loadLatest(boardId))?.id).toBe(second.id);
+  });
+});
+
+describe("bounded snapshot candidate discovery and capture fencing", () => {
+  it("discovers immediate bootstrap eligibility, including a genesis board", async () => {
+    const boardId = await createBoard("candidate-bootstrap");
+    const result = await candidates.discover();
+    expect(result).toMatchObject({ inspectedCount: 1, nextCursor: boardId });
+    expect(result.candidates).toEqual([
+      {
+        boardId,
+        canvasHead: 0,
+        deliveryHead: 0,
+        verifiedSnapshotCanvasHead: null,
+        verifiedSnapshotDeliveryHead: null,
+        reason: "bootstrap",
+      },
+    ]);
+  });
+
+  it("excludes a post-snapshot tail below every threshold", async () => {
+    const boardId = await createBoard("candidate-below-threshold");
+    const snapshot = await snapshots.create(boardId);
+    await commitCreations(boardId, 1);
+    const result = await candidates.discover({
+      operationThreshold: 2,
+      operationBytesThreshold: Number.MAX_SAFE_INTEGER,
+      currentTime: new Date(snapshot.verifiedAt),
+    });
+    expect(result.candidates).toEqual([]);
+  });
+
+  it("selects at the canvas-operation threshold", async () => {
+    const boardId = await createBoard("candidate-operation-count");
+    await snapshots.create(boardId);
+    await commitCreations(boardId, 2);
+    const result = await candidates.discover({
+      operationThreshold: 2,
+      operationBytesThreshold: Number.MAX_SAFE_INTEGER,
+    });
+    expect(result.candidates).toEqual([
+      expect.objectContaining({ boardId, canvasHead: 2, reason: "operation_count" }),
+    ]);
+    expect(SNAPSHOT_OPERATION_THRESHOLD_DEFAULT).toBe(1_000);
+  });
+
+  it("uses PostgreSQL pg_column_size(command) for the bounded operation-byte threshold", async () => {
+    const boardId = await createBoard("candidate-operation-bytes");
+    await snapshots.create(boardId);
+    await commitCreations(boardId, 1);
+    const measured = await pool.query<{ bytes: string }>(
+      `SELECT pg_column_size(command)::text AS bytes
+       FROM board_operations
+       WHERE board_id = $1`,
+      [boardId],
+    );
+    const threshold = Number(measured.rows[0]?.bytes);
+    const result = await candidates.discover({
+      operationThreshold: 1_000,
+      operationBytesThreshold: threshold,
+    });
+    expect(result.candidates).toEqual([
+      expect.objectContaining({ boardId, reason: "operation_bytes" }),
+    ]);
+  });
+
+  it("selects a 24-hour-old snapshot after canvas-head advancement", async () => {
+    const boardId = await createBoard("candidate-canvas-age");
+    const snapshot = await snapshots.create(boardId);
+    await commitCreations(boardId, 1);
+    const result = await candidates.discover({
+      operationThreshold: 1_000,
+      operationBytesThreshold: Number.MAX_SAFE_INTEGER,
+      currentTime: afterAge(snapshot.verifiedAt),
+    });
+    expect(result.candidates).toEqual([
+      expect.objectContaining({ boardId, canvasHead: 1, deliveryHead: 1, reason: "changed_age" }),
+    ]);
+  });
+
+  it("uses delivery-head-only advancement only for the 24-hour trigger", async () => {
+    const boardId = await createBoard("candidate-delivery-age");
+    const snapshot = await snapshots.create(boardId);
+    await pool.query("UPDATE boards SET last_delivery_seq = 1 WHERE id = $1", [boardId]);
+
+    expect(
+      (
+        await candidates.discover({
+          operationThreshold: 1,
+          operationBytesThreshold: Number.MAX_SAFE_INTEGER,
+          currentTime: new Date(snapshot.verifiedAt),
+        })
+      ).candidates,
+    ).toEqual([]);
+    expect(
+      (
+        await candidates.discover({
+          operationThreshold: 1,
+          operationBytesThreshold: Number.MAX_SAFE_INTEGER,
+          currentTime: afterAge(snapshot.verifiedAt),
+        })
+      ).candidates,
+    ).toEqual([
+      expect.objectContaining({ boardId, canvasHead: 0, deliveryHead: 1, reason: "changed_age" }),
+    ]);
+  });
+
+  it("does not resnapshot an unchanged board solely because time passed", async () => {
+    const boardId = await createBoard("candidate-no-change-age");
+    const snapshot = await snapshots.create(boardId);
+    const result = await candidates.discover({ currentTime: afterAge(snapshot.verifiedAt) });
+    expect(result.candidates).toEqual([]);
+  });
+
+  it("immediately selects replacement for a newest invalid snapshot", async () => {
+    const boardId = await createBoard("candidate-invalid-replacement");
+    const snapshot = await snapshots.create(boardId);
+    await pool.query(
+      `UPDATE board_snapshots
+       SET status = 'invalid', invalidation_code = 'TEST_INVALID', invalidated_at = clock_timestamp()
+       WHERE id = $1`,
+      [snapshot.id],
+    );
+    const result = await candidates.discover();
+    expect(result.candidates).toEqual([
+      expect.objectContaining({ boardId, reason: "invalid_replacement" }),
+    ]);
+  });
+
+  it("enforces scan/result bounds and advances the cursor past every inspected board", async () => {
+    const boardIds = await Promise.all(
+      Array.from({ length: 5 }, (_, index) => createBoard(`candidate-limits-${index}`)),
+    );
+    const ordered = [...boardIds].sort();
+    const result = await candidates.discover({ scanLimit: 3, candidateLimit: 2 });
+    expect(result.inspectedCount).toBe(3);
+    expect(result.candidates.map(({ boardId }) => boardId)).toEqual(ordered.slice(0, 2));
+    expect(result.nextCursor).toBe(ordered[2]);
+  });
+
+  it("wraps deterministically without inspecting a board twice in one cycle", async () => {
+    const boardIds = await Promise.all(
+      Array.from({ length: 4 }, (_, index) => createBoard(`candidate-wrap-${index}`)),
+    );
+    const ordered = [...boardIds].sort();
+    const cursor = ordered.at(1);
+    if (!cursor) throw new Error("Expected a round-robin cursor fixture");
+    const result = await candidates.discover({
+      cursor,
+      scanLimit: 3,
+      candidateLimit: 3,
+    });
+    expect(result.candidates.map(({ boardId }) => boardId)).toEqual([
+      ordered[2],
+      ordered[3],
+      ordered[0],
+    ]);
+    expect(new Set(result.candidates.map(({ boardId }) => boardId)).size).toBe(3);
+    expect(result.nextCursor).toBe(ordered[0]);
+  });
+
+  it("discovers candidates without mutating durable board or snapshot state", async () => {
+    const boardId = await createBoard("candidate-read-only");
+    const before = await pool.query(
+      `SELECT b.last_seq, b.last_delivery_seq,
+              (SELECT count(*)::text FROM board_operations o WHERE o.board_id = b.id) AS operations,
+              (SELECT count(*)::text FROM board_snapshots s WHERE s.board_id = b.id) AS snapshots
+       FROM boards b WHERE b.id = $1`,
+      [boardId],
+    );
+    await candidates.discover();
+    const after = await pool.query(
+      `SELECT b.last_seq, b.last_delivery_seq,
+              (SELECT count(*)::text FROM board_operations o WHERE o.board_id = b.id) AS operations,
+              (SELECT count(*)::text FROM board_snapshots s WHERE s.board_id = b.id) AS snapshots
+       FROM boards b WHERE b.id = $1`,
+      [boardId],
+    );
+    expect(after.rows).toEqual(before.rows);
+  });
+
+  it("returns busy immediately without state changes when the board lock is held", async () => {
+    const boardId = await createBoard("candidate-busy");
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
+      await expect(candidates.capture(boardId)).resolves.toEqual({ status: "busy" });
+      const count = await pool.query<{ count: string }>(
+        "SELECT count(*) FROM board_snapshots WHERE board_id = $1",
+        [boardId],
+      );
+      expect(count.rows[0]?.count).toBe("0");
+    } finally {
+      await holder.query("ROLLBACK");
+      holder.release();
+    }
+  });
+
+  it("returns no_longer_eligible when another capture already satisfied the candidate", async () => {
+    const boardId = await createBoard("candidate-recheck");
+    expect((await candidates.discover()).candidates).toHaveLength(1);
+    await snapshots.create(boardId);
+    await expect(candidates.capture(boardId)).resolves.toEqual({
+      status: "no_longer_eligible",
+    });
+  });
+
+  it("allows concurrent workers to create at most one snapshot for captured heads", async () => {
+    const boardId = await createBoard("candidate-concurrent");
+    const peer = new BoardSnapshotCandidateRepository(pool);
+    const outcomes = await Promise.all([candidates.capture(boardId), peer.capture(boardId)]);
+    expect(outcomes.filter(({ status }) => status === "captured")).toHaveLength(1);
+    expect(
+      outcomes.every(({ status }) => ["captured", "busy", "no_longer_eligible"].includes(status)),
+    ).toBe(true);
+    const count = await pool.query<{ count: string }>(
+      "SELECT count(*) FROM board_snapshots WHERE board_id = $1",
+      [boardId],
+    );
+    expect(count.rows[0]?.count).toBe("1");
+  });
+
+  it("captures and verifies one eligible snapshot without advancing either head", async () => {
+    const boardId = await createBoard("candidate-capture");
+    await commitCreations(boardId, 1);
+    const headsBefore = await pool.query(
+      "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
+      [boardId],
+    );
+    const outcome = await candidates.capture(boardId);
+    expect(outcome).toMatchObject({ status: "captured", canvasHead: 1, deliveryHead: 1 });
+    const headsAfter = await pool.query(
+      "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
+      [boardId],
+    );
+    expect(headsAfter.rows).toEqual(headsBefore.rows);
+    expect((await snapshots.loadLatest(boardId))?.id).toBe(
+      outcome.status === "captured" ? outcome.snapshotId : "unreachable",
+    );
+  });
+
+  it("returns deterministic_failure for an oversized canonical payload and inserts no row", async () => {
+    const boardId = await createBoard("candidate-payload-limit");
+    await expect(candidates.capture(boardId, { maximumPayloadBytes: 1 })).resolves.toEqual({
+      status: "deterministic_failure",
+      code: "SNAPSHOT_TOO_LARGE",
+    });
+    const count = await pool.query<{ count: string }>(
+      "SELECT count(*) FROM board_snapshots WHERE board_id = $1",
+      [boardId],
+    );
+    expect(count.rows[0]?.count).toBe("0");
+  });
+
+  it("does not mislabel unexpected failures as deterministic outcomes", async () => {
+    const boardId = await createBoard("candidate-unexpected-failure");
+    const failure = Object.assign(new Error("injected PostgreSQL failure"), { code: "57P01" });
+    const failing = new BoardSnapshotCandidateRepository({
+      connect: () =>
+        Promise.resolve({
+          query: (sql: string) =>
+            sql === "BEGIN" || sql === "ROLLBACK"
+              ? Promise.resolve({ rows: [] })
+              : Promise.reject(failure),
+          release: () => undefined,
+        }),
+    } as unknown as pg.Pool);
+    await expect(failing.capture(boardId)).rejects.toBe(failure);
+  });
+
+  it("rejects malformed cursor and unsafe or non-positive bounds", async () => {
+    await expect(candidates.discover({ cursor: "not-a-board" })).rejects.toBeInstanceOf(
+      SnapshotCandidateError,
+    );
+    await expect(candidates.discover({ scanLimit: 0 })).rejects.toBeInstanceOf(
+      SnapshotCandidateError,
+    );
+    await expect(
+      candidates.discover({ changedAgeMs: Number.MAX_SAFE_INTEGER }),
+    ).rejects.toBeInstanceOf(SnapshotCandidateError);
+    await expect(
+      candidates.capture(crypto.randomUUID(), { maximumPayloadBytes: 16_777_217 }),
+    ).rejects.toBeInstanceOf(SnapshotCandidateError);
   });
 });

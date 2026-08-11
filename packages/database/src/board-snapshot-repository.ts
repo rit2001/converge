@@ -299,6 +299,96 @@ function isUniqueViolation(error: unknown): boolean {
   return isRecord(error) && error.code === "23505";
 }
 
+/** Capture after the caller has begun a transaction and acquired the board advisory lock. */
+export async function captureBoardSnapshotInTransaction(
+  client: pg.PoolClient,
+  boardId: string,
+  hooks: BoardSnapshotRepositoryHooks = {},
+  maximumBytes = BOARD_SNAPSHOT_MAX_BYTES,
+): Promise<VerifiedBoardSnapshot> {
+  const board = await client.query<{
+    id: string;
+    name: string;
+    last_seq: string;
+    last_delivery_seq: string;
+  }>("SELECT id, name, last_seq, last_delivery_seq FROM boards WHERE id = $1 FOR UPDATE", [
+    boardId,
+  ]);
+  const boardRow = board.rows[0];
+  if (!boardRow) throw new BoardSnapshotError("BOARD_NOT_FOUND");
+  const rows = await client.query<ProjectionRow>(
+    `SELECT object_id, stack_order, object_data, field_seq, created_seq, updated_seq, deleted_seq
+     FROM board_objects
+     WHERE board_id = $1
+     ORDER BY stack_order, object_id`,
+    [boardId],
+  );
+  const rawProjection = {
+    schemaVersion: BOARD_SNAPSHOT_SCHEMA_VERSION,
+    boardId: boardRow.id,
+    boardName: boardRow.name,
+    lastSeq: parseSafeSequence(boardRow.last_seq),
+    lastDeliverySeq: parseSafeSequence(boardRow.last_delivery_seq),
+    objects: rows.rows.map((row) => ({
+      objectId: row.object_id,
+      stackOrder: parseSafeSequence(row.stack_order, true),
+      value: row.object_data,
+      fieldSeq: row.field_seq,
+      createdSeq: parseSafeSequence(row.created_seq, true),
+      updatedSeq: parseSafeSequence(row.updated_seq, true),
+      deletedSeq: row.deleted_seq === null ? null : parseSafeSequence(row.deleted_seq, true),
+    })),
+  };
+  let projection: BoardSnapshotProjection;
+  try {
+    projection = parseBoardSnapshotProjection(rawProjection);
+  } catch (error) {
+    if (error instanceof BoardSnapshotError && error.code === "UNSUPPORTED_SNAPSHOT_VERSION")
+      throw error;
+    throw new BoardSnapshotError("INVALID_SOURCE_PROJECTION");
+  }
+  await hooks.afterProjectionRead?.(projection);
+  const canonical = canonicalBoardSnapshot(projection);
+  const byteSize = Buffer.byteLength(canonical, "utf8");
+  if (byteSize > maximumBytes) throw new BoardSnapshotError("SNAPSHOT_TOO_LARGE");
+  const snapshotId = crypto.randomUUID();
+  await client.query(
+    `INSERT INTO board_snapshots(
+       id, board_id, snapshot_seq, snapshot_delivery_seq, schema_version, projection,
+       canonical_hash, object_count, byte_size, status
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'creating')`,
+    [
+      snapshotId,
+      projection.boardId,
+      projection.lastSeq,
+      projection.lastDeliverySeq,
+      projection.schemaVersion,
+      projection,
+      hashBoardSnapshot(projection),
+      projection.objects.length,
+      byteSize,
+    ],
+  );
+  await hooks.afterInsert?.(snapshotId);
+  const reread = await client.query<BoardSnapshotStorageRow>(
+    "SELECT * FROM board_snapshots WHERE id = $1",
+    [snapshotId],
+  );
+  const insertedRow = reread.rows[0];
+  if (!insertedRow) throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
+  verifyStoredBoardSnapshot(insertedRow, false);
+  const verified = await client.query<BoardSnapshotStorageRow>(
+    `UPDATE board_snapshots
+     SET status = 'verified', verified_at = clock_timestamp()
+     WHERE id = $1 AND status = 'creating'
+     RETURNING *`,
+    [snapshotId],
+  );
+  const verifiedRow = verified.rows[0];
+  if (!verifiedRow) throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
+  return verifyStoredBoardSnapshot(verifiedRow, true);
+}
+
 export class BoardSnapshotRepository {
   constructor(
     private readonly pool: pg.Pool,
@@ -313,87 +403,7 @@ export class BoardSnapshotRepository {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
       await this.hooks.afterAdvisoryLock?.(boardId);
-      const board = await client.query<{
-        id: string;
-        name: string;
-        last_seq: string;
-        last_delivery_seq: string;
-      }>("SELECT id, name, last_seq, last_delivery_seq FROM boards WHERE id = $1 FOR UPDATE", [
-        boardId,
-      ]);
-      const boardRow = board.rows[0];
-      if (!boardRow) throw new BoardSnapshotError("BOARD_NOT_FOUND");
-      const rows = await client.query<ProjectionRow>(
-        `SELECT object_id, stack_order, object_data, field_seq, created_seq, updated_seq, deleted_seq
-         FROM board_objects
-         WHERE board_id = $1
-         ORDER BY stack_order, object_id`,
-        [boardId],
-      );
-      const rawProjection = {
-        schemaVersion: BOARD_SNAPSHOT_SCHEMA_VERSION,
-        boardId: boardRow.id,
-        boardName: boardRow.name,
-        lastSeq: parseSafeSequence(boardRow.last_seq),
-        lastDeliverySeq: parseSafeSequence(boardRow.last_delivery_seq),
-        objects: rows.rows.map((row) => ({
-          objectId: row.object_id,
-          stackOrder: parseSafeSequence(row.stack_order, true),
-          value: row.object_data,
-          fieldSeq: row.field_seq,
-          createdSeq: parseSafeSequence(row.created_seq, true),
-          updatedSeq: parseSafeSequence(row.updated_seq, true),
-          deletedSeq: row.deleted_seq === null ? null : parseSafeSequence(row.deleted_seq, true),
-        })),
-      };
-      let projection: BoardSnapshotProjection;
-      try {
-        projection = parseBoardSnapshotProjection(rawProjection);
-      } catch (error) {
-        if (error instanceof BoardSnapshotError && error.code === "UNSUPPORTED_SNAPSHOT_VERSION")
-          throw error;
-        throw new BoardSnapshotError("INVALID_SOURCE_PROJECTION");
-      }
-      await this.hooks.afterProjectionRead?.(projection);
-      const canonical = canonicalBoardSnapshot(projection);
-      const byteSize = Buffer.byteLength(canonical, "utf8");
-      if (byteSize > BOARD_SNAPSHOT_MAX_BYTES) throw new BoardSnapshotError("SNAPSHOT_TOO_LARGE");
-      const snapshotId = crypto.randomUUID();
-      await client.query(
-        `INSERT INTO board_snapshots(
-           id, board_id, snapshot_seq, snapshot_delivery_seq, schema_version, projection,
-           canonical_hash, object_count, byte_size, status
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'creating')`,
-        [
-          snapshotId,
-          projection.boardId,
-          projection.lastSeq,
-          projection.lastDeliverySeq,
-          projection.schemaVersion,
-          projection,
-          hashBoardSnapshot(projection),
-          projection.objects.length,
-          byteSize,
-        ],
-      );
-      await this.hooks.afterInsert?.(snapshotId);
-      const reread = await client.query<BoardSnapshotStorageRow>(
-        "SELECT * FROM board_snapshots WHERE id = $1",
-        [snapshotId],
-      );
-      const insertedRow = reread.rows[0];
-      if (!insertedRow) throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
-      verifyStoredBoardSnapshot(insertedRow, false);
-      const verified = await client.query<BoardSnapshotStorageRow>(
-        `UPDATE board_snapshots
-         SET status = 'verified', verified_at = clock_timestamp()
-         WHERE id = $1 AND status = 'creating'
-         RETURNING *`,
-        [snapshotId],
-      );
-      const verifiedRow = verified.rows[0];
-      if (!verifiedRow) throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
-      const result = verifyStoredBoardSnapshot(verifiedRow, true);
+      const result = await captureBoardSnapshotInTransaction(client, boardId, this.hooks);
       await client.query("COMMIT");
       return result;
     } catch (error) {
