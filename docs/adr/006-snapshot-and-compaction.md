@@ -79,6 +79,19 @@ hash, and each contiguous tail operation. They replace only authoritative commit
 durable pending commands, and then reapply pending optimistic overlays under the existing session and
 attempt fencing. A client never splices a tail onto a different snapshot sequence.
 
+The backward-compatible authenticated recovery endpoint is
+`GET /v1/boards/:boardId/recovery`. Its strict response identifies the verified snapshot and its
+canvas/delivery heads, the fixed current heads, the full snapshot projection and canonical hash, the
+contiguous operation tail, and the reconstructed current canonical hash. Existing board snapshot and
+operation-range endpoints retain their contracts.
+
+When current durable evidence cannot form any complete trustworthy snapshot-plus-tail chain, the
+endpoint returns HTTP `409` with the strict `RECOVERY_BLOCKED` protocol error, the sanitized message
+`Authoritative board recovery is unavailable`, and `retryable: false`. Snapshot invalidation remains
+owned by the database repository; the HTTP response neither repairs nor invalidates data. PostgreSQL
+connection loss, query timeout, pool shutdown, and unexpected programming failures are not durable
+recovery evidence and retain the existing sanitized retryable `INTERNAL_ERROR` response.
+
 If the newest snapshot fails validation, it is marked invalid and the server tries an earlier verified
 snapshot only when the complete tail from that snapshot still exists. Otherwise the board is
 operator-blocked for recovery. The system never serves a hash-mismatched snapshot or invents missing

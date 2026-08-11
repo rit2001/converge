@@ -151,6 +151,7 @@ export const errorCodeSchema = z.enum([
   "RESYNC_REQUIRED",
   "CANNOT_REMOVE_OWNER",
   "ACCESS_REVOKED",
+  "RECOVERY_BLOCKED",
   "INTERNAL_ERROR",
 ]);
 
@@ -161,7 +162,17 @@ export const protocolErrorSchema = z
     message: z.string().max(500),
     retryable: z.boolean(),
   })
-  .strict();
+  .strict()
+  .superRefine((error, context) => {
+    if (
+      error.code === "RECOVERY_BLOCKED" &&
+      (error.message !== "Authoritative board recovery is unavailable" || error.retryable)
+    )
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Recovery-blocked errors use the fixed non-retryable public contract",
+      });
+  });
 
 export const httpInternalErrorResponseSchema = z
   .object({
@@ -173,7 +184,7 @@ export const httpInternalErrorResponseSchema = z
   })
   .strict();
 
-export const operationAckSchema = z.discriminatedUnion("ok", [
+export const operationAckSchema = z.union([
   z
     .object({ ok: z.literal(true), duplicate: z.boolean(), operation: committedOperationSchema })
     .strict(),
@@ -188,6 +199,122 @@ export const boardSnapshotSchema = z
     objects: z.array(canvasObjectSchema),
   })
   .strict();
+
+const recoveryFieldSeqSchema = z
+  .object({
+    id: sequenceSchema.positive(),
+    kind: sequenceSchema.positive(),
+    x: sequenceSchema.positive(),
+    y: sequenceSchema.positive(),
+    width: sequenceSchema.positive(),
+    height: sequenceSchema.positive(),
+    rotation: sequenceSchema.positive(),
+    fill: sequenceSchema.positive(),
+    text: sequenceSchema.positive(),
+  })
+  .strict();
+
+export const boardRecoverySnapshotStateSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    boardName: z.string().min(1).max(120),
+    lastSeq: sequenceSchema,
+    lastDeliverySeq: sequenceSchema,
+    objects: z.array(
+      z
+        .object({
+          objectId: idSchema,
+          stackOrder: sequenceSchema.positive(),
+          value: canvasObjectSchema,
+          fieldSeq: recoveryFieldSeqSchema,
+          createdSeq: sequenceSchema.positive(),
+          updatedSeq: sequenceSchema.positive(),
+          deletedSeq: sequenceSchema.positive().nullable(),
+        })
+        .strict(),
+    ),
+  })
+  .strict()
+  .superRefine((state, context) => {
+    if (state.lastDeliverySeq < state.lastSeq) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Delivery head precedes canvas head",
+      });
+      return;
+    }
+    let priorStackOrder = 0;
+    for (const object of state.objects) {
+      if (
+        object.objectId !== object.value.id ||
+        object.stackOrder <= priorStackOrder ||
+        object.createdSeq > object.updatedSeq ||
+        object.updatedSeq > state.lastSeq ||
+        (object.deletedSeq !== null &&
+          (object.deletedSeq !== object.updatedSeq || object.deletedSeq > state.lastSeq)) ||
+        Object.values(object.fieldSeq).some((sequence) => sequence > state.lastSeq)
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Invalid authoritative snapshot projection",
+        });
+        return;
+      }
+      priorStackOrder = object.stackOrder;
+    }
+  });
+
+export const boardRecoveryRequestQuerySchema = z.object({}).strict();
+
+export const boardRecoveryMaterialSchema = z
+  .object({
+    boardId: idSchema,
+    snapshotId: idSchema,
+    snapshotSchemaVersion: z.literal(SCHEMA_VERSION),
+    snapshotCanvasSeq: sequenceSchema,
+    snapshotDeliverySeq: sequenceSchema,
+    capturedCanvasSeq: sequenceSchema,
+    capturedDeliverySeq: sequenceSchema,
+    snapshotState: boardRecoverySnapshotStateSchema,
+    snapshotCanonicalHash: z.string().regex(/^[0-9a-f]{64}$/),
+    operationTail: z.array(committedOperationSchema).max(MAX_SYNC_BATCH_SIZE),
+    reconstructedCanonicalHash: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict()
+  .superRefine((material, context) => {
+    if (
+      material.snapshotState.boardId !== material.boardId ||
+      material.snapshotState.schemaVersion !== material.snapshotSchemaVersion ||
+      material.snapshotState.lastSeq !== material.snapshotCanvasSeq ||
+      material.snapshotState.lastDeliverySeq !== material.snapshotDeliverySeq ||
+      material.snapshotCanvasSeq > material.capturedCanvasSeq ||
+      material.snapshotDeliverySeq > material.capturedDeliverySeq
+    ) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Recovery metadata mismatch" });
+      return;
+    }
+    let expected = material.snapshotCanvasSeq + 1;
+    for (const operation of material.operationTail) {
+      if (
+        operation.boardId !== material.boardId ||
+        operation.seq !== expected ||
+        operation.seq > material.capturedCanvasSeq
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Recovery operation tail must be contiguous",
+        });
+        return;
+      }
+      expected += 1;
+    }
+    if (expected - 1 !== material.capturedCanvasSeq)
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Recovery operation tail does not reach the captured head",
+      });
+  });
 export const createBoardRequestSchema = z
   .object({ name: z.string().trim().min(1).max(120) })
   .strict();
@@ -494,10 +621,7 @@ export const joinBoardSuccessSchema = z
   })
   .strict();
 
-export const joinBoardAckSchema = z.discriminatedUnion("ok", [
-  joinBoardSuccessSchema,
-  protocolErrorSchema,
-]);
+export const joinBoardAckSchema = z.union([joinBoardSuccessSchema, protocolErrorSchema]);
 
 export const operationRangeQuerySchema = z
   .object({
@@ -553,6 +677,8 @@ export type OperationAck = z.infer<typeof operationAckSchema>;
 export type ProtocolError = z.infer<typeof protocolErrorSchema>;
 export type HttpInternalErrorResponse = z.infer<typeof httpInternalErrorResponseSchema>;
 export type BoardSnapshot = z.infer<typeof boardSnapshotSchema>;
+export type BoardRecoverySnapshotState = z.infer<typeof boardRecoverySnapshotStateSchema>;
+export type BoardRecoveryMaterial = z.infer<typeof boardRecoveryMaterialSchema>;
 export type JoinBoardRequest = z.infer<typeof joinBoardRequestSchema>;
 export type JoinBoardAck = z.infer<typeof joinBoardAckSchema>;
 export type OperationRangeQuery = z.infer<typeof operationRangeQuerySchema>;

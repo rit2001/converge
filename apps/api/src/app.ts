@@ -5,14 +5,19 @@ import rateLimit from "@fastify/rate-limit";
 import { Server, type DefaultEventsMap } from "socket.io";
 import { z } from "zod";
 import {
+  BoardRecoveryError,
+  BoardRecoveryMaterialRepository,
   BoardRepository,
   RepositoryError,
+  type VerifiedBoardRecoveryMaterial,
   type BoardRepositoryHooks,
   type DatabasePool,
 } from "@converge/database";
 import {
   MAX_SYNC_BATCH_SIZE,
   boardAccessRevokedEventSchema,
+  boardRecoveryMaterialSchema,
+  boardRecoveryRequestQuerySchema,
   committedOperationSchema,
   createBoardRequestSchema,
   durableCommandSchema,
@@ -80,6 +85,50 @@ function failedAck(error: unknown): ProtocolError {
     message: "Operation could not be committed",
     retryable: true,
   };
+}
+
+const durableRecoveryFailureCodes = new Set<BoardRecoveryError["code"]>([
+  "MISSING_BOARD_HEAD",
+  "MISSING_REQUIRED_SNAPSHOT",
+  "SNAPSHOT_CORRUPT",
+  "UNSUPPORTED_SNAPSHOT_VERSION",
+  "SNAPSHOT_HEAD_BEYOND_BOARD",
+  "TAIL_LIMIT_EXCEEDED",
+  "TAIL_GAP",
+  "TAIL_ORDER_CONFLICT",
+  "WRONG_BOARD_OPERATION",
+  "MALFORMED_OPERATION",
+  "OPERATION_BEYOND_HEAD",
+  "REDUCER_FAILURE",
+  "PROJECTION_MISMATCH",
+  "CANONICAL_HASH_MISMATCH",
+  "NO_COMPLETE_RECOVERY_CHAIN",
+]);
+
+function recoveryBlocked(error: BoardRecoveryError): ProtocolError | null {
+  if (!durableRecoveryFailureCodes.has(error.code)) return null;
+  return protocolErrorSchema.parse({
+    ok: false,
+    code: "RECOVERY_BLOCKED",
+    message: "Authoritative board recovery is unavailable",
+    retryable: false,
+  });
+}
+
+function recoveryResponse(material: VerifiedBoardRecoveryMaterial) {
+  return boardRecoveryMaterialSchema.parse({
+    boardId: material.boardId,
+    snapshotId: material.snapshotId,
+    snapshotSchemaVersion: material.snapshotSchemaVersion,
+    snapshotCanvasSeq: material.snapshotCanvasSeq,
+    snapshotDeliverySeq: material.snapshotDeliverySeq,
+    capturedCanvasSeq: material.capturedCanvasSeq,
+    capturedDeliverySeq: material.capturedDeliverySeq,
+    snapshotState: material.snapshot.projection,
+    snapshotCanonicalHash: material.snapshotHash,
+    operationTail: material.operations,
+    reconstructedCanonicalHash: material.reconstructedHash,
+  });
 }
 
 function fastifyClientError(
@@ -235,6 +284,7 @@ export interface BuildAppOptions {
   deliveryMode?: ApplicationDeliveryMode;
   createBoardDeliveryHeadWatchdog?: BoardDeliveryHeadWatchdogFactory;
   repositoryHooks?: BoardRepositoryHooks;
+  recoveryMaterialRepository?: Pick<BoardRecoveryMaterialRepository, "load">;
   loggerStream?: Writable;
 }
 
@@ -254,6 +304,8 @@ export async function buildApp(
   await app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   const repository = new BoardRepository(pool, options.repositoryHooks);
+  const recoveryMaterialRepository =
+    options.recoveryMaterialRepository ?? new BoardRecoveryMaterialRepository(pool);
   const deliveryCoordinator = options.deliveryCoordinator ?? new BoardDeliveryCoordinator();
   const deliveryMode = options.deliveryMode ?? { mode: "local" as const };
   const synchronizationBatchSize = z
@@ -351,6 +403,25 @@ export async function buildApp(
           return reply
             .code(errorStatus(error.code))
             .send(protocolErrorSchema.parse(failedAck(error)));
+        throw error;
+      }
+    },
+  );
+  app.get<{ Params: { boardId: string }; Querystring: Record<string, unknown> }>(
+    "/v1/boards/:boardId/recovery",
+    async (request, reply) => {
+      const user = await authenticateHttp(request);
+      const boardId = z.string().uuid().parse(request.params.boardId);
+      boardRecoveryRequestQuerySchema.parse(request.query);
+      const role = await repository.roleFor(boardId, user.id);
+      if (!role) throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");
+      try {
+        return recoveryResponse(await recoveryMaterialRepository.load(boardId));
+      } catch (error) {
+        if (error instanceof BoardRecoveryError) {
+          const response = recoveryBlocked(error);
+          if (response) return reply.code(409).send(response);
+        }
         throw error;
       }
     },

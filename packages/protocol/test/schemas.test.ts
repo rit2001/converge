@@ -6,6 +6,8 @@ import {
   DELIVERY_STREAM_METADATA_MAX_BYTES,
   REDIS_STREAM_ENTRY_ID_MAX_BYTES,
   boardAccessRevokedEventSchema,
+  boardRecoveryMaterialSchema,
+  boardRecoveryRequestQuerySchema,
   boardSnapshotSchema,
   createBoardRequestSchema,
   decodeDeliveryStreamFieldPairs,
@@ -349,6 +351,73 @@ describe("protocol schemas", () => {
         retryable: false,
       }),
     ).toMatchObject({ code: "IDEMPOTENCY_CONFLICT", retryable: false });
+  });
+
+  it("validates strict verified board recovery material", () => {
+    const response = {
+      boardId: command.boardId,
+      snapshotId: "50000000-0000-4000-8000-000000000001",
+      snapshotSchemaVersion: 1,
+      snapshotCanvasSeq: 1,
+      snapshotDeliverySeq: 1,
+      capturedCanvasSeq: 1,
+      capturedDeliverySeq: 1,
+      snapshotState: {
+        schemaVersion: 1,
+        boardId: command.boardId,
+        boardName: "Recovery board",
+        lastSeq: 1,
+        lastDeliverySeq: 1,
+        objects: [
+          {
+            objectId: rectangle.targetId,
+            stackOrder: 1,
+            value: rectangle.payload,
+            fieldSeq: {
+              id: 1,
+              kind: 1,
+              x: 1,
+              y: 1,
+              width: 1,
+              height: 1,
+              rotation: 1,
+              fill: 1,
+              text: 1,
+            },
+            createdSeq: 1,
+            updatedSeq: 1,
+            deletedSeq: null,
+          },
+        ],
+      },
+      snapshotCanonicalHash: "a".repeat(64),
+      operationTail: [],
+      reconstructedCanonicalHash: "b".repeat(64),
+    };
+    expect(boardRecoveryMaterialSchema.parse(response)).toEqual(response);
+    expect(boardRecoveryMaterialSchema.safeParse({ ...response, unknown: true }).success).toBe(
+      false,
+    );
+    expect(boardRecoveryRequestQuerySchema.parse({})).toEqual({});
+    expect(boardRecoveryRequestQuerySchema.safeParse({ after: 0 }).success).toBe(false);
+  });
+
+  it("enforces the exact non-retryable recovery-blocked envelope", () => {
+    const error = {
+      ok: false,
+      code: "RECOVERY_BLOCKED",
+      message: "Authoritative board recovery is unavailable",
+      retryable: false,
+    } as const;
+    expect(protocolErrorSchema.parse(error)).toEqual(error);
+    expect(protocolErrorSchema.safeParse({ ...error, retryable: true }).success).toBe(false);
+    expect(protocolErrorSchema.safeParse({ ...error, message: "private details" }).success).toBe(
+      false,
+    );
+    expect(protocolErrorSchema.safeParse({ ...error, extra: true }).success).toBe(false);
+    expect(protocolErrorSchema.safeParse({ ...error, code: "UNKNOWN_RECOVERY" }).success).toBe(
+      false,
+    );
   });
 
   it("validates the strict generic HTTP internal-error envelope", () => {

@@ -182,6 +182,16 @@ indexes are:
 full reducer state includes tombstones and field sequence metadata; the existing visible-object HTTP
 snapshot is not sufficient for server recovery.
 
+Verified snapshot-plus-tail material is exposed without changing the existing snapshot or range
+contracts at `GET /v1/boards/:boardId/recovery`. The authenticated route delegates selection,
+corrupt-candidate invalidation, contiguous-tail validation, reducer replay, and authoritative hash
+comparison to the PostgreSQL recovery repository, then constructs the response through the shared
+strict schema. Durable-evidence failures return HTTP `409` as non-retryable `RECOVERY_BLOCKED` with
+no corrupt contents or internal diagnostics. Infrastructure failures such as database connection
+loss or query timeout remain sanitized retryable `INTERNAL_ERROR` failures. The `409` response does
+not itself mutate recovery state; repository-owned fenced invalidation is the only permitted recovery
+mutation.
+
 ## Sequence allocation
 
 ```mermaid
