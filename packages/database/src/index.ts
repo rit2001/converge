@@ -68,6 +68,29 @@ export interface CommitOperationResult {
   event: OperationCommittedDeliveryEnvelope;
 }
 
+export const BOARD_DELIVERY_HEAD_QUERY_MAXIMUM = 100 as const;
+
+export interface BoardDeliveryHead {
+  boardId: string;
+  lastDeliverySeq: number;
+}
+
+export class BoardDeliveryHeadReadError extends Error {
+  constructor(
+    public readonly code: "INVALID_BOARD_BATCH" | "MISSING_BOARD_HEAD" | "INVALID_DELIVERY_HEAD",
+  ) {
+    super(`Board delivery-head read failed: ${code}`);
+  }
+}
+
+function parseDeliveryHead(value: unknown): number {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value))
+    throw new BoardDeliveryHeadReadError("INVALID_DELIVERY_HEAD");
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new BoardDeliveryHeadReadError("INVALID_DELIVERY_HEAD");
+  return parsed;
+}
+
 export function createPool(databaseUrl: string): pg.Pool {
   return new pg.Pool({ connectionString: databaseUrl, max: 20 });
 }
@@ -108,6 +131,38 @@ export class BoardRepository {
       [boardId, userId],
     );
     return result.rows[0]?.role ?? null;
+  }
+
+  async getBoardDeliveryHeads(boardIds: readonly string[]): Promise<readonly BoardDeliveryHead[]> {
+    const expected = new Set(boardIds);
+    if (
+      boardIds.length === 0 ||
+      boardIds.length > BOARD_DELIVERY_HEAD_QUERY_MAXIMUM ||
+      expected.size !== boardIds.length
+    )
+      throw new BoardDeliveryHeadReadError("INVALID_BOARD_BATCH");
+    const result = await this.pool.query<{ id: string; last_delivery_seq: string }>(
+      `SELECT id, last_delivery_seq
+       FROM boards
+       WHERE id = ANY($1::uuid[])
+       ORDER BY id`,
+      [boardIds],
+    );
+    const heads = new Map<string, BoardDeliveryHead>();
+    for (const row of result.rows) {
+      if (!expected.has(row.id) || heads.has(row.id))
+        throw new BoardDeliveryHeadReadError("INVALID_DELIVERY_HEAD");
+      heads.set(row.id, {
+        boardId: row.id,
+        lastDeliverySeq: parseDeliveryHead(row.last_delivery_seq),
+      });
+    }
+    if (heads.size !== expected.size) throw new BoardDeliveryHeadReadError("MISSING_BOARD_HEAD");
+    return boardIds.map((boardId) => {
+      const head = heads.get(boardId);
+      if (!head) throw new BoardDeliveryHeadReadError("MISSING_BOARD_HEAD");
+      return head;
+    });
   }
 
   async getBoardSequence(boardId: string, userId: string): Promise<number> {
