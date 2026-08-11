@@ -57,6 +57,7 @@ export interface DeliveryRuntimeOwner {
 
 export type DeliveryRuntimeFactory = (
   handlers: DeliveryRuntimeEventHandlers,
+  observer: DeliveryRuntimeObserver,
 ) => DeliveryRuntimeOwner;
 
 export interface ApiDeliveryRuntimeOptions {

@@ -18,7 +18,6 @@ import {
 } from "@converge/api/delivery-consumer";
 import {
   ApiDeliveryRuntime,
-  type DeliveryRuntimeEventHandlers,
   type DeliveryRuntimeFactory,
   type DeliveryRuntimeLifecycleEvent,
 } from "@converge/api/delivery-runtime";
@@ -395,7 +394,7 @@ async function createApiInstance(label: string, streamKey: string): Promise<ApiI
     consumer: undefined,
     runtime: undefined,
   };
-  const createRuntime: DeliveryRuntimeFactory = (handlers: DeliveryRuntimeEventHandlers) => {
+  const createRuntime: DeliveryRuntimeFactory = (handlers, applicationObserver) => {
     const runtime = new ApiDeliveryRuntime({
       createConsumer: (callbacks: DeliveryConsumerCallbacks) => {
         const transport = new AuditedRedisTransport(
@@ -427,10 +426,13 @@ async function createApiInstance(label: string, streamKey: string): Promise<ApiI
       },
       handlers,
       observer: {
-        lifecycle: (event) => evidence.lifecycle.push(event),
-        quarantine: (event) => {
+        lifecycle: async (event) => {
+          evidence.lifecycle.push(event);
+          await applicationObserver.lifecycle(event);
+        },
+        quarantine: async (event) => {
           evidence.quarantines.push(event);
-          return Promise.resolve();
+          await applicationObserver.quarantine(event);
         },
       },
     });

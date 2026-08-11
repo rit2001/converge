@@ -35,7 +35,12 @@ import {
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
 import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
-import type { DeliveryRuntimeFactory, DeliveryRuntimeOwner } from "./delivery-runtime.js";
+import type {
+  DeliveryRuntimeFactory,
+  DeliveryRuntimeLifecycleEvent,
+  DeliveryRuntimeObserver,
+  DeliveryRuntimeOwner,
+} from "./delivery-runtime.js";
 import type { Environment } from "./env.js";
 
 function errorStatus(code: RepositoryError["code"]): number {
@@ -112,6 +117,17 @@ function fastifyClientError(
 function socketAuthenticationError(error: AuthenticationError): Error {
   return Object.assign(new Error(error.message), {
     data: protocolErrorSchema.parse(failedAck(error)),
+  });
+}
+
+function socketDeliveryUnavailableError(): Error {
+  return Object.assign(new Error("Realtime delivery is temporarily unavailable"), {
+    data: protocolErrorSchema.parse({
+      ok: false,
+      code: "INTERNAL_ERROR",
+      message: "Realtime delivery is temporarily unavailable",
+      retryable: true,
+    }),
   });
 }
 
@@ -362,6 +378,52 @@ export async function buildApp(
     );
   };
 
+  let deliveryRuntime: DeliveryRuntimeOwner | undefined;
+  let deliveryRuntimeStartPromise: Promise<void> | undefined;
+  let deliveryRuntimeStopPromise: Promise<void> | undefined;
+  let socketIoClosePromise: Promise<void> | undefined;
+  let distributedSocketReady = deliveryMode.mode === "local";
+  let distributedReadinessTerminal = false;
+  let applicationClosing = false;
+  let acceptsDistributedDeliveries = false;
+  const socketsAreReady = (): boolean =>
+    deliveryMode.mode === "local" ||
+    (!applicationClosing && !distributedReadinessTerminal && distributedSocketReady);
+  const requireSocketReadiness = (): void => {
+    if (!socketsAreReady()) throw socketDeliveryUnavailableError();
+  };
+  const makeSocketsUnready = (terminal: boolean): void => {
+    if (deliveryMode.mode === "local") return;
+    const wasReady = distributedSocketReady;
+    distributedSocketReady = false;
+    acceptsDistributedDeliveries = false;
+    if (terminal) distributedReadinessTerminal = true;
+    if (wasReady) io.local.disconnectSockets(true);
+  };
+  const observeDeliveryLifecycle = (event: DeliveryRuntimeLifecycleEvent): void => {
+    if (deliveryMode.mode === "local" || applicationClosing) return;
+    switch (event.state) {
+      case "established":
+      case "recovered":
+        if (distributedReadinessTerminal) return;
+        distributedSocketReady = true;
+        acceptsDistributedDeliveries = true;
+        return;
+      case "unavailable":
+      case "recovering":
+        makeSocketsUnready(false);
+        return;
+      case "terminal":
+      case "stopped":
+        makeSocketsUnready(true);
+        return;
+    }
+  };
+  const deliveryRuntimeObserver: DeliveryRuntimeObserver = {
+    lifecycle: observeDeliveryLifecycle,
+    quarantine: () => Promise.resolve(),
+  };
+
   app.delete<{
     Params: { boardId: string; userId: string };
     Querystring: Record<string, unknown>;
@@ -400,36 +462,50 @@ export async function buildApp(
     }
   });
   io.use((socket, next) => {
+    if (!socketsAreReady()) {
+      next(socketDeliveryUnavailableError());
+      return;
+    }
     void (async () => {
       try {
         const principal = await auth.authenticateSocket(socket);
+        requireSocketReadiness();
         if (!principal)
           throw new AuthenticationError("AUTHENTICATION_REQUIRED", "Authentication required");
         socket.data.principal = principal;
         socket.data.revokedBoards = new Set();
         next();
       } catch (error) {
-        if (error instanceof AuthenticationError) next(socketAuthenticationError(error));
+        if (!socketsAreReady()) next(socketDeliveryUnavailableError());
+        else if (error instanceof AuthenticationError) next(socketAuthenticationError(error));
         else next(new Error("Authentication failed"));
       }
     })();
   });
   io.on("connection", (socket) => {
+    if (!socketsAreReady()) {
+      socket.disconnect(true);
+      return;
+    }
     const user = socket.data.principal;
     let windowStarted = Date.now();
     let commandsInWindow = 0;
     socket.on("board:join", async (raw, acknowledge) => {
+      if (!socketsAreReady()) return;
       if (typeof acknowledge !== "function") {
         app.log.warn({ socketId: socket.id }, "board join requires an acknowledgement callback");
         return;
       }
       try {
+        requireSocketReadiness();
         const request = joinBoardRequestSchema.parse(raw);
         await deliveryCoordinator.run(request.boardId, async () => {
+          requireSocketReadiness();
           if (socket.data.revokedBoards.has(request.boardId))
             throw new RepositoryError("FORBIDDEN", "Board access was revoked");
-          if (!(await repository.roleFor(request.boardId, user.id)))
-            throw new RepositoryError("FORBIDDEN", "Board membership required");
+          const role = await repository.roleFor(request.boardId, user.id);
+          requireSocketReadiness();
+          if (!role) throw new RepositoryError("FORBIDDEN", "Board membership required");
           await socket.join(boardRoom(request.boardId));
         });
         await options.synchronizationHooks?.afterRoomJoin?.({
@@ -437,7 +513,9 @@ export async function buildApp(
           userId: user.id,
           socketId: socket.id,
         });
+        requireSocketReadiness();
         const joinWatermark = await repository.getBoardSequence(request.boardId, user.id);
+        requireSocketReadiness();
         if (request.lastAppliedSeq > joinWatermark)
           throw new RepositoryError(
             "RESYNC_REQUIRED",
@@ -451,10 +529,12 @@ export async function buildApp(
           }),
         );
       } catch (error) {
+        if (!socketsAreReady()) return;
         acknowledge(joinBoardAckSchema.parse(failedAck(error)));
       }
     });
     socket.on("operation:submit", async (raw, acknowledge) => {
+      if (!socketsAreReady()) return;
       const reportDeliveryFailure = (stage: OperationDeliveryStage, error: unknown): void =>
         app.log.warn(
           { error, stage, socketId: socket.id, userId: user.id },
@@ -486,6 +566,7 @@ export async function buildApp(
         return;
       }
       try {
+        requireSocketReadiness();
         if (JSON.stringify(raw).length > 64 * 1024) {
           acknowledgeWithoutThrow(
             acknowledge,
@@ -501,6 +582,7 @@ export async function buildApp(
         }
         const command = durableCommandSchema.parse(raw);
         const committed = await deliveryCoordinator.run(command.boardId, async () => {
+          requireSocketReadiness();
           if (socket.data.revokedBoards.has(command.boardId))
             throw new RepositoryError("FORBIDDEN", "Board access was revoked");
           const result = await repository.commitOperation(user.id, command);
@@ -519,7 +601,7 @@ export async function buildApp(
             );
           return result;
         });
-        if (!socket.data.revokedBoards.has(command.boardId))
+        if (socketsAreReady() && !socket.data.revokedBoards.has(command.boardId))
           acknowledgeWithoutThrow(
             acknowledge,
             { ok: true, duplicate: committed.duplicate, operation: committed.operation },
@@ -527,16 +609,12 @@ export async function buildApp(
           );
       } catch (error) {
         app.log.warn({ error, userId: user.id }, "operation rejected");
+        if (!socketsAreReady()) return;
         acknowledgeWithoutThrow(acknowledge, failedAck(error), reportDeliveryFailure);
       }
     });
   });
 
-  let deliveryRuntime: DeliveryRuntimeOwner | undefined;
-  let deliveryRuntimeStartPromise: Promise<void> | undefined;
-  let deliveryRuntimeStopPromise: Promise<void> | undefined;
-  let socketIoClosePromise: Promise<void> | undefined;
-  let acceptsDistributedDeliveries = false;
   const stopDeliveryRuntimeOnce = (): Promise<void> => {
     deliveryRuntimeStopPromise ??= deliveryRuntime?.stop() ?? Promise.resolve();
     return deliveryRuntimeStopPromise;
@@ -547,18 +625,18 @@ export async function buildApp(
   };
   app.addHook("onReady", async () => {
     if (!deliveryRuntime) return;
-    acceptsDistributedDeliveries = true;
     try {
       deliveryRuntimeStartPromise ??= deliveryRuntime.start();
       await deliveryRuntimeStartPromise;
     } catch (error) {
-      acceptsDistributedDeliveries = false;
+      makeSocketsUnready(true);
       await stopDeliveryRuntimeOnce().catch(() => undefined);
       throw error;
     }
   });
   app.addHook("preClose", async () => {
-    acceptsDistributedDeliveries = false;
+    applicationClosing = true;
+    makeSocketsUnready(true);
     await stopDeliveryRuntimeOnce();
     await closeSocketIoOnce();
   });
@@ -569,27 +647,30 @@ export async function buildApp(
       throw new TypeError("Distributed delivery mode requires a runtime factory");
     }
     try {
-      deliveryRuntime = deliveryMode.createRuntime({
-        operationCommitted: (envelope) => {
-          if (!acceptsDistributedDeliveries) return Promise.resolve();
-          return deliveryCoordinator.run(envelope.boardId, () => {
+      deliveryRuntime = deliveryMode.createRuntime(
+        {
+          operationCommitted: (envelope) => {
             if (!acceptsDistributedDeliveries) return Promise.resolve();
-            const operation = committedOperationSchema.parse(envelope.payload.operation);
-            if (operation.boardId !== envelope.boardId)
-              throw new Error("Committed operation board does not match its delivery envelope");
-            io.local.to(boardRoom(envelope.boardId)).emit("operation:committed", operation);
-            return Promise.resolve();
-          });
-        },
-        membershipRevoked: (envelope) => {
-          if (!acceptsDistributedDeliveries) return Promise.resolve();
-          return deliveryCoordinator.run(envelope.boardId, () => {
+            return deliveryCoordinator.run(envelope.boardId, () => {
+              if (!acceptsDistributedDeliveries) return Promise.resolve();
+              const operation = committedOperationSchema.parse(envelope.payload.operation);
+              if (operation.boardId !== envelope.boardId)
+                throw new Error("Committed operation board does not match its delivery envelope");
+              io.local.to(boardRoom(envelope.boardId)).emit("operation:committed", operation);
+              return Promise.resolve();
+            });
+          },
+          membershipRevoked: (envelope) => {
             if (!acceptsDistributedDeliveries) return Promise.resolve();
-            const revocation = membershipRevokedDeliveryEnvelopeSchema.parse(envelope);
-            return evictBoardMember(revocation.boardId, revocation.payload.revokedUserId);
-          });
+            return deliveryCoordinator.run(envelope.boardId, () => {
+              if (!acceptsDistributedDeliveries) return Promise.resolve();
+              const revocation = membershipRevokedDeliveryEnvelopeSchema.parse(envelope);
+              return evictBoardMember(revocation.boardId, revocation.payload.revokedUserId);
+            });
+          },
         },
-      });
+        deliveryRuntimeObserver,
+      );
     } catch (error) {
       await app.close();
       throw error;

@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import type { AuthAdapter } from "./auth.js";
+import type { AuthAdapter, AuthenticatedPrincipal } from "./auth.js";
 import { buildApp, type BuildAppOptions } from "./app.js";
 import type {
   DeliveryRuntimeEventHandlers,
   DeliveryRuntimeFactory,
+  DeliveryRuntimeLifecycleEvent,
+  DeliveryRuntimeObserver,
   DeliveryRuntimeOwner,
 } from "./delivery-runtime.js";
 import type { Environment } from "./env.js";
@@ -12,6 +14,7 @@ import type { DatabasePool } from "@converge/database";
 import {
   membershipRevokedDeliveryEnvelopeSchema,
   operationCommittedDeliveryEnvelopeSchema,
+  protocolErrorSchema,
 } from "@converge/protocol";
 
 const ids = {
@@ -89,19 +92,22 @@ const membershipEnvelope = membershipRevokedDeliveryEnvelopeSchema.parse({
   payload: { revokedUserId: ids.revoked, initiatedByUserId: ids.actor },
 });
 
-function runtimeHarness(options: { startError?: Error } = {}) {
+function runtimeHarness(options: { startError?: Error; establishOnStart?: boolean } = {}) {
   let handlers: DeliveryRuntimeEventHandlers | undefined;
-  const startRuntime = vi.fn(() =>
-    options.startError === undefined ? Promise.resolve() : Promise.reject(options.startError),
-  );
+  let observer: DeliveryRuntimeObserver | undefined;
+  const startRuntime = vi.fn(async () => {
+    if (options.startError !== undefined) throw options.startError;
+    if (options.establishOnStart !== false) await observer?.lifecycle({ state: "established" });
+  });
   const stopRuntime = vi.fn(() => Promise.resolve());
   const runtime: DeliveryRuntimeOwner = {
     start: startRuntime,
     stop: stopRuntime,
   };
   const createRuntime: DeliveryRuntimeFactory = vi.fn(
-    (createdHandlers: DeliveryRuntimeEventHandlers) => {
+    (createdHandlers: DeliveryRuntimeEventHandlers, createdObserver: DeliveryRuntimeObserver) => {
       handlers = createdHandlers;
+      observer = createdObserver;
       return runtime;
     },
   );
@@ -113,10 +119,262 @@ function runtimeHarness(options: { startError?: Error } = {}) {
       if (!handlers) throw new Error("Expected distributed delivery handlers");
       return handlers;
     },
+    lifecycle(event: DeliveryRuntimeLifecycleEvent): Promise<void> {
+      if (!observer) throw new Error("Expected a distributed delivery observer");
+      return Promise.resolve(observer.lifecycle(event));
+    },
   };
 }
 
+const authorizedHttpAuthentication = vi.fn(() =>
+  Promise.resolve({ id: ids.actor, displayName: "Readiness actor" }),
+);
+const authorizedSocketAuthentication = vi.fn(() =>
+  Promise.resolve({ id: ids.actor, displayName: "Readiness actor" }),
+);
+const authorizedAuth: AuthAdapter = {
+  authenticateHttp: authorizedHttpAuthentication,
+  authenticateSocket: authorizedSocketAuthentication,
+};
+
+async function runSocketMiddlewares(context: Awaited<ReturnType<typeof buildApp>>) {
+  const namespace = context.io.of("/") as unknown as {
+    _fns: Array<
+      (
+        socket: { handshake: { auth: Record<string, unknown> }; data: Record<string, unknown> },
+        next: (error?: Error) => void,
+      ) => void
+    >;
+  };
+  const socket = { handshake: { auth: {} }, data: {} };
+  for (const middleware of namespace._fns) {
+    const error = await new Promise<Error | undefined>((resolve) => middleware(socket, resolve));
+    if (error) return error;
+  }
+  return undefined;
+}
+
+function protocolData(error: Error | undefined) {
+  return protocolErrorSchema.parse((error as Error & { data: unknown }).data);
+}
+
+function attachFakeSocket(context: Awaited<ReturnType<typeof buildApp>>) {
+  const listeners = new Map<string, (...args: unknown[]) => unknown>();
+  const socket = {
+    id: "readiness-socket",
+    data: {
+      principal: { id: ids.actor, displayName: "Readiness actor" },
+      revokedBoards: new Set<string>(),
+    },
+    rooms: new Set(["readiness-socket"]),
+    on: vi.fn((event: string, listener: (...args: unknown[]) => unknown) => {
+      listeners.set(event, listener);
+      return socket;
+    }),
+    disconnect: vi.fn(),
+    join: vi.fn(() => Promise.resolve()),
+    leave: vi.fn(() => Promise.resolve()),
+    emit: vi.fn(),
+  };
+  const connection = context.io.of("/").listeners("connection")[0];
+  if (!connection) throw new Error("Expected the Socket.IO connection handler");
+  connection(socket as never);
+  return { socket, listeners };
+}
+
+function healthyHttpPool(): DatabasePool {
+  const query = vi.fn((sql: string) => {
+    if (sql.includes("SELECT b.id, b.name, b.last_seq"))
+      return Promise.resolve({
+        rows: [{ id: ids.board, name: "Ready board", last_seq: "0", object_data: null }],
+        rowCount: 1,
+      });
+    if (sql.includes("SELECT b.last_seq"))
+      return Promise.resolve({ rows: [{ last_seq: "0" }], rowCount: 1 });
+    if (sql.includes("FROM board_operations")) return Promise.resolve({ rows: [], rowCount: 0 });
+    throw new Error(`Unexpected pool query: ${sql}`);
+  });
+  const connect = vi.fn(() => {
+    const client = {
+      query: vi.fn((sql: string) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("pg_advisory_xact_lock"))
+          return Promise.resolve({ rows: [], rowCount: 0 });
+        if (sql.includes("SELECT b.created_by"))
+          return Promise.resolve({
+            rows: [{ created_by: ids.actor, actor_role: "owner", last_delivery_seq: "0" }],
+            rowCount: 1,
+          });
+        if (sql.includes("SELECT role FROM board_members"))
+          return Promise.resolve({ rows: [], rowCount: 0 });
+        throw new Error(`Unexpected client query: ${sql}`);
+      }),
+      release: vi.fn(),
+    };
+    return Promise.resolve(client);
+  });
+  return { query, connect } as unknown as DatabasePool;
+}
+
 describe("distributed-delivery application composition", () => {
+  it("starts socket-unready until the distributed consumer is established", async () => {
+    const state = runtimeHarness({ establishOnStart: false });
+    authorizedSocketAuthentication.mockClear();
+    const context = await buildApp(environment, pool, authorizedAuth, {
+      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime },
+    });
+    try {
+      await context.app.ready();
+      const startupError = await runSocketMiddlewares(context);
+      expect(protocolData(startupError)).toEqual({
+        ok: false,
+        code: "INTERNAL_ERROR",
+        message: "Realtime delivery is temporarily unavailable",
+        retryable: true,
+      });
+      expect(startupError?.message).toBe("Realtime delivery is temporarily unavailable");
+      expect(startupError?.message).not.toMatch(/auth|board|redis|cursor/i);
+      expect(authorizedSocketAuthentication).not.toHaveBeenCalled();
+      await state.lifecycle({ state: "established" });
+      await expect(runSocketMiddlewares(context)).resolves.toBeUndefined();
+    } finally {
+      await context.app.close();
+    }
+  });
+
+  it("disconnects and fences sockets until the current runtime recovers", async () => {
+    const state = runtimeHarness();
+    const context = await buildApp(environment, pool, authorizedAuth, {
+      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime },
+    });
+    const disconnectSockets = vi.spyOn(context.io.of("/").adapter, "disconnectSockets");
+    const broadcast = vi.spyOn(context.io.of("/").adapter, "broadcast");
+    try {
+      await context.app.ready();
+      const active = attachFakeSocket(context);
+
+      await state.lifecycle({ state: "unavailable", code: "REDIS_UNAVAILABLE" });
+      expect(disconnectSockets).toHaveBeenCalledOnce();
+      expect(disconnectSockets.mock.calls[0]?.[0]).toMatchObject({ flags: { local: true } });
+      expect(disconnectSockets.mock.calls[0]?.[1]).toBe(true);
+      expect(protocolData(await runSocketMiddlewares(context))).toMatchObject({
+        code: "INTERNAL_ERROR",
+        retryable: true,
+      });
+
+      const joinAck = vi.fn();
+      await active.listeners.get("board:join")?.(
+        { schemaVersion: 1, boardId: ids.board, lastAppliedSeq: 0 },
+        joinAck,
+      );
+      const operationAck = vi.fn();
+      await active.listeners.get("operation:submit")?.(
+        operationEnvelope().payload.operation,
+        operationAck,
+      );
+      await state.handlers.operationCommitted(operationEnvelope());
+      expect(joinAck).not.toHaveBeenCalled();
+      expect(operationAck).not.toHaveBeenCalled();
+      expect(broadcast).not.toHaveBeenCalled();
+
+      await state.lifecycle({ state: "unavailable", code: "BOARD_STATE_CAPACITY_EXCEEDED" });
+      await state.lifecycle({ state: "recovering" });
+      await state.lifecycle({ state: "recovering" });
+      expect(disconnectSockets).toHaveBeenCalledOnce();
+      expect(protocolData(await runSocketMiddlewares(context))).toMatchObject({ retryable: true });
+
+      await state.lifecycle({ state: "recovered" });
+      await state.lifecycle({ state: "recovered" });
+      await expect(runSocketMiddlewares(context)).resolves.toBeUndefined();
+
+      await state.lifecycle({ state: "terminal", source: "cursor", code: "STREAM_BEHIND_CURSOR" });
+      expect(disconnectSockets).toHaveBeenCalledTimes(2);
+      await state.lifecycle({ state: "recovered" });
+      expect(protocolData(await runSocketMiddlewares(context))).toMatchObject({
+        code: "INTERNAL_ERROR",
+      });
+    } finally {
+      await context.app.close();
+    }
+
+    await state.lifecycle({ state: "established" });
+    await state.lifecycle({ state: "recovered" });
+    expect(protocolData(await runSocketMiddlewares(context))).toMatchObject({
+      code: "INTERNAL_ERROR",
+      retryable: true,
+    });
+  });
+
+  it("fails closed when readiness is lost during asynchronous socket authentication", async () => {
+    const state = runtimeHarness();
+    let finishAuthentication: (() => void) | undefined;
+    const delayedSocketAuthentication: AuthAdapter["authenticateSocket"] = vi.fn(
+      () =>
+        new Promise<AuthenticatedPrincipal | null>((resolve) => {
+          finishAuthentication = () => resolve({ id: ids.actor, displayName: "Readiness actor" });
+        }),
+    );
+    const delayedAuth: AuthAdapter = {
+      authenticateHttp: () => authorizedHttpAuthentication(),
+      authenticateSocket: delayedSocketAuthentication,
+    };
+    const context = await buildApp(environment, pool, delayedAuth, {
+      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime },
+    });
+    try {
+      await context.app.ready();
+      const pendingHandshake = runSocketMiddlewares(context);
+      await vi.waitFor(() => expect(delayedSocketAuthentication).toHaveBeenCalledOnce());
+      await state.lifecycle({ state: "unavailable", code: "REDIS_UNAVAILABLE" });
+      finishAuthentication?.();
+      expect(protocolData(await pendingHandshake)).toEqual({
+        ok: false,
+        code: "INTERNAL_ERROR",
+        message: "Realtime delivery is temporarily unavailable",
+        retryable: true,
+      });
+    } finally {
+      await context.app.close();
+    }
+  });
+
+  it("keeps local sockets immediately usable and leaves PostgreSQL HTTP routes ungated", async () => {
+    const local = await buildApp(environment, pool, authorizedAuth);
+    try {
+      await local.app.ready();
+      await expect(runSocketMiddlewares(local)).resolves.toBeUndefined();
+    } finally {
+      await local.app.close();
+    }
+
+    const state = runtimeHarness({ establishOnStart: false });
+    const distributed = await buildApp(environment, healthyHttpPool(), authorizedAuth, {
+      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime },
+    });
+    try {
+      await distributed.app.ready();
+      expect(await runSocketMiddlewares(distributed)).toBeInstanceOf(Error);
+      const snapshot = await distributed.app.inject({
+        method: "GET",
+        url: `/v1/boards/${ids.board}`,
+      });
+      const operationRange = await distributed.app.inject({
+        method: "GET",
+        url: `/v1/boards/${ids.board}/operations?after=0&watermark=0`,
+      });
+      const membership = await distributed.app.inject({
+        method: "DELETE",
+        url: `/v1/boards/${ids.board}/members/${ids.revoked}`,
+        payload: {},
+      });
+      expect(snapshot.statusCode).toBe(200);
+      expect(operationRange.statusCode).toBe(200);
+      expect(membership.statusCode).toBe(200);
+      expect(membership.json()).toMatchObject({ ok: true, removed: false, eventId: null });
+    } finally {
+      await distributed.app.close();
+    }
+  });
+
   it("keeps local delivery as the default and production startup Redis-free", () => {
     const appSource = readFileSync(new URL("./app.ts", import.meta.url), "utf8");
     const serverSource = readFileSync(new URL("./server.ts", import.meta.url), "utf8");

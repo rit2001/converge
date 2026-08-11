@@ -5,6 +5,7 @@ import type { AuthenticatedPrincipal } from "@converge/api/auth";
 import type {
   DeliveryRuntimeEventHandlers,
   DeliveryRuntimeFactory,
+  DeliveryRuntimeObserver,
 } from "@converge/api/delivery-runtime";
 import type { Environment } from "@converge/api/env";
 import { BoardRepository, createPool } from "@converge/database";
@@ -54,9 +55,15 @@ let runtimeHandlers: DeliveryRuntimeEventHandlers | undefined;
 const startRuntime = vi.fn(() => Promise.resolve());
 const stopRuntime = vi.fn(() => Promise.resolve());
 const createRuntime: DeliveryRuntimeFactory = vi.fn(
-  (createdHandlers: DeliveryRuntimeEventHandlers) => {
+  (createdHandlers: DeliveryRuntimeEventHandlers, observer: DeliveryRuntimeObserver) => {
     runtimeHandlers = createdHandlers;
-    return { start: startRuntime, stop: stopRuntime };
+    return {
+      start: async () => {
+        await startRuntime();
+        await observer.lifecycle({ state: "established" });
+      },
+      stop: stopRuntime,
+    };
   },
 );
 const sockets = new Set<TestSocket>();
