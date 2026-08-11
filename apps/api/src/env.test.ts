@@ -17,7 +17,62 @@ describe("environment validation", () => {
       NODE_ENV: "production",
       DATABASE_URL: required.DATABASE_URL,
       WEB_ORIGIN: "https://example.test",
+      API_DELIVERY_MODE: "local",
+      REDIS_URL: "redis://localhost:6379",
+      REDIS_STREAM_KEY: "converge:delivery:v1",
     });
+  });
+
+  it("accepts explicit distributed delivery with the required Redis identity", () => {
+    expect(
+      parseEnvironment({
+        ...required,
+        API_DELIVERY_MODE: "distributed",
+        REDIS_URL: "rediss://delivery-user:secret@example.test:6380",
+        REDIS_STREAM_KEY: "converge:delivery:production:v1",
+      }),
+    ).toMatchObject({
+      API_DELIVERY_MODE: "distributed",
+      REDIS_STREAM_KEY: "converge:delivery:production:v1",
+      REDIS_DELIVERY_MAX_BOARD_STATES: 1_000,
+      DELIVERY_WATCHDOG_INTERVAL_MS: 5_000,
+    });
+  });
+
+  it("rejects incomplete distributed configuration instead of falling back to local mode", () => {
+    expect(() => parseEnvironment({ ...required, API_DELIVERY_MODE: "distributed" })).toThrowError(
+      new EnvironmentConfigurationError(["REDIS_STREAM_KEY", "REDIS_URL"]),
+    );
+  });
+
+  it("does not apply distributed-only Redis constraints in local mode", () => {
+    expect(
+      parseEnvironment({
+        ...required,
+        API_DELIVERY_MODE: "local",
+        REDIS_URL: "https://unused.example.test",
+        REDIS_STREAM_KEY: "unused local stream value",
+      }),
+    ).toMatchObject({
+      API_DELIVERY_MODE: "local",
+      REDIS_URL: "https://unused.example.test",
+      REDIS_STREAM_KEY: "unused local stream value",
+    });
+  });
+
+  it("strictly validates the delivery mode and bounded distributed settings", () => {
+    expect(() => parseEnvironment({ ...required, API_DELIVERY_MODE: "automatic" })).toThrowError(
+      new EnvironmentConfigurationError(["API_DELIVERY_MODE"]),
+    );
+    expect(() =>
+      parseEnvironment({
+        ...required,
+        API_DELIVERY_MODE: "distributed",
+        REDIS_URL: "redis://localhost:6379",
+        REDIS_STREAM_KEY: "converge:delivery:v1",
+        DELIVERY_WATCHDOG_INTERVAL_MS: "0",
+      }),
+    ).toThrowError(new EnvironmentConfigurationError(["DELIVERY_WATCHDOG_INTERVAL_MS"]));
   });
 
   it("fails clearly before startup when required configuration is absent", () => {
@@ -37,5 +92,23 @@ describe("environment validation", () => {
     expect(message).toBe("Invalid environment configuration: DATABASE_URL");
     expect(message).not.toContain(secret);
     expect(message).not.toContain("not-a-url");
+  });
+
+  it("does not expose Redis credentials in distributed configuration errors", () => {
+    const secret = "redis-password-must-stay-private";
+    let message = "";
+    try {
+      parseEnvironment({
+        ...required,
+        API_DELIVERY_MODE: "distributed",
+        REDIS_URL: `https://delivery:${secret}@example.test`,
+        REDIS_STREAM_KEY: "invalid stream key",
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe("Invalid environment configuration: REDIS_STREAM_KEY, REDIS_URL");
+    expect(message).not.toContain(secret);
+    expect(message).not.toContain("example.test");
   });
 });

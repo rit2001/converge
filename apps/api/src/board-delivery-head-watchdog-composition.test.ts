@@ -16,7 +16,7 @@ import type {
   DeliveryRuntimeLifecycleEvent,
   DeliveryRuntimeObserver,
 } from "./delivery-runtime.js";
-import type { Environment } from "./env.js";
+import { parseEnvironment } from "./env.js";
 import type { DatabasePool } from "@converge/database";
 import {
   membershipRevokedDeliveryEnvelopeSchema,
@@ -36,16 +36,16 @@ const ids = {
   revoked: "60000000-0000-4000-8000-000000000002",
 } as const;
 
-const environment: Environment = {
+const environment = parseEnvironment({
   NODE_ENV: "test",
   HOST: "127.0.0.1",
-  API_PORT: 4000,
+  API_PORT: "4000",
   WEB_ORIGIN: "http://127.0.0.1:3000",
   DATABASE_URL: "postgresql://unused",
   REDIS_URL: "redis://unused",
   LOG_LEVEL: "silent",
   DEV_AUTH_USER_NAME: "Unused",
-};
+});
 
 const auth: AuthAdapter = {
   authenticateHttp: vi.fn(() => Promise.resolve({ id: ids.actor, displayName: "Actor" })),

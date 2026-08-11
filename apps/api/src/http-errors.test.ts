@@ -4,7 +4,7 @@ import { RepositoryError, type DatabasePool } from "@converge/database";
 import { httpInternalErrorResponseSchema, protocolErrorSchema } from "@converge/protocol";
 import { buildApp } from "./app.js";
 import type { AuthAdapter, AuthenticatedPrincipal } from "./auth.js";
-import type { Environment } from "./env.js";
+import { parseEnvironment, type Environment } from "./env.js";
 
 const principal: AuthenticatedPrincipal = {
   id: "00000000-0000-4000-8000-000000000091",
@@ -25,16 +25,16 @@ function environment(
   nodeEnvironment: Environment["NODE_ENV"],
   logLevel: Environment["LOG_LEVEL"] = "silent",
 ): Environment {
-  return {
+  return parseEnvironment({
     NODE_ENV: nodeEnvironment,
     HOST: "127.0.0.1",
-    API_PORT: 4000,
+    API_PORT: "4000",
     WEB_ORIGIN: "http://127.0.0.1:3000",
     DATABASE_URL: "postgresql://localhost/converge",
     REDIS_URL: "redis://localhost:6379",
     LOG_LEVEL: logLevel,
     DEV_AUTH_USER_NAME: "Unused",
-  };
+  });
 }
 
 function failingPool(error: Error): DatabasePool {

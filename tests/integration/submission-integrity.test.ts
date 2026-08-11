@@ -2,7 +2,7 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp, type AppContext } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
-import type { Environment } from "@converge/api/env";
+import { parseEnvironment } from "@converge/api/env";
 import { BoardRepository, createPool } from "@converge/database";
 import {
   committedOperationSchema,
@@ -28,16 +28,16 @@ const auth = new TestAuthAdapter(
     [tokens.editor, identities.editor],
   ]),
 );
-const environment: Environment = {
+const environment = parseEnvironment({
   NODE_ENV: "test",
   HOST: "127.0.0.1",
-  API_PORT: 4000,
+  API_PORT: "4000",
   WEB_ORIGIN: "http://127.0.0.1:3000",
   DATABASE_URL: databaseUrl,
   REDIS_URL: "redis://127.0.0.1:6379",
   LOG_LEVEL: "silent",
   DEV_AUTH_USER_NAME: "Unused development identity",
-};
+});
 
 type TestSocket = ReturnType<typeof createTestSocket>;
 let context: AppContext;

@@ -9,7 +9,7 @@ import type {
   DeliveryRuntimeObserver,
   DeliveryRuntimeOwner,
 } from "./delivery-runtime.js";
-import type { Environment } from "./env.js";
+import { parseEnvironment } from "./env.js";
 import type { DatabasePool } from "@converge/database";
 import {
   membershipRevokedDeliveryEnvelopeSchema,
@@ -29,16 +29,16 @@ const ids = {
   actor: "70000000-0000-4000-8000-000000000001",
 } as const;
 
-const environment: Environment = {
+const environment = parseEnvironment({
   NODE_ENV: "test",
   HOST: "127.0.0.1",
-  API_PORT: 4000,
+  API_PORT: "4000",
   WEB_ORIGIN: "http://127.0.0.1:3000",
   DATABASE_URL: "postgresql://unused",
   REDIS_URL: "redis://unused",
   LOG_LEVEL: "silent",
   DEV_AUTH_USER_NAME: "Unused",
-};
+});
 
 const pool = {} as DatabasePool;
 const auth = {
@@ -375,15 +375,15 @@ describe("distributed-delivery application composition", () => {
     }
   });
 
-  it("keeps local delivery as the default and production startup Redis-free", () => {
+  it("keeps local delivery as the application default and delegates server activation", () => {
     const appSource = readFileSync(new URL("./app.ts", import.meta.url), "utf8");
     const serverSource = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
 
     expect(appSource).toContain('options.deliveryMode ?? { mode: "local" as const }');
     expect(appSource).toContain('if (deliveryMode.mode === "local")');
-    expect(serverSource).not.toContain("deliveryMode");
+    expect(serverSource).toContain("createApiServer");
     expect(serverSource).not.toContain("RedisDelivery");
-    expect(serverSource).not.toContain("createRuntime");
+    expect(serverSource).not.toContain("OutboxWorker");
     expect(serverSource).not.toContain("io.close");
   });
 

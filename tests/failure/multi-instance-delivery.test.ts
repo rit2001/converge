@@ -21,7 +21,7 @@ import {
   type DeliveryRuntimeFactory,
   type DeliveryRuntimeLifecycleEvent,
 } from "@converge/api/delivery-runtime";
-import type { Environment } from "@converge/api/env";
+import { parseEnvironment, type Environment } from "@converge/api/env";
 import { RedisDeliveryConsumerTransport } from "@converge/api/redis-delivery-transport";
 import {
   applyCommitted,
@@ -353,16 +353,16 @@ function roomHas(api: ApiInstance, boardId: string, client: ClientProbe): boolea
 }
 
 function environment(): Environment {
-  return {
+  return parseEnvironment({
     NODE_ENV: "test",
     HOST: "127.0.0.1",
-    API_PORT: 4000,
+    API_PORT: "4000",
     WEB_ORIGIN: "http://127.0.0.1:3000",
     DATABASE_URL: requireDatabaseUrl(),
     REDIS_URL: redisUrl,
     LOG_LEVEL: "silent",
     DEV_AUTH_USER_NAME: "Unused development identity",
-  };
+  });
 }
 
 function apiDiagnostics(evidence: ApiEvidence): unknown {
