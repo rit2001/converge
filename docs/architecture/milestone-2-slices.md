@@ -299,6 +299,16 @@ capture failures emit one bounded sanitized notification and suppress the same b
 until a head changes. The in-memory deterministic-LRU cache is capped at 1,000 fingerprints and may
 hold no board objects, payloads, SQL, credentials, or principal data.
 
+**On-demand recovery refresh:** The response tail remains bounded to 100 operations, so the
+1,000-operation background trigger cannot guarantee that a recovery snapshot already exists. After
+authorization, `GET /v1/boards/:boardId/recovery` may make one refresh attempt only for
+`MISSING_REQUIRED_SNAPSHOT` or `TAIL_LIMIT_EXCEEDED`. A timeout-aware
+`pg_try_advisory_xact_lock` transaction rereads the fixed boundary and returns a verified exact-head
+snapshot with an empty tail. It advances no head and mutates no logical board data. Lock contention
+and query timeout are retryable infrastructure failures; corruption, unsupported versions, tail
+gaps/conflicts, reducer/projection/hash mismatch, and oversized material stay non-retryable and may
+not be hidden by replacement capture.
+
 Lifecycle is idempotent and single-flight. Stop prevents new scans/captures, bounds in-flight work by
 the existing worker shutdown grace, fences late scheduling/callbacks, and releases timers, listeners,
 retry/cursor/suppression state. Implementation must add the ADR-defined `SNAPSHOT_*` variables to

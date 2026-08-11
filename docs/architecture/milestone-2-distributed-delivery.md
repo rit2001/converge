@@ -192,6 +192,15 @@ loss or query timeout remain sanitized retryable `INTERNAL_ERROR` failures. The 
 not itself mutate recovery state; repository-owned fenced invalidation is the only permitted recovery
 mutation.
 
+Because the strict recovery tail is capped at 100 operations but automatic snapshots normally start
+at 1,000 operations, 8 MiB, or 24 changed hours, an authorized recovery request may materialize one
+verified exact-head snapshot on demand. This single attempt is allowed only for a missing verified
+snapshot or an otherwise-valid tail over 100 operations. It uses a timeout-bounded nonblocking board
+lock, rereads the fixed boundary, and returns the new snapshot with an empty tail without changing
+logical board state. Busy locks and database timeouts remain retryable `INTERNAL_ERROR`; corruption,
+gaps, conflicts, unsupported versions, and projection/hash failures never trigger refresh and remain
+`RECOVERY_BLOCKED`.
+
 ## Sequence allocation
 
 ```mermaid

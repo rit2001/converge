@@ -39,6 +39,8 @@ import {
   type ServerToClientEvents,
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
+import { BoardRecoveryService } from "./board-recovery-service.js";
+export { BoardRecoveryService } from "./board-recovery-service.js";
 import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
 import {
   BoardDeliveryHeadWatchdog,
@@ -90,6 +92,7 @@ function failedAck(error: unknown): ProtocolError {
 const durableRecoveryFailureCodes = new Set<BoardRecoveryError["code"]>([
   "MISSING_BOARD_HEAD",
   "MISSING_REQUIRED_SNAPSHOT",
+  "SNAPSHOT_TOO_LARGE",
   "SNAPSHOT_CORRUPT",
   "UNSUPPORTED_SNAPSHOT_VERSION",
   "SNAPSHOT_HEAD_BEYOND_BOARD",
@@ -304,8 +307,9 @@ export async function buildApp(
   await app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   const repository = new BoardRepository(pool, options.repositoryHooks);
+  const boardRecoveryMaterialRepository = new BoardRecoveryMaterialRepository(pool);
   const recoveryMaterialRepository =
-    options.recoveryMaterialRepository ?? new BoardRecoveryMaterialRepository(pool);
+    options.recoveryMaterialRepository ?? new BoardRecoveryService(boardRecoveryMaterialRepository);
   const deliveryCoordinator = options.deliveryCoordinator ?? new BoardDeliveryCoordinator();
   const deliveryMode = options.deliveryMode ?? { mode: "local" as const };
   const synchronizationBatchSize = z

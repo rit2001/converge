@@ -1,11 +1,13 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { buildApp, type AppContext } from "@converge/api";
+import { BoardRecoveryService, buildApp, type AppContext } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
 import { parseEnvironment } from "@converge/api/env";
 import {
   BoardRecoveryMaterialRepository,
+  BoardRecoveryError,
+  BoardRecoveryRefreshInfrastructureError,
   BoardRepository,
   BoardSnapshotRepository,
   createPool,
@@ -20,6 +22,7 @@ import {
 import {
   boardRecoveryMaterialSchema,
   boardSnapshotSchema,
+  httpInternalErrorResponseSchema,
   operationRangeResponseSchema,
 } from "@converge/protocol";
 import type { DurableCommand } from "@converge/protocol";
@@ -82,6 +85,20 @@ async function corruptHash(snapshotId: string): Promise<void> {
   } finally {
     await pool.query("ALTER TABLE board_snapshots ENABLE TRIGGER board_snapshots_immutable");
   }
+}
+
+async function logicalBoardState(boardId: string): Promise<unknown> {
+  const result = await pool.query<{ state: unknown }>(
+    `SELECT jsonb_build_object(
+      'board', (SELECT to_jsonb(b) FROM boards b WHERE id = $1),
+      'objects', (SELECT jsonb_agg(to_jsonb(o) ORDER BY stack_order) FROM board_objects o WHERE board_id = $1),
+      'operations', (SELECT jsonb_agg(to_jsonb(op) ORDER BY seq) FROM board_operations op WHERE board_id = $1),
+      'outbox', (SELECT jsonb_agg(to_jsonb(e) ORDER BY delivery_seq) FROM outbox_events e WHERE board_id = $1),
+      'members', (SELECT jsonb_agg(to_jsonb(m) ORDER BY user_id) FROM board_members m WHERE board_id = $1)
+    ) AS state`,
+    [boardId],
+  );
+  return result.rows[0]?.state;
 }
 
 beforeAll(async () => {
@@ -153,6 +170,7 @@ describe("snapshot plus contiguous operation-tail recovery", () => {
       "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
       [boardId],
     );
+    const logicalBefore = await logicalBoardState(boardId);
     const response = await api.app.inject({
       method: "GET",
       url: `/v1/boards/${boardId}/recovery`,
@@ -184,6 +202,7 @@ describe("snapshot plus contiguous operation-tail recovery", () => {
       boardId,
     ]);
     expect(after.rows).toEqual(before.rows);
+    expect(await logicalBoardState(boardId)).toEqual(logicalBefore);
   });
 
   it("serializes the actual earlier fallback snapshot, ordered state, tail, and hashes", async () => {
@@ -238,8 +257,9 @@ describe("snapshot plus contiguous operation-tail recovery", () => {
     expect(body.reconstructedCanonicalHash).toBe(evidence.reconstructedHash);
   });
 
-  it("returns sanitized recovery-blocked evidence without advancing board heads", async () => {
-    const boardId = await board("api-blocked");
+  it("bootstraps missing recovery material once without advancing board heads", async () => {
+    const boardId = await board("api-bootstrap");
+    const logicalBefore = await logicalBoardState(boardId);
     const before = await pool.query(
       "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
       [boardId],
@@ -249,31 +269,271 @@ describe("snapshot plus contiguous operation-tail recovery", () => {
       url: `/v1/boards/${boardId}/recovery`,
       headers: testAuthorizationHeaders(recoveryToken),
     });
-    expect(response.statusCode).toBe(409);
-    expect(response.json()).toEqual({
-      ok: false,
-      code: "RECOVERY_BLOCKED",
-      message: "Authoritative board recovery is unavailable",
-      retryable: false,
+    expect(response.statusCode).toBe(200);
+    const material = boardRecoveryMaterialSchema.parse(response.json());
+    expect(material).toMatchObject({
+      boardId,
+      snapshotCanvasSeq: 0,
+      snapshotDeliverySeq: 0,
+      capturedCanvasSeq: 0,
+      capturedDeliverySeq: 0,
+      operationTail: [],
     });
+    const snapshotCount = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+      [boardId],
+    );
+    expect(snapshotCount.rows[0]?.count).toBe("1");
+    const repeated = await api.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}/recovery`,
+      headers: testAuthorizationHeaders(recoveryToken),
+    });
+    expect(boardRecoveryMaterialSchema.parse(repeated.json()).snapshotId).toBe(material.snapshotId);
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+          [boardId],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
     const after = await pool.query("SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1", [
       boardId,
     ]);
     expect(after.rows).toEqual(before.rows);
+    expect(await logicalBoardState(boardId)).toEqual(logicalBefore);
   });
 
-  it("requires a genesis snapshot and accepts an exact-head snapshot with an empty tail", async () => {
+  it("refreshes a genesis snapshot and accepts it with an empty tail", async () => {
     const boardId = await board("genesis");
     await expect(recovery.load(boardId)).rejects.toMatchObject({
       code: "MISSING_REQUIRED_SNAPSHOT",
     });
-    const snapshot = await snapshots.create(boardId);
+    const snapshot = await recovery.refresh(boardId);
     const first = await recovery.load(boardId);
     const second = await recovery.load(boardId);
     expect(first).toEqual(second);
-    expect(first.snapshotId).toBe(snapshot.id);
+    expect(first.snapshotId).toBe(snapshot.snapshotId);
     expect(first.operations).toEqual([]);
     expect(first.capturedCanvasSeq).toBe(0);
+  });
+
+  it("uses a 100-operation tail and refreshes once at 101", async () => {
+    const boardId = await board("tail-boundary");
+    const initial = await snapshots.create(boardId);
+    for (let sequence = 0; sequence < 100; sequence += 1)
+      await boards.commitOperation(fixtureIds.user, createRectangleCommand(boardId));
+    const headers = testAuthorizationHeaders(recoveryToken);
+    const bounded = await api.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}/recovery`,
+      headers,
+    });
+    expect(bounded.statusCode).toBe(200);
+    const boundedMaterial = boardRecoveryMaterialSchema.parse(bounded.json());
+    expect(boundedMaterial.snapshotId).toBe(initial.id);
+    expect(boundedMaterial.operationTail).toHaveLength(100);
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+          [boardId],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+
+    await boards.commitOperation(fixtureIds.user, createRectangleCommand(boardId));
+    const headsBefore = await pool.query(
+      "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
+      [boardId],
+    );
+    const refreshed = await api.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}/recovery`,
+      headers,
+    });
+    expect(refreshed.statusCode).toBe(200);
+    const refreshedMaterial = boardRecoveryMaterialSchema.parse(refreshed.json());
+    expect(refreshedMaterial.snapshotId).not.toBe(initial.id);
+    expect(refreshedMaterial.snapshotCanvasSeq).toBe(101);
+    expect(refreshedMaterial.capturedCanvasSeq).toBe(101);
+    expect(refreshedMaterial.operationTail).toEqual([]);
+    const headsAfter = await pool.query(
+      "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
+      [boardId],
+    );
+    expect(headsAfter.rows).toEqual(headsBefore.rows);
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+          [boardId],
+        )
+      ).rows[0]?.count,
+    ).toBe("2");
+  });
+
+  it("uses a nonblocking refresh lock and creates at most one concurrent snapshot", async () => {
+    const boardId = await board("concurrent-refresh");
+    const entered = deferred();
+    const release = deferred();
+    let lockWinner = true;
+    const reader = new BoardRecoveryMaterialRepository(pool, {
+      hooks: {
+        afterAdvisoryLock: async () => {
+          if (!lockWinner) return;
+          lockWinner = false;
+          entered.resolve();
+          await release.promise;
+        },
+      },
+    });
+    const first = reader.refresh(boardId);
+    await entered.promise;
+    await expect(reader.refresh(boardId)).rejects.toBeInstanceOf(
+      BoardRecoveryRefreshInfrastructureError,
+    );
+    release.resolve();
+    const material = await first;
+    expect(material.operations).toEqual([]);
+    const repeated = await reader.refresh(boardId);
+    expect(repeated.snapshotId).toBe(material.snapshotId);
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+          [boardId],
+        )
+      ).rows[0]?.count,
+    ).toBe("1");
+  });
+
+  it("maps busy and timed-out refresh infrastructure to retryable INTERNAL_ERROR", async () => {
+    const auth = new TestAuthAdapter(
+      new Map([[recoveryToken, { id: fixtureIds.user, displayName: "Recovery owner" }]]),
+    );
+    for (const mode of ["busy", "timeout"] as const) {
+      const boardId = await board(`refresh-${mode}`);
+      const blocker = await pool.connect();
+      await blocker.query("BEGIN");
+      if (mode === "busy")
+        await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
+      else await blocker.query("SELECT id FROM boards WHERE id = $1 FOR UPDATE", [boardId]);
+      const refreshRepository = new BoardRecoveryMaterialRepository(pool, {
+        refreshTimeoutMs: 25,
+      });
+      const service = new BoardRecoveryService({
+        load: () => Promise.reject(new BoardRecoveryError("MISSING_REQUIRED_SNAPSHOT")),
+        refresh: (id) => refreshRepository.refresh(id),
+      });
+      const context = await buildApp(
+        parseEnvironment({
+          NODE_ENV: "test",
+          HOST: "127.0.0.1",
+          API_PORT: "4000",
+          WEB_ORIGIN: "http://127.0.0.1:3000",
+          DATABASE_URL: sharedDatabaseUrl,
+          REDIS_URL: "redis://127.0.0.1:6379",
+          LOG_LEVEL: "silent",
+          DEV_AUTH_USER_NAME: "Unused",
+        }),
+        pool,
+        auth,
+        { recoveryMaterialRepository: service },
+      );
+      try {
+        const response = await context.app.inject({
+          method: "GET",
+          url: `/v1/boards/${boardId}/recovery`,
+          headers: testAuthorizationHeaders(recoveryToken),
+        });
+        expect(response.statusCode).toBe(500);
+        expect(httpInternalErrorResponseSchema.parse(response.json())).toMatchObject({
+          code: "INTERNAL_ERROR",
+          retryable: true,
+        });
+        expect(
+          (
+            await pool.query<{ count: string }>(
+              "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+              [boardId],
+            )
+          ).rows[0]?.count,
+        ).toBe("0");
+      } finally {
+        await context.app.close();
+        await blocker.query("ROLLBACK");
+        blocker.release();
+      }
+    }
+  });
+
+  it("keeps oversized and corrupt recovery refresh terminal without replacement", async () => {
+    const oversizedBoard = await board("oversized-refresh");
+    const oversized = new BoardRecoveryMaterialRepository(pool, { maximumSnapshotBytes: 1 });
+    await expect(oversized.refresh(oversizedBoard)).rejects.toMatchObject({
+      code: "SNAPSHOT_TOO_LARGE",
+    });
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+          [oversizedBoard],
+        )
+      ).rows[0]?.count,
+    ).toBe("0");
+    const oversizedService = new BoardRecoveryService({
+      load: () => Promise.reject(new BoardRecoveryError("MISSING_REQUIRED_SNAPSHOT")),
+      refresh: (id) => oversized.refresh(id),
+    });
+    const oversizedContext = await buildApp(
+      parseEnvironment({
+        NODE_ENV: "test",
+        HOST: "127.0.0.1",
+        API_PORT: "4000",
+        WEB_ORIGIN: "http://127.0.0.1:3000",
+        DATABASE_URL: sharedDatabaseUrl,
+        REDIS_URL: "redis://127.0.0.1:6379",
+        LOG_LEVEL: "silent",
+        DEV_AUTH_USER_NAME: "Unused",
+      }),
+      pool,
+      new TestAuthAdapter(
+        new Map([[recoveryToken, { id: fixtureIds.user, displayName: "Recovery owner" }]]),
+      ),
+      { recoveryMaterialRepository: oversizedService },
+    );
+    try {
+      const oversizedResponse = await oversizedContext.app.inject({
+        method: "GET",
+        url: `/v1/boards/${oversizedBoard}/recovery`,
+        headers: testAuthorizationHeaders(recoveryToken),
+      });
+      expect(oversizedResponse.statusCode).toBe(409);
+      expect(oversizedResponse.json()).toMatchObject({
+        code: "RECOVERY_BLOCKED",
+        retryable: false,
+      });
+    } finally {
+      await oversizedContext.app.close();
+    }
+
+    const corruptBoard = await board("corrupt-no-chain");
+    const corrupt = await snapshots.create(corruptBoard);
+    await corruptHash(corrupt.id);
+    const response = await api.app.inject({
+      method: "GET",
+      url: `/v1/boards/${corruptBoard}/recovery`,
+      headers: testAuthorizationHeaders(recoveryToken),
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ code: "RECOVERY_BLOCKED", retryable: false });
+    const rows = await pool.query<{ status: string }>(
+      "SELECT status FROM board_snapshots WHERE board_id = $1",
+      [corruptBoard],
+    );
+    expect(rows.rows).toEqual([{ status: "invalid" }]);
   });
 
   it("reconstructs one and multiple ordered operations with stacking and rotation", async () => {
@@ -408,7 +668,7 @@ describe("snapshot plus contiguous operation-tail recovery", () => {
     const corrupt = await snapshots.create(boardId);
     await corruptHash(corrupt.id);
     await pool.query("DELETE FROM board_operations WHERE board_id = $1 AND seq = 1", [boardId]);
-    await expect(recovery.load(boardId)).rejects.toMatchObject({ code: "TAIL_GAP" });
+    await expect(recovery.load(boardId)).rejects.toMatchObject({ code: "SNAPSHOT_CORRUPT" });
     const status = await pool.query<{ status: string }>(
       "SELECT status FROM board_snapshots WHERE id = $1",
       [corrupt.id],
@@ -424,9 +684,7 @@ describe("snapshot plus contiguous operation-tail recovery", () => {
     const corrupt = await snapshots.create(boardId);
     await corruptHash(corrupt.id);
     const bounded = new BoardRecoveryMaterialRepository(pool, { tailLimit: 1 });
-    await expect(bounded.load(boardId)).rejects.toMatchObject({
-      code: "TAIL_LIMIT_EXCEEDED",
-    });
+    await expect(bounded.load(boardId)).rejects.toMatchObject({ code: "SNAPSHOT_CORRUPT" });
     expect(
       (
         await pool.query<{ status: string }>("SELECT status FROM board_snapshots WHERE id = $1", [

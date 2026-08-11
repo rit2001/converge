@@ -163,6 +163,23 @@ canvas/delivery heads, the fixed current heads, the full snapshot projection and
 contiguous operation tail, and the reconstructed current canonical hash. Existing board snapshot and
 operation-range endpoints retain their contracts.
 
+The recovery response/replay tail is capped at 100 operations, while background snapshot creation
+normally begins at 1,000 operations, 8 MiB, or 24 changed hours. Background creation is therefore an
+efficiency mechanism, not a recovery-availability guarantee. After authorization, one recovery
+request may perform at most one on-demand refresh when ordinary selection fails only because no
+verified snapshot exists or an otherwise-valid tail exceeds 100 operations. Refresh uses a bounded
+`pg_try_advisory_xact_lock` transaction, rereads recovery evidence under that fixed boundary, and
+either uses a snapshot created by a peer or captures and verifies one exact-head snapshot with an
+empty tail. It changes no canvas/delivery head, operation, projection, outbox row, membership,
+receipt, or authorization state.
+
+Lock contention and PostgreSQL timeout are retryable infrastructure failures. Snapshot corruption,
+unsupported versions, gaps, conflicts, reducer/projection/hash mismatch, and deterministic inability
+to create a bounded trustworthy snapshot prohibit refresh and remain non-retryable
+`RECOVERY_BLOCKED`. A corrupt newest snapshot is never hidden by creating a replacement; normal ADR
+fallback to an earlier verified snapshot remains valid only when its complete tail fits the
+100-operation bound.
+
 When current durable evidence cannot form any complete trustworthy snapshot-plus-tail chain, the
 endpoint returns HTTP `409` with the strict `RECOVERY_BLOCKED` protocol error, the sanitized message
 `Authoritative board recovery is unavailable`, and `retryable: false`. Snapshot invalidation remains
