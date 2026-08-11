@@ -272,10 +272,46 @@ by applying its contiguous log tail.
 - `apps/web` snapshot replacement plus existing pending/session fencing;
 - relevant unit, integration, failure, and Playwright tests.
 
+**Automatic creation contract:** `apps/worker` owns an asynchronous coordinator independent from
+outbox publication and Redis. User operation and revocation transactions never create snapshots.
+Eligibility is immediate when no verified snapshot exists, including genesis, or when the newest
+snapshot is invalid. Otherwise the newest valid verified snapshot is the baseline for any of:
+1,000 later canvas operations, 8 MiB estimated later operation payload, or a 24-hour-old snapshot
+after either canvas or delivery head advanced. Delivery-only advancement applies only to the age
+trigger, and an unchanged board is not resnapshotted solely due to age. Payloads remain capped at
+16 MiB.
+
+The coordinator polls every 30 seconds with ±20% jitter. Each single-flight cycle advances a
+deterministic round-robin board-ID cursor, inspects at most 100 IDs with bounded indexed queries,
+returns no more than 16 eligible boards, and runs at most two captures concurrently. Bootstrap uses
+the same traversal and never scans all unsnapshotted boards into memory. Configuration is strictly
+validated as positive safe integers and timer-safe where applicable.
+
+Multiple workers may discover one board; M2.6 adds no persistent snapshot claim/lease and no Redis
+coordination. Capture delegates to `BoardSnapshotRepository`, uses `pg_try_advisory_xact_lock` with
+the writer's board key, skips a busy board, and under the lock rereads eligibility and both heads. A
+peer-created snapshot is a harmless no-longer-eligible result, while the unique board/head constraint
+remains the final duplicate fence. Busy results receive a 5-second ±20% cooldown and are not failures.
+
+Transient failures use full-jitter exponential backoff with a 5-second base and 5-minute cap; M2.6
+does not persist attempts or exhaust them into a durable blocked state. Deterministic non-retryable
+capture failures emit one bounded sanitized notification and suppress the same board/head fingerprint
+until a head changes. The in-memory deterministic-LRU cache is capped at 1,000 fingerprints and may
+hold no board objects, payloads, SQL, credentials, or principal data.
+
+Lifecycle is idempotent and single-flight. Stop prevents new scans/captures, bounds in-flight work by
+the existing worker shutdown grace, fences late scheduling/callbacks, and releases timers, listeners,
+retry/cursor/suppression state. Implementation must add the ADR-defined `SNAPSHOT_*` variables to
+`.env.example` and Turbo pass-through; this documentation slice does not. Automatic creation does not
+delete operations/outbox rows, advance floors, compact, alter HTTP/client recovery, deploy, or claim
+M2.8 observability.
+
 **Tests required:** Trigger policies, one-board exclusion, busy-lock skip, snapshot/writer race, complete
 live/tombstone/field/stack projection, deterministic hash and size, strict schema bounds, latest valid
 selection, fixed-watermark join, corrupt newest fallback, operator block without a complete chain,
-pending-command preservation, stale session cancellation, and final canonical convergence.
+pending-command preservation, stale session cancellation, final canonical convergence, bounded
+round-robin discovery, multi-worker duplicate discovery, busy cooldown, transient retry cap,
+fingerprint suppression/eviction, and idempotent shutdown fencing.
 
 **Commands to run:**
 

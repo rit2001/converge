@@ -50,21 +50,99 @@ cannot be repaired event by event and forces fail-closed reauthentication/recove
 
 ### Creation and verification
 
-The worker schedules a board when any configurable initial trigger is met: 1,000 operations since
-the latest verified snapshot, 24 hours since that snapshot while the board changed, or 8 MiB of
-estimated retained operation payload. These are safe starting policies to validate, not performance
-or capacity claims. At most one snapshot per board is created at a time.
+`apps/worker` owns automatic snapshot creation. Snapshot scheduling and capture are independent from
+outbox publication: Redis health and publication success are not prerequisites for creating a
+PostgreSQL snapshot. User operation and membership-revocation transactions never create snapshots
+synchronously.
 
-Snapshot creation opens a short PostgreSQL transaction, attempts the existing board advisory lock,
-and skips a busy board rather than waiting indefinitely. While holding the lock it reads the board
-heads and the complete `board_objects` projection in deterministic stack/object order, canonicalizes
-the projection, computes its hash and byte count, inserts the snapshot, rereads and rehashes the
-stored value, and marks it verified. Writers cannot interleave between head capture and projection
-capture. Redis I/O is not involved.
+A board is eligible when any one of these conditions is true:
+
+1. It has no verified snapshot. This is immediate bootstrap eligibility, including for an empty or
+   genesis board.
+2. At least 1,000 canvas operations exist after the newest valid verified snapshot.
+3. Estimated retained operation payload after that snapshot is at least 8 MiB.
+4. Either the canvas or delivery head advanced after the snapshot and the verified snapshot is at
+   least 24 hours old.
+
+Delivery-head-only advancement qualifies only for the 24-hour trigger and does not count as a canvas
+operation. A newest invalid snapshot causes immediate replacement eligibility, while candidate
+comparison continues to use the newest valid verified snapshot as the recovery baseline. A board
+whose canvas and delivery heads have not advanced is not resnapshotted solely because time passed.
+The snapshot payload remains limited to 16 MiB.
+
+The worker polls every 30,000 ms with ±20% jitter. A polling cycle inspects at most 100 board IDs and
+returns at most 16 eligible candidates. It runs no more than two captures concurrently. Poll cycles
+are single-flight and never overlap. Candidate traversal uses a deterministic round-robin board-ID
+cursor, including for bootstrap candidates, so no worker loads or scans every board into application
+memory at startup or during a later cycle. Bounded indexed PostgreSQL queries evaluate verified
+snapshot heads and post-snapshot operation count and estimated bytes; candidate discovery must not
+issue one query per board or one unbounded query over the complete board table.
+
+M2.6 adds no persistent snapshot claim or lease table. Multiple workers may discover the same
+candidate. Capture opens a short PostgreSQL transaction and uses `pg_try_advisory_xact_lock` with the
+same board lock key as operations. A busy board is skipped immediately so user commits retain
+priority. After acquiring the lock, capture rereads eligibility and both authoritative heads. If
+another worker already created the required snapshot, the result is harmlessly no longer eligible.
+The unique board/head snapshot constraint remains the final duplicate fence: duplicate discovery is
+allowed, but duplicate durable snapshots are not.
+
+While holding the lock, capture reads the board heads and complete `board_objects` projection in
+deterministic stack/object order, canonicalizes the projection, computes its hash and byte count,
+inserts the snapshot, rereads and rehashes the stored value, and marks it verified. Writers cannot
+interleave between head capture and projection capture. Redis I/O is not involved.
 
 The worker bounds one snapshot payload to a configurable initial 16 MiB. A board exceeding the bound
 is operator-blocked for compaction and remains recoverable from its existing log; it is not truncated
 or partially snapshotted.
+
+### Coordinator retry, suppression, and lifecycle
+
+A failed `pg_try_advisory_xact_lock` is not a snapshot failure. That worker applies a 5,000 ms ±20%
+busy-board cooldown before retrying the board, while unrelated candidates continue.
+
+Transient failures use full-jitter exponential backoff with a 5,000 ms base and 300,000 ms cap.
+M2.6 does not exhaust retries into a durable blocked state. Retry work remains bounded by the cap,
+polling limits, and capture concurrency; an ordinary process restart may reset transient in-memory
+attempt counters. M2.8 adds operator alerting and durable operational visibility, so M2.6 makes no
+such claim.
+
+Deterministic non-retryable capture failures include a projection exceeding 16 MiB, strict
+projection/schema failure, and deterministic canonicalization failure. The coordinator emits one
+bounded sanitized failure notification and suppresses repeated attempts for the same board plus
+canvas/delivery-head fingerprint. A changed authoritative head permits one new attempt. This
+in-memory suppression cache holds at most 1,000 fingerprints and uses deterministic LRU eviction. It
+never stores board objects, snapshot payloads, SQL, credentials, or principal data.
+
+`start()` and `stop()` are idempotent. No candidate scans overlap. Stop prevents new scans and
+captures. In-flight captures may finish only within the existing worker shutdown grace; after grace
+expiry, late results cannot schedule work or invoke lifecycle callbacks. Shutdown releases timers,
+listeners, retry state, round-robin cursor state, and suppression state.
+
+All coordinator configuration is strictly validated as positive safe integers and, for timing
+values, against timer-safe upper bounds:
+
+| Configuration                        |    Default |
+| ------------------------------------ | ---------: |
+| `SNAPSHOT_POLL_INTERVAL_MS`          |    `30000` |
+| `SNAPSHOT_POLL_JITTER_PERCENT`       |       `20` |
+| `SNAPSHOT_CANDIDATE_SCAN_LIMIT`      |      `100` |
+| `SNAPSHOT_CANDIDATE_BATCH_SIZE`      |       `16` |
+| `SNAPSHOT_MAX_CONCURRENCY`           |        `2` |
+| `SNAPSHOT_OPERATION_THRESHOLD`       |     `1000` |
+| `SNAPSHOT_CHANGED_AGE_MS`            | `86400000` |
+| `SNAPSHOT_OPERATION_BYTES_THRESHOLD` |  `8388608` |
+| `SNAPSHOT_MAX_PAYLOAD_BYTES`         | `16777216` |
+| `SNAPSHOT_RETRY_BASE_MS`             |     `5000` |
+| `SNAPSHOT_RETRY_CAP_MS`              |   `300000` |
+| `SNAPSHOT_BUSY_RETRY_MS`             |     `5000` |
+| `SNAPSHOT_FAILURE_FINGERPRINT_LIMIT` |     `1000` |
+
+The implementation slice must add these variables to `.env.example` and Turbo environment
+pass-through. This documentation-only decision does not edit those configuration files.
+
+The coordinator does not delete operations or outbox rows, advance recovery floors, compact data,
+add a persistent snapshot lease table, coordinate through Redis, change HTTP/client recovery, deploy
+infrastructure, or claim completed observability. Those remain later, separately gated work.
 
 ### Recovery contract
 

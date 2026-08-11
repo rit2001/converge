@@ -259,10 +259,16 @@ invariants.
 | Fail-closed socket lifecycle   | 2 seconds maximum                                                | Readiness drops first; forced closure bounds stale socket lifetime.                                                     | `SOCKET_FAIL_CLOSED_TIMEOUT_MS`                                                                   | Disconnect duration and F09/F23                        | No; provisional safety deadline. |
 | Board-head watchdog            | One query of 100 active boards every 5 seconds, ±20% jitter      | Bounds DB load per replica and avoids synchronized polling.                                                             | `DELIVERY_WATCHDOG_INTERVAL_MS`, `DELIVERY_WATCHDOG_BATCH_SIZE`, `DELIVERY_WATCHDOG_JITTER_RATIO` | Query count/duration and F27/F31                       | No; not a detection SLO.         |
 | Operation tail batch           | 100 operations                                                   | Preserves the accepted M1 synchronization bound.                                                                        | `SYNC_BATCH_SIZE`                                                                                 | Catch-up batches and existing synchronization tests    | No; inherited safety bound.      |
-| Snapshot operation trigger     | 1,000 operations since verified snapshot                         | Bounds tail growth by a configurable count trigger.                                                                     | `SNAPSHOT_OPERATION_INTERVAL`                                                                     | Tail length and snapshot trigger test                  | No; provisional policy.          |
-| Snapshot time trigger          | 24 changed hours                                                 | Creates recovery points for slowly changing boards.                                                                     | `SNAPSHOT_MAX_CHANGED_AGE_MS`                                                                     | Snapshot age and scheduler test                        | No; provisional policy.          |
-| Snapshot retained-byte trigger | 8 MiB estimated operation payload                                | Adds a size-sensitive trigger independent of operation count.                                                           | `SNAPSHOT_TAIL_BYTES_TRIGGER`                                                                     | Retained-tail bytes and scheduler test                 | No; provisional policy.          |
-| Snapshot payload maximum       | 16 MiB                                                           | Refuses unbounded in-memory serialization; leaves the log intact.                                                       | `SNAPSHOT_MAX_BYTES`                                                                              | `snapshot_size_bytes` and oversize failure test        | No; provisional bound.           |
+| Snapshot poll interval         | 30 seconds with ±20% jitter                                      | Bounds candidate discovery and avoids synchronized workers.                                                             | `SNAPSHOT_POLL_INTERVAL_MS`, `SNAPSHOT_POLL_JITTER_PERCENT`                                       | Single-flight poll and deterministic jitter tests      | No; provisional bound.           |
+| Snapshot candidate scan        | Inspect 100 board IDs; return at most 16 eligible boards         | Bounds indexed round-robin discovery without a full-board scan.                                                         | `SNAPSHOT_CANDIDATE_SCAN_LIMIT`, `SNAPSHOT_CANDIDATE_BATCH_SIZE`                                  | Query-bound and traversal tests                        | No; provisional bound.           |
+| Snapshot capture concurrency   | 2 captures per worker                                            | Bounds projection serialization and PostgreSQL work.                                                                    | `SNAPSHOT_MAX_CONCURRENCY`                                                                        | Slot and unrelated-board tests                         | No; provisional bound.           |
+| Snapshot operation trigger     | 1,000 canvas operations since newest valid verified snapshot     | Bounds tail growth by a configurable count trigger.                                                                     | `SNAPSHOT_OPERATION_THRESHOLD`                                                                    | Tail length and bootstrap trigger tests                | No; provisional policy.          |
+| Snapshot time trigger          | 24 hours after either head changed                               | Creates a later recovery point for slowly changing canvas or delivery state.                                            | `SNAPSHOT_CHANGED_AGE_MS`                                                                         | Canvas/delivery-head scheduler tests                   | No; provisional policy.          |
+| Snapshot retained-byte trigger | 8 MiB estimated post-snapshot operation payload                  | Adds a size-sensitive trigger independent of operation count.                                                           | `SNAPSHOT_OPERATION_BYTES_THRESHOLD`                                                              | Retained-tail bytes and scheduler test                 | No; provisional policy.          |
+| Snapshot payload maximum       | 16 MiB                                                           | Refuses unbounded in-memory serialization; leaves the log intact.                                                       | `SNAPSHOT_MAX_PAYLOAD_BYTES`                                                                      | `snapshot_size_bytes` and oversize failure test        | No; provisional bound.           |
+| Snapshot transient retry       | Full jitter; 5-second base, 5-minute cap                         | Bounds retries without creating durable blocked state in M2.6.                                                          | `SNAPSHOT_RETRY_BASE_MS`, `SNAPSHOT_RETRY_CAP_MS`                                                 | Backoff/cap and process-restart tests                  | No; provisional policy.          |
+| Snapshot busy-board retry      | 5 seconds with ±20% jitter                                       | Keeps background work behind writers without busy-spinning.                                                             | `SNAPSHOT_BUSY_RETRY_MS`                                                                          | Busy-lock and unrelated-board tests                    | No; provisional policy.          |
+| Snapshot failure suppression   | 1,000 board/head fingerprints with deterministic LRU eviction    | Bounds repeated deterministic failure state without retaining board contents.                                           | `SNAPSHOT_FAILURE_FINGERPRINT_LIMIT`                                                              | Fingerprint/head-change/eviction tests                 | No; provisional bound.           |
 | Snapshot retention             | Minimum 2 verified snapshots plus floor and all pinned snapshots | Retains a newest/floor fallback and future version anchors.                                                             | `SNAPSHOT_MIN_RETAINED`                                                                           | Retention invariant and corruption test                | No; provisional minimum.         |
 | Compaction safety margin       | One verified snapshot generation behind newest                   | Prevents the newest checkpoint from immediately becoming the deletion floor.                                            | `COMPACTION_SNAPSHOT_SAFETY_GENERATIONS`                                                          | Floor distance and F16/F21/F22                         | No; provisional safety margin.   |
 | Compaction enablement          | Disabled                                                         | Prevents deletion before recovery, corruption, backup, and failure gates pass.                                          | `COMPACTION_ENABLED`                                                                              | M2.7 stop gate and compaction suite                    | No; approved release gate.       |
@@ -736,6 +742,49 @@ Snapshot creation, canonical contents, selection, corruption behavior, schedulin
 receipts, and future restore compatibility are specified in ADR 006. The existing 100-operation tail
 batch remains. Snapshot and stream envelope byte limits prevent a single board from consuming
 unbounded worker/API memory.
+
+### Bounded automatic snapshot coordinator
+
+`apps/worker` owns automatic snapshots independently from its outbox publisher. Operation and
+membership-revocation commits never create snapshots synchronously, and Redis health or publication
+success does not gate PostgreSQL snapshot creation.
+
+Eligibility is immediate for a board without a verified snapshot, including an empty genesis board,
+and for replacement of a newest invalid snapshot. Otherwise the newest valid verified snapshot is
+the baseline. A board qualifies after 1,000 later canvas operations, 8 MiB of estimated later
+operation payload, or after either authoritative head advanced and the snapshot became 24 hours old.
+A delivery-only advance applies only to the age trigger. An unchanged board does not qualify merely
+because time passed.
+
+Every single-flight 30-second ±20% jittered cycle advances a deterministic round-robin board-ID
+cursor, inspects at most 100 IDs through bounded indexed queries, returns at most 16 eligible IDs, and
+runs no more than two captures concurrently. Bootstrap boards use the same traversal; no worker loads
+every board or every unsnapshotted board. All configuration values are positive safe integers and
+timing values are timer-safe.
+
+Workers do not persist snapshot claims or coordinate snapshots through Redis. Duplicate discovery is
+permitted. `BoardSnapshotRepository` capture uses `pg_try_advisory_xact_lock` with the writer's board
+key, skips a busy board immediately, then rereads eligibility and both heads. A snapshot created by a
+peer makes the result harmlessly no longer eligible; the existing unique board/head constraint is
+the final duplicate fence. A busy result is not a failure and receives a 5-second ±20% cooldown so
+unrelated boards and user commits continue.
+
+Transient failures use full-jitter exponential backoff from 5 seconds through a 5-minute cap, with
+in-memory attempts resettable by process restart and no M2.6 durable blocked state. Deterministic
+non-retryable failures emit one sanitized bounded notification and suppress the same board plus
+canvas/delivery-head fingerprint until either head changes. The deterministic-LRU suppression cache
+holds at most 1,000 fingerprints and no board object, payload, SQL, credential, or principal data.
+Durable operator visibility remains M2.8 work.
+
+Coordinator `start()`/`stop()` and repeated shutdown are idempotent. Stop prevents new scans and
+captures; in-flight work has only the existing worker shutdown grace. Late results after that grace
+cannot schedule work or callbacks, and shutdown releases timers, listeners, retries, traversal cursor,
+and suppression state.
+
+Implementation must later add the documented `SNAPSHOT_*` variables to `.env.example` and Turbo
+pass-through. This documentation slice intentionally changes neither file. Automatic creation does
+not delete operations/outbox rows, advance recovery floors, compact, add a persistent snapshot lease,
+change HTTP/client behavior, deploy infrastructure, or claim completed observability.
 
 Compaction is serialized with writers by the board advisory lock. It advances floors and deletes rows
 in one transaction only after verified coverage and published outbox status. An API/client below a
