@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import {
+  emptyBoardState,
+  hashBoardState,
+  reduceCommand,
+  type BoardState,
+} from "@converge/canvas-engine";
 import type {
+  BoardRecoveryMaterial,
   BoardSnapshot,
   CommittedOperation,
   DurableCommand,
@@ -58,8 +65,118 @@ function pending(index: number): DurableCommand {
   };
 }
 
+function transformOperation(
+  seq: number,
+  targetId: string,
+  payload: { x?: number; rotation?: number },
+): CommittedOperation {
+  return {
+    schemaVersion: 1,
+    opId: uuid("6", seq),
+    boardId,
+    clientId,
+    baseSeq: seq - 1,
+    targetId,
+    clientTimestamp: `2026-08-07T12:02:${String(seq).padStart(2, "0")}.000Z`,
+    committedAt: `2026-08-07T12:03:${String(seq).padStart(2, "0")}.000Z`,
+    type: "object.transform",
+    payload,
+    seq,
+  };
+}
+
 function snapshot(lastSeq = 0): BoardSnapshot {
   return { id: boardId, name: "Recovery", lastSeq, objects: [] };
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, item]) => [key, canonicalValue(item)]),
+    );
+  }
+  if (typeof value === "number" && Object.is(value, -0)) return 0;
+  return value;
+}
+
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function replay(operations: CommittedOperation[]): BoardState {
+  return operations.reduce((state, item) => {
+    const result = reduceCommand(state, item, item.seq);
+    if (!result.ok) throw new Error(`Invalid recovery fixture: ${result.code}`);
+    return result.state;
+  }, emptyBoardState());
+}
+
+async function recoveryMaterial(
+  snapshotOperations: CommittedOperation[] = [],
+  operationTail: CommittedOperation[] = [],
+): Promise<BoardRecoveryMaterial> {
+  const snapshotStateValue = replay(snapshotOperations);
+  const orderedIds = [
+    ...snapshotStateValue.order,
+    ...Object.keys(snapshotStateValue.objects)
+      .filter((id) => !snapshotStateValue.order.includes(id))
+      .sort(),
+  ];
+  const snapshotState: BoardRecoveryMaterial["snapshotState"] = {
+    schemaVersion: 1 as const,
+    boardId,
+    boardName: "Recovery",
+    lastSeq: snapshotStateValue.lastSeq,
+    lastDeliverySeq: snapshotStateValue.lastSeq,
+    objects: orderedIds.map((id, index) => {
+      const projected = snapshotStateValue.objects[id];
+      if (!projected) throw new Error("Missing recovery fixture object");
+      return {
+        objectId: id,
+        stackOrder: index + 1,
+        value: projected.value,
+        fieldSeq: {
+          id: projected.fieldSeq.id ?? projected.createdSeq,
+          kind: projected.fieldSeq.kind ?? projected.createdSeq,
+          x: projected.fieldSeq.x ?? projected.createdSeq,
+          y: projected.fieldSeq.y ?? projected.createdSeq,
+          width: projected.fieldSeq.width ?? projected.createdSeq,
+          height: projected.fieldSeq.height ?? projected.createdSeq,
+          rotation: projected.fieldSeq.rotation ?? projected.createdSeq,
+          fill: projected.fieldSeq.fill ?? projected.createdSeq,
+          text: projected.fieldSeq.text ?? projected.createdSeq,
+        },
+        createdSeq: projected.createdSeq,
+        updatedSeq: projected.updatedSeq,
+        deletedSeq: projected.deletedSeq,
+      };
+    }),
+  };
+  const reconstructed = operationTail.reduce((state, item) => {
+    const result = reduceCommand(state, item, item.seq);
+    if (!result.ok) throw new Error(`Invalid recovery fixture tail: ${result.code}`);
+    return result.state;
+  }, snapshotStateValue);
+  const snapshotCanonicalHash = await sha256(
+    `converge.snapshot.v1\0${JSON.stringify(canonicalValue(snapshotState))}`,
+  );
+  return {
+    boardId,
+    snapshotId: "50000000-0000-4000-8000-000000000001",
+    snapshotSchemaVersion: 1,
+    snapshotCanvasSeq: snapshotState.lastSeq,
+    snapshotDeliverySeq: snapshotState.lastDeliverySeq,
+    capturedCanvasSeq: reconstructed.lastSeq,
+    capturedDeliverySeq: reconstructed.lastSeq,
+    snapshotState,
+    snapshotCanonicalHash,
+    operationTail,
+    reconstructedCanonicalHash: await hashBoardState(reconstructed),
+  };
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
@@ -71,7 +188,10 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
 }
 
 async function settle(): Promise<void> {
-  for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+  for (let turn = 0; turn < 8; turn += 1) {
+    await crypto.subtle.digest("SHA-256", new Uint8Array());
+    await Promise.resolve();
+  }
 }
 
 class FakeScheduler implements RetryScheduler {
@@ -235,7 +355,8 @@ function harness(
     initialSeq?: number;
     initialPending?: DurableCommand[];
     fetcher?: typeof fetch;
-    loadSnapshot?: (id: string, signal: AbortSignal) => Promise<unknown>;
+    loadRecovery?: (id: string, signal: AbortSignal) => Promise<unknown>;
+    useDefaultRecovery?: boolean;
     countLimit?: number;
     byteLimit?: number;
     retryCapMs?: number;
@@ -257,7 +378,11 @@ function harness(
     pendingStore: persistence,
     socketFactory: () => socket as never,
     fetcher,
-    loadSnapshot: options.loadSnapshot ?? (() => Promise.resolve(snapshot())),
+    ...(options.loadRecovery
+      ? { loadRecovery: options.loadRecovery }
+      : options.useDefaultRecovery
+        ? {}
+        : { loadRecovery: () => recoveryMaterial() }),
     synchronization: {
       liveBufferMaxCount: options.countLimit ?? LIVE_BUFFER_MAX_COUNT,
       liveBufferMaxBytes: options.byteLimit ?? LIVE_BUFFER_MAX_BYTES,
@@ -271,6 +396,15 @@ function harness(
 
 function succeedJoin(socket: FakeSocket, index: number, watermark: number): void {
   socket.joins[index]?.acknowledge({ ok: true, boardId, joinWatermark: watermark });
+}
+
+function requireRecovery(socket: FakeSocket, index = 0): void {
+  socket.joins[index]?.acknowledge({
+    ok: false,
+    code: "RESYNC_REQUIRED",
+    message: "Authoritative recovery is required",
+    retryable: true,
+  });
 }
 
 beforeEach(() => {
@@ -506,9 +640,9 @@ describe("terminal synchronization failures", () => {
         rangeRequests += 1;
         return Promise.resolve(response(0, 0, []));
       },
-      loadSnapshot: () => {
+      loadRecovery: () => {
         snapshotLoads += 1;
-        return Promise.resolve(snapshot());
+        return recoveryMaterial();
       },
     });
 
@@ -632,9 +766,9 @@ describe("terminal synchronization failures", () => {
           ),
         );
       },
-      loadSnapshot: () => {
+      loadRecovery: () => {
         snapshotLoads += 1;
-        return Promise.resolve(snapshot());
+        return recoveryMaterial();
       },
     });
     succeedJoin(test.socket, 0, 1);
@@ -688,9 +822,9 @@ describe("terminal synchronization failures", () => {
         rangeRequests += 1;
         return Promise.resolve(response(0, 0, []));
       },
-      loadSnapshot: () => {
+      loadRecovery: () => {
         snapshotLoads += 1;
-        return Promise.resolve(snapshot());
+        return recoveryMaterial();
       },
     });
     failed.socket.deliver({ malformed: true });
@@ -917,9 +1051,9 @@ describe("authoritative resynchronization and pending interaction", () => {
             { status: 409, headers: { "content-type": "application/json" } },
           ),
         ),
-      loadSnapshot: () => {
+      loadRecovery: () => {
         snapshotLoads += 1;
-        return Promise.resolve(snapshot(0));
+        return recoveryMaterial();
       },
     });
     succeedJoin(test.socket, 0, 1);
@@ -942,9 +1076,9 @@ describe("authoritative resynchronization and pending interaction", () => {
     const test = harness({
       initialSeq: 5,
       initialPending: [item],
-      loadSnapshot: () => {
+      loadRecovery: () => {
         snapshotLoads += 1;
-        return Promise.resolve(snapshot(0));
+        return recoveryMaterial();
       },
     });
     test.socket.joins[0]?.acknowledge({
@@ -980,6 +1114,306 @@ describe("authoritative resynchronization and pending interaction", () => {
     succeedJoin(test.socket, 1, 0);
     await settle();
     expect(test.socket.submissions).toEqual([first]);
+  });
+});
+
+describe("verified snapshot-plus-tail recovery", () => {
+  it("applies an exact-head snapshot with an empty tail", async () => {
+    const first = operation(1);
+    const material = await recoveryMaterial([first]);
+    const test = harness({ loadRecovery: () => Promise.resolve(material) });
+
+    requireRecovery(test.socket);
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "retry-wait",
+      committed: { lastSeq: 1, order: [first.targetId] },
+      objects: [{ id: first.targetId }],
+    });
+    expect(material.operationTail).toEqual([]);
+  });
+
+  it("replays one and multiple contiguous operations while preserving stacking and rotation", async () => {
+    const first = operation(1);
+    const second = operation(2);
+    const rotated = transformOperation(3, first.targetId, { x: 77, rotation: 35 });
+    const oneTailMaterial = await recoveryMaterial([first], [second]);
+    const oneTail = harness({ loadRecovery: () => Promise.resolve(oneTailMaterial) });
+    requireRecovery(oneTail.socket);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      committed: { lastSeq: 2, order: [first.targetId, second.targetId] },
+    });
+
+    const material = await recoveryMaterial([first], [second, rotated]);
+    const test = harness({ loadRecovery: () => Promise.resolve(material) });
+
+    requireRecovery(test.socket);
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      committed: { lastSeq: 3, order: [first.targetId, second.targetId] },
+      objects: [
+        { id: first.targetId, x: 77, rotation: 35 },
+        { id: second.targetId, rotation: 0 },
+      ],
+    });
+  });
+
+  it("publishes only the fully replayed state and retains durable pending commands until READY", async () => {
+    const first = operation(1);
+    const second = operation(2);
+    const third = operation(3);
+    const pendingCommand = pending(9);
+    const material = await recoveryMaterial([first], [second, third]);
+    const test = harness({
+      initialPending: [pendingCommand],
+      loadRecovery: () => Promise.resolve(material),
+    });
+    let prior = useBoardStore.getState().committed;
+    const committedSequences: number[] = [];
+    const unsubscribe = useBoardStore.subscribe((state) => {
+      if (state.committed === prior) return;
+      prior = state.committed;
+      committedSequences.push(state.committed.lastSeq);
+    });
+
+    requireRecovery(test.socket);
+    await settle();
+
+    expect(committedSequences).toEqual([3]);
+    expect(test.persistence.rows.has(pendingCommand.opId)).toBe(true);
+    expect(test.socket.submissions).toEqual([]);
+    test.scheduler.runDelay(500);
+    succeedJoin(test.socket, 1, 3);
+    await settle();
+    expect(useBoardStore.getState().connection).toBe("ready");
+    expect(test.socket.submissions).toEqual([pendingCommand]);
+    expect(test.persistence.rows.has(pendingCommand.opId)).toBe(true);
+    unsubscribe();
+  });
+
+  it("treats RECOVERY_BLOCKED as terminal without retry or legacy snapshot fallback", async () => {
+    const repairedMaterial = await recoveryMaterial([], [operation(1)]);
+    const urls: string[] = [];
+    const failed = harness({
+      useDefaultRecovery: true,
+      fetcher: (input) => {
+        urls.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        );
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              ok: false,
+              code: "RECOVERY_BLOCKED",
+              message: "Authoritative board recovery is unavailable",
+              retryable: false,
+            }),
+            { status: 409, headers: { "content-type": "application/json" } },
+          ),
+        );
+      },
+    });
+
+    requireRecovery(failed.socket);
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "error",
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: { retryCode: "RECOVERY_BLOCKED", retryScheduled: false },
+    });
+    expect(failed.socket.connected).toBe(false);
+    expect(failed.scheduler.tasks.size).toBe(0);
+    expect(urls).toEqual([`http://localhost:4000/v1/boards/${boardId}/recovery`]);
+
+    const replacement = harness({ loadRecovery: () => Promise.resolve(repairedMaterial) });
+    requireRecovery(replacement.socket);
+    await settle();
+    replacement.scheduler.runDelay(500);
+    succeedJoin(replacement.socket, 1, 1);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      sessionToken: replacement.token,
+      connection: "ready",
+      committed: { lastSeq: 1 },
+      authoritativeHash: {
+        status: "ready",
+        seq: 1,
+        value: repairedMaterial.reconstructedCanonicalHash,
+      },
+    });
+  });
+
+  it("retries transient recovery failures and keeps authorization failures terminal", async () => {
+    const material = await recoveryMaterial();
+    let recoveryRequests = 0;
+    const retried = harness({
+      useDefaultRecovery: true,
+      fetcher: () => {
+        recoveryRequests += 1;
+        const failure = recoveryRequests === 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify(
+              failure
+                ? {
+                    ok: false,
+                    code: "INTERNAL_ERROR",
+                    message: "An internal server error occurred.",
+                    retryable: true,
+                  }
+                : material,
+            ),
+            { status: failure ? 500 : 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      },
+    });
+    requireRecovery(retried.socket);
+    await settle();
+    expect(useBoardStore.getState().connection).toBe("retry-wait");
+    retried.scheduler.runDelay(500);
+    requireRecovery(retried.socket, 1);
+    await settle();
+    retried.scheduler.runDelay(1_000);
+    succeedJoin(retried.socket, 2, 0);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({ connection: "ready", error: null });
+    expect(recoveryRequests).toBe(2);
+
+    const unauthorized = harness({
+      useDefaultRecovery: true,
+      fetcher: () =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              ok: false,
+              code: "AUTHENTICATION_REQUIRED",
+              message: "Authentication required",
+              retryable: false,
+            }),
+            { status: 401, headers: { "content-type": "application/json" } },
+          ),
+        ),
+    });
+    requireRecovery(unauthorized.socket);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({ connection: "authorization-failed" });
+  });
+
+  it.each([
+    ["wrong board", async () => ({ ...(await recoveryMaterial()), boardId: uuid("9", 1) })],
+    [
+      "unsafe head",
+      async () => ({
+        ...(await recoveryMaterial()),
+        capturedCanvasSeq: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    ],
+    [
+      "snapshot hash mismatch",
+      async () => ({ ...(await recoveryMaterial()), snapshotCanonicalHash: "f".repeat(64) }),
+    ],
+    [
+      "tail gap",
+      async () => {
+        const material = await recoveryMaterial([], [operation(1), operation(2)]);
+        return { ...material, operationTail: [material.operationTail[1]] };
+      },
+    ],
+    [
+      "duplicate sequence",
+      async () => {
+        const material = await recoveryMaterial([], [operation(1), operation(2)]);
+        return {
+          ...material,
+          operationTail: [material.operationTail[0], { ...material.operationTail[1], seq: 1 }],
+        };
+      },
+    ],
+    [
+      "malformed operation",
+      async () => {
+        const material = await recoveryMaterial([], [operation(1)]);
+        return {
+          ...material,
+          operationTail: [{ ...material.operationTail[0], privateField: true }],
+        };
+      },
+    ],
+    [
+      "reducer failure",
+      async () => ({
+        ...(await recoveryMaterial()),
+        capturedCanvasSeq: 1,
+        capturedDeliverySeq: 1,
+        operationTail: [transformOperation(1, uuid("8", 1), { x: 10 })],
+      }),
+    ],
+    [
+      "reconstructed hash mismatch",
+      async () => ({ ...(await recoveryMaterial()), reconstructedCanonicalHash: "e".repeat(64) }),
+    ],
+    ["unknown field", async () => ({ ...(await recoveryMaterial()), privateField: true })],
+  ])("terminally rejects %s evidence before store mutation", async (_name, buildMaterial) => {
+    const raw = await buildMaterial();
+    const test = harness({ loadRecovery: () => Promise.resolve(raw) });
+
+    requireRecovery(test.socket);
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "error",
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: { retryCode: "INVALID_COMMAND", retryScheduled: false },
+    });
+    expect(test.socket.connected).toBe(false);
+    expect(test.scheduler.tasks.size).toBe(0);
+  });
+
+  it("keeps the timeout active through stalled response-body consumption", async () => {
+    const body = deferred<unknown>();
+    const test = harness({
+      useDefaultRecovery: true,
+      fetcher: () => Promise.resolve({ ok: true, json: () => body.promise } as unknown as Response),
+    });
+    requireRecovery(test.socket);
+    await settle();
+
+    test.scheduler.runDelay(SYNC_ACK_TIMEOUT_MS);
+    await settle();
+    expect(useBoardStore.getState()).toMatchObject({
+      connection: "retry-wait",
+      committed: { lastSeq: 0 },
+      synchronizationDiagnostics: { retryCode: "INTERNAL_ERROR" },
+    });
+
+    body.resolve(await recoveryMaterial([], [operation(1)]));
+    await settle();
+    expect(useBoardStore.getState().committed.lastSeq).toBe(0);
+  });
+
+  it("ignores cancelled recovery material after a replacement session owns the store", async () => {
+    const late = deferred<unknown>();
+    const stale = harness({ loadRecovery: () => late.promise });
+    requireRecovery(stale.socket);
+    await settle();
+    stale.transport.disconnect();
+
+    const replacement = harness();
+    succeedJoin(replacement.socket, 0, 0);
+    await settle();
+    late.resolve(await recoveryMaterial([], [operation(1)]));
+    await settle();
+
+    expect(useBoardStore.getState()).toMatchObject({
+      sessionToken: replacement.token,
+      connection: "ready",
+      committed: { lastSeq: 0 },
+    });
   });
 });
 

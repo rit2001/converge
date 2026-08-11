@@ -84,7 +84,6 @@ export function Workspace(): React.JSX.Element {
       createTransport: (boardId: string, token: BoardSessionToken) =>
         new BoardTransport(boardId, clientId, token, {
           pendingStore: indexedDbPendingOperationStore,
-          loadSnapshot,
         }),
     });
   }, [clientId]);
