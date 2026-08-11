@@ -135,7 +135,6 @@ describe("distributed-delivery application composition", () => {
       deliveryMode: {
         mode: "distributed",
         createRuntime: state.createRuntime,
-        membershipRevoked: vi.fn(() => Promise.resolve()),
       },
     });
     const closeSocketIo = vi.spyOn(context.io, "close");
@@ -165,7 +164,6 @@ describe("distributed-delivery application composition", () => {
       deliveryMode: {
         mode: "distributed",
         createRuntime: state.createRuntime,
-        membershipRevoked: vi.fn(() => Promise.resolve()),
       },
     });
     vi.spyOn(context.io, "close").mockImplementation(() => {
@@ -186,7 +184,6 @@ describe("distributed-delivery application composition", () => {
       deliveryMode: {
         mode: "distributed",
         createRuntime: state.createRuntime,
-        membershipRevoked: vi.fn(() => Promise.resolve()),
       },
     });
     const broadcast = vi.spyOn(context.io.of("/").adapter, "broadcast");
@@ -208,40 +205,36 @@ describe("distributed-delivery application composition", () => {
     }
   });
 
-  it("forwards membership revocation to its required injected handler", async () => {
+  it("injects the required membership-revocation handler into the runtime", async () => {
     const state = runtimeHarness();
-    const membershipRevoked = vi.fn(() => Promise.resolve());
     const context = await buildApp(environment, pool, auth, {
-      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime, membershipRevoked },
+      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime },
     });
     try {
       await context.app.ready();
       await state.handlers.membershipRevoked(membershipEnvelope);
-      expect(membershipRevoked).toHaveBeenCalledOnce();
-      expect(membershipRevoked).toHaveBeenCalledWith(membershipEnvelope);
+      expect(state.createRuntime).toHaveBeenCalledOnce();
     } finally {
       await context.app.close();
     }
   });
 
-  it("rejects distributed composition without the membership handler", async () => {
+  it("rejects distributed composition without a runtime factory", async () => {
     const state = runtimeHarness();
     const deliveryMode = {
       mode: "distributed",
-      createRuntime: state.createRuntime,
     } as unknown as NonNullable<BuildAppOptions["deliveryMode"]>;
 
     await expect(buildApp(environment, pool, auth, { deliveryMode })).rejects.toThrow(
-      "requires a runtime and every event handler",
+      "requires a runtime factory",
     );
     expect(state.createRuntime).not.toHaveBeenCalled();
   });
 
   it("fences operation and membership callbacks as soon as application shutdown starts", async () => {
     const state = runtimeHarness();
-    const membershipRevoked = vi.fn(() => Promise.resolve());
     const context = await buildApp(environment, pool, auth, {
-      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime, membershipRevoked },
+      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime },
     });
     const broadcast = vi.spyOn(context.io.of("/").adapter, "broadcast");
     await context.app.ready();
@@ -251,7 +244,6 @@ describe("distributed-delivery application composition", () => {
     await state.handlers.operationCommitted(operationEnvelope());
     await state.handlers.membershipRevoked(membershipEnvelope);
     expect(broadcast).not.toHaveBeenCalled();
-    expect(membershipRevoked).not.toHaveBeenCalled();
   });
 
   it("rejects a handler payload whose operation targets another board", async () => {
@@ -260,7 +252,6 @@ describe("distributed-delivery application composition", () => {
       deliveryMode: {
         mode: "distributed",
         createRuntime: state.createRuntime,
-        membershipRevoked: vi.fn(() => Promise.resolve()),
       },
     });
     try {

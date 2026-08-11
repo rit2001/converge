@@ -37,8 +37,8 @@ Run the exact local commands from the root `README.md`. CI repeats them with an 
 
 ## Deferred by design
 
-- Production activation of Redis multi-instance Socket.IO fan-out (the test-only two-API topology is
-  proven; M2.5 revocation/readiness gates remain)
+- Production activation of Redis multi-instance Socket.IO fan-out (the test-only two-API operation
+  and membership-revocation topology is proven; M2.5 readiness/watchdog gates remain)
 - Production activation of transactional-outbox dispatch (the repository, worker publisher, and
   crash-boundary failure evidence are implemented)
 - Snapshot creation, historical recovery, and operation-log compaction

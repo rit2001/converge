@@ -19,6 +19,7 @@ import {
   httpInternalErrorResponseSchema,
   joinBoardAckSchema,
   joinBoardRequestSchema,
+  membershipRevokedDeliveryEnvelopeSchema,
   operationAckSchema,
   operationRangeQuerySchema,
   operationRangeResponseSchema,
@@ -34,11 +35,7 @@ import {
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
 import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
-import type {
-  DeliveryRuntimeEventHandlers,
-  DeliveryRuntimeFactory,
-  DeliveryRuntimeOwner,
-} from "./delivery-runtime.js";
+import type { DeliveryRuntimeFactory, DeliveryRuntimeOwner } from "./delivery-runtime.js";
 import type { Environment } from "./env.js";
 
 function errorStatus(code: RepositoryError["code"]): number {
@@ -125,6 +122,7 @@ export interface AppContext {
 
 interface AuthenticatedSocketData {
   principal: AuthenticatedPrincipal;
+  revokedBoards: Set<string>;
 }
 
 type AppIo = Server<
@@ -203,7 +201,6 @@ export type ApplicationDeliveryMode =
   | {
       mode: "distributed";
       createRuntime: DeliveryRuntimeFactory;
-      membershipRevoked: DeliveryRuntimeEventHandlers["membershipRevoked"];
     };
 
 export interface BuildAppOptions {
@@ -358,6 +355,7 @@ export async function buildApp(
     );
     await Promise.all(
       targets.map(async (target) => {
+        target.data.revokedBoards.add(boardId);
         target.emit("board:access-revoked", event);
         await target.leave(room);
       }),
@@ -383,7 +381,7 @@ export async function buildApp(
         } catch (error) {
           app.log.warn({ error, boardId: params.boardId }, "membership delivery hook failed");
         }
-        await evictBoardMember(params.boardId, params.userId);
+        if (deliveryMode.mode === "local") await evictBoardMember(params.boardId, params.userId);
         return removed;
       });
       return reply.send(
@@ -408,6 +406,7 @@ export async function buildApp(
         if (!principal)
           throw new AuthenticationError("AUTHENTICATION_REQUIRED", "Authentication required");
         socket.data.principal = principal;
+        socket.data.revokedBoards = new Set();
         next();
       } catch (error) {
         if (error instanceof AuthenticationError) next(socketAuthenticationError(error));
@@ -427,6 +426,8 @@ export async function buildApp(
       try {
         const request = joinBoardRequestSchema.parse(raw);
         await deliveryCoordinator.run(request.boardId, async () => {
+          if (socket.data.revokedBoards.has(request.boardId))
+            throw new RepositoryError("FORBIDDEN", "Board access was revoked");
           if (!(await repository.roleFor(request.boardId, user.id)))
             throw new RepositoryError("FORBIDDEN", "Board membership required");
           await socket.join(boardRoom(request.boardId));
@@ -500,6 +501,8 @@ export async function buildApp(
         }
         const command = durableCommandSchema.parse(raw);
         const committed = await deliveryCoordinator.run(command.boardId, async () => {
+          if (socket.data.revokedBoards.has(command.boardId))
+            throw new RepositoryError("FORBIDDEN", "Board access was revoked");
           const result = await repository.commitOperation(user.id, command);
           try {
             await options.deliveryHooks?.afterOperationCommit?.({
@@ -516,11 +519,12 @@ export async function buildApp(
             );
           return result;
         });
-        acknowledgeWithoutThrow(
-          acknowledge,
-          { ok: true, duplicate: committed.duplicate, operation: committed.operation },
-          reportDeliveryFailure,
-        );
+        if (!socket.data.revokedBoards.has(command.boardId))
+          acknowledgeWithoutThrow(
+            acknowledge,
+            { ok: true, duplicate: committed.duplicate, operation: committed.operation },
+            reportDeliveryFailure,
+          );
       } catch (error) {
         app.log.warn({ error, userId: user.id }, "operation rejected");
         acknowledgeWithoutThrow(acknowledge, failedAck(error), reportDeliveryFailure);
@@ -560,12 +564,9 @@ export async function buildApp(
   });
 
   if (deliveryMode.mode === "distributed") {
-    if (
-      typeof deliveryMode.createRuntime !== "function" ||
-      typeof deliveryMode.membershipRevoked !== "function"
-    ) {
+    if (typeof deliveryMode.createRuntime !== "function") {
       await app.close();
-      throw new TypeError("Distributed delivery mode requires a runtime and every event handler");
+      throw new TypeError("Distributed delivery mode requires a runtime factory");
     }
     try {
       deliveryRuntime = deliveryMode.createRuntime({
@@ -584,7 +585,8 @@ export async function buildApp(
           if (!acceptsDistributedDeliveries) return Promise.resolve();
           return deliveryCoordinator.run(envelope.boardId, () => {
             if (!acceptsDistributedDeliveries) return Promise.resolve();
-            return deliveryMode.membershipRevoked(envelope);
+            const revocation = membershipRevokedDeliveryEnvelopeSchema.parse(envelope);
+            return evictBoardMember(revocation.boardId, revocation.payload.revokedUserId);
           });
         },
       });

@@ -39,15 +39,20 @@ import {
 } from "@converge/database";
 import type { StructuredLogger } from "@converge/observability";
 import {
+  boardAccessRevokedEventSchema,
   boardSnapshotSchema,
   committedOperationSchema,
   deliveryEnvelopeSchema,
   encodeDeliveryStreamFields,
   operationRangeResponseSchema,
+  removeBoardMemberResponseSchema,
+  type BoardAccessRevokedEvent,
   type BoardSnapshot,
   type CommittedOperation,
+  type DeliveryEnvelope,
   type DurableCommand,
   type JoinBoardAck,
+  type MembershipRevokedDeliveryEnvelope,
   type OperationAck,
   type OperationCommittedDeliveryEnvelope,
 } from "@converge/protocol";
@@ -77,12 +82,18 @@ const deadlineMs = 10_000;
 const identities = {
   owner: { id: "00000000-0000-4000-8000-000000000091", displayName: "M24B Owner" },
   editor: { id: "00000000-0000-4000-8000-000000000092", displayName: "M24B Editor" },
+  viewer: { id: "00000000-0000-4000-8000-000000000093", displayName: "M25 Viewer" },
 } as const;
-const tokens = { owner: "m24b-owner-token", editor: "m24b-editor-token" } as const;
+const tokens = {
+  owner: "m24b-owner-token",
+  editor: "m24b-editor-token",
+  viewer: "m25-viewer-token",
+} as const;
 const auth = new TestAuthAdapter(
   new Map<string, AuthenticatedPrincipal>([
     [tokens.owner, identities.owner],
     [tokens.editor, identities.editor],
+    [tokens.viewer, identities.viewer],
   ]),
 );
 const logger: StructuredLogger = {
@@ -244,8 +255,11 @@ type TestSocket = ReturnType<typeof createTestSocket>;
 
 class ClientProbe {
   readonly operations = new Journal<CommittedOperation>();
+  readonly revocations = new Journal<BoardAccessRevokedEvent>();
+  readonly timeline: string[] = [];
   readonly localProbes = new Journal<string>();
   readonly rawOperationCounts = new Map<string, number>();
+  readonly rawRevocationCounts = new Map<string, number>();
   state: BoardState;
 
   constructor(
@@ -261,6 +275,16 @@ class ClientProbe {
       );
       if (operation.seq > this.state.lastSeq) this.state = applyCommitted(this.state, operation);
       this.operations.push(operation);
+      this.timeline.push(`operation:${operation.opId}`);
+    });
+    socket.on("board:access-revoked", (value) => {
+      const event = boardAccessRevokedEventSchema.parse(value);
+      this.rawRevocationCounts.set(
+        event.boardId,
+        (this.rawRevocationCounts.get(event.boardId) ?? 0) + 1,
+      );
+      this.revocations.push(event);
+      this.timeline.push(`revoked:${event.boardId}`);
     });
     socket.onAny((event: string, value: unknown) => {
       if (event === "m24b:local-probe" && typeof value === "string") this.localProbes.push(value);
@@ -283,6 +307,15 @@ interface OperationEvidence {
   payload: OperationCommittedDeliveryEnvelope;
 }
 
+interface RevocationEvidence {
+  eventId: string;
+  boardId: string;
+  deliverySeq: number;
+  status: string;
+  redisEntryId: string | null;
+  payload: MembershipRevokedDeliveryEnvelope;
+}
+
 function requireAssertionPool(): DatabasePool {
   if (!assertionPool) throw new Error("The isolated PostgreSQL pool is unavailable");
   return assertionPool;
@@ -298,8 +331,8 @@ function requireDatabaseUrl(): string {
   return isolatedDatabaseUrl;
 }
 
-function uniqueStreamKey(): string {
-  const key = `converge:test:m24b:${crypto.randomUUID()}`;
+function uniqueStreamKey(namespace: "m24b" | "m25"): string {
+  const key = `converge:test:${namespace}:${crypto.randomUUID()}`;
   ownedStreamKeys.add(key);
   return key;
 }
@@ -311,6 +344,13 @@ function emitLocalProbe(api: ApiInstance, boardId: string, probe: string): void 
     };
   };
   io.local.to(`board:${boardId}`).emit("m24b:local-probe", probe);
+}
+
+function roomHas(api: ApiInstance, boardId: string, client: ClientProbe): boolean {
+  return (
+    api.context.io.sockets.adapter.rooms.get(`board:${boardId}`)?.has(client.socket.id ?? "") ??
+    false
+  );
 }
 
 function environment(): Environment {
@@ -403,8 +443,6 @@ async function createApiInstance(label: string, streamKey: string): Promise<ApiI
       deliveryMode: {
         mode: "distributed",
         createRuntime,
-        membershipRevoked: () =>
-          Promise.reject(new Error("Distributed revocation is outside M2.4B Slice 2")),
       },
     });
     await withDeadline(
@@ -443,26 +481,28 @@ async function createApiInstance(label: string, streamKey: string): Promise<ApiI
 }
 
 class TestTopology {
-  readonly streamKey = uniqueStreamKey();
+  readonly streamKey: string;
   readonly repository = new BoardRepository(requireAssertionPool());
   readonly sockets = new Set<TestSocket>();
   readonly apis = new Set<ApiInstance>();
   readonly workerPool = createPool(requireDatabaseUrl());
   readonly workerRepository = new OutboxRepository(this.workerPool);
-  readonly workerStream = new RedisDeliveryStream(
-    redisUrl,
-    this.streamKey,
-    100_000,
-    24 * 60 * 60 * 1000,
-    logger,
-  );
+  readonly workerStream: RedisDeliveryStream;
   readonly worker: OutboxWorker;
   readonly workerLifecycle: WorkerProcessLifecycle;
   apiA!: ApiInstance;
   apiB!: ApiInstance;
   private closePromise: Promise<void> | undefined;
 
-  private constructor(hooks: OutboxWorkerHooks) {
+  private constructor(hooks: OutboxWorkerHooks, namespace: "m24b" | "m25") {
+    this.streamKey = uniqueStreamKey(namespace);
+    this.workerStream = new RedisDeliveryStream(
+      redisUrl,
+      this.streamKey,
+      100_000,
+      24 * 60 * 60 * 1000,
+      logger,
+    );
     this.worker = new OutboxWorker(
       this.workerRepository,
       this.workerStream,
@@ -480,8 +520,11 @@ class TestTopology {
     );
   }
 
-  static async create(hooks: OutboxWorkerHooks = {}): Promise<TestTopology> {
-    const topology = new TestTopology(hooks);
+  static async create(
+    hooks: OutboxWorkerHooks = {},
+    namespace: "m24b" | "m25" = "m24b",
+  ): Promise<TestTopology> {
+    const topology = new TestTopology(hooks, namespace);
     activeTopologies.add(topology);
     try {
       await topology.workerStream.connect();
@@ -506,7 +549,7 @@ class TestTopology {
     };
   }
 
-  async createBoard(includeEditor = true): Promise<string> {
+  async createBoard(includeEditor = true, includeViewer = false): Promise<string> {
     const snapshot = await this.repository.createBoard(
       identities.owner.id,
       `m24b-${crypto.randomUUID()}`,
@@ -515,6 +558,11 @@ class TestTopology {
       await requireAssertionPool().query(
         "INSERT INTO board_members(board_id, user_id, role) VALUES ($1, $2, 'editor')",
         [snapshot.id, identities.editor.id],
+      );
+    if (includeViewer)
+      await requireAssertionPool().query(
+        "INSERT INTO board_members(board_id, user_id, role) VALUES ($1, $2, 'viewer')",
+        [snapshot.id, identities.viewer.id],
       );
     return snapshot.id;
   }
@@ -567,6 +615,16 @@ class TestTopology {
     );
   }
 
+  async removeMember(api: ApiInstance, boardId: string, userId: string) {
+    const response = await api.context.app.inject({
+      method: "DELETE",
+      url: `/v1/boards/${boardId}/members/${userId}`,
+      headers: testAuthorizationHeaders(tokens.owner),
+    });
+    expect(response.statusCode).toBe(200);
+    return removeBoardMemberResponseSchema.parse(response.json());
+  }
+
   runWorkerCycle(): Promise<WorkerCycleResult> {
     return withDeadline(this.worker.runCycle(), "worker publication cycle", () =>
       this.diagnostics(),
@@ -577,6 +635,14 @@ class TestTopology {
     return withDeadline(
       client.operations.waitFor(({ opId }) => opId === operationId),
       `client delivery ${operationId}`,
+      () => this.diagnostics(),
+    );
+  }
+
+  waitForRevocation(client: ClientProbe, boardId: string): Promise<BoardAccessRevokedEvent> {
+    return withDeadline(
+      client.revocations.waitFor((event) => event.boardId === boardId),
+      `client revocation ${boardId}`,
       () => this.diagnostics(),
     );
   }
@@ -666,10 +732,35 @@ async function operationEvidence(operationId: string): Promise<OperationEvidence
   };
 }
 
-async function appendDuplicate(
-  streamKey: string,
-  envelope: OperationCommittedDeliveryEnvelope,
-): Promise<string> {
+async function revocationEvidence(eventId: string): Promise<RevocationEvidence> {
+  const result = await requireAssertionPool().query<{
+    event_id: string;
+    board_id: string;
+    delivery_seq: string;
+    status: string;
+    redis_entry_id: string | null;
+    payload: unknown;
+  }>(
+    `SELECT id AS event_id, board_id, delivery_seq, status, redis_entry_id, payload
+     FROM outbox_events WHERE id = $1 AND event_type = 'board.membership.revoked'`,
+    [eventId],
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error(`Missing durable revocation evidence for ${eventId}`);
+  const payload = deliveryEnvelopeSchema.parse(row.payload);
+  if (payload.eventType !== "board.membership.revoked")
+    throw new Error(`Unexpected delivery event type for ${eventId}`);
+  return {
+    eventId: row.event_id,
+    boardId: row.board_id,
+    deliverySeq: Number(row.delivery_seq),
+    status: row.status,
+    redisEntryId: row.redis_entry_id,
+    payload,
+  };
+}
+
+async function appendDuplicate(streamKey: string, envelope: DeliveryEnvelope): Promise<string> {
   const fields = encodeDeliveryStreamFields(envelope);
   const result = await requireRedis().sendCommand([
     "XADD",
@@ -1226,6 +1317,230 @@ describe.sequential("M2.4B real multi-instance Redis fan-out", () => {
       } finally {
         broadcast.mockRestore();
       }
+    });
+  });
+});
+
+describe.sequential("M2.5 distributed membership revocation across API replicas", () => {
+  it("revokes matching local sockets on both APIs in board order and suppresses duplicates", async () => {
+    await withUnhandledRejectionAudit(async () => {
+      const revocationPaused = deferred<void>();
+      const releaseRevocation = deferred<void>();
+      const pauseTarget: { eventId: string | undefined } = { eventId: undefined };
+      const topology = await TestTopology.create(
+        {
+          beforeXadd: async (claim) => {
+            if (claim.eventId !== pauseTarget.eventId) return;
+            revocationPaused.resolve();
+            await releaseRevocation.promise;
+          },
+        },
+        "m25",
+      );
+      const boardA = await topology.createBoard(true, true);
+      const boardB = await topology.createBoard();
+      const { client: owner } = await topology.connect(topology.apiA, tokens.owner, boardA);
+      const { client: editorA } = await topology.connect(topology.apiA, tokens.editor, boardA);
+      const { client: editorB } = await topology.connect(topology.apiB, tokens.editor, boardA);
+      const { client: viewer } = await topology.connect(topology.apiB, tokens.viewer, boardA);
+      const { client: editorOtherBoard } = await topology.connect(
+        topology.apiA,
+        tokens.editor,
+        boardB,
+      );
+
+      const beforeRevocation = createRectangleCommand(boardA);
+      await topology.submit(owner, beforeRevocation);
+      await topology.runWorkerCycle();
+      await Promise.all([
+        topology.waitForClientOperation(editorA, beforeRevocation.opId),
+        topology.waitForClientOperation(editorB, beforeRevocation.opId),
+        topology.waitForClientOperation(viewer, beforeRevocation.opId),
+      ]);
+
+      const removal = await topology.removeMember(topology.apiA, boardA, identities.editor.id);
+      expect(removal).toMatchObject({ removed: true, boardId: boardA });
+      if (!removal.eventId) throw new Error("Expected a committed revocation event ID");
+      const pendingRevocation = await revocationEvidence(removal.eventId);
+      pauseTarget.eventId = removal.eventId;
+      expect(pendingRevocation).toMatchObject({ status: "pending", deliverySeq: 2 });
+      expect(roomHas(topology.apiA, boardA, editorA)).toBe(true);
+      expect(roomHas(topology.apiB, boardA, editorB)).toBe(true);
+      expect(editorA.revocations.entries).toEqual([]);
+      expect(editorB.revocations.entries).toEqual([]);
+
+      const { joined: postCommitJoin } = await topology.connect(
+        topology.apiB,
+        tokens.editor,
+        boardA,
+      );
+      expect(postCommitJoin).toMatchObject({ ok: false, code: "FORBIDDEN" });
+
+      const afterRevocation = createRectangleCommand(boardA);
+      await topology.submit(owner, afterRevocation);
+      const pendingOperation = await operationEvidence(afterRevocation.opId);
+      expect(pendingOperation).toMatchObject({ status: "pending", deliverySeq: 3 });
+      const otherBoardOperation = createRectangleCommand(boardB);
+      await topology.submit(editorOtherBoard, otherBoardOperation);
+
+      const publicationCycle = topology.runWorkerCycle();
+      await withDeadline(revocationPaused.promise, "paused revocation XADD", () =>
+        topology.diagnostics(),
+      );
+      await topology.waitForClientOperation(editorOtherBoard, otherBoardOperation.opId);
+      expect(roomHas(topology.apiA, boardA, editorA)).toBe(true);
+      expect(roomHas(topology.apiB, boardA, editorB)).toBe(true);
+      releaseRevocation.resolve();
+      const publicationResult = await publicationCycle;
+      expect(publicationResult.claimed).toBe(2);
+      expect(publicationResult.outcomes).toEqual(["published", "published"]);
+      const publishedRevocation = await revocationEvidence(removal.eventId);
+      if (!publishedRevocation.redisEntryId)
+        throw new Error("Expected a published revocation Redis entry ID");
+      const [revokedA, revokedB, handledA, handledB] = await Promise.all([
+        topology.waitForRevocation(editorA, boardA),
+        topology.waitForRevocation(editorB, boardA),
+        topology.waitForHandled(topology.apiA, removal.eventId),
+        topology.waitForHandled(topology.apiB, removal.eventId),
+      ]);
+      expect(revokedA).toEqual(revokedB);
+      expect(revokedA).toEqual({
+        schemaVersion: 1,
+        boardId: boardA,
+        code: "ACCESS_REVOKED",
+        message: "Board access was revoked",
+      });
+      expect(handledA.redisEntryId).toBe(publishedRevocation.redisEntryId);
+      expect(handledB.redisEntryId).toBe(publishedRevocation.redisEntryId);
+      expect(roomHas(topology.apiA, boardA, editorA)).toBe(false);
+      expect(roomHas(topology.apiB, boardA, editorB)).toBe(false);
+      expect(roomHas(topology.apiB, boardA, viewer)).toBe(true);
+      expect(roomHas(topology.apiA, boardB, editorOtherBoard)).toBe(true);
+      expect(editorA.timeline).toEqual([`operation:${beforeRevocation.opId}`, `revoked:${boardA}`]);
+      expect(editorB.timeline).toEqual(editorA.timeline);
+
+      const duplicateId = await appendDuplicate(topology.streamKey, publishedRevocation.payload);
+      await Promise.all([
+        topology.waitForReadEvidence(topology.apiA, duplicateId),
+        topology.waitForReadEvidence(topology.apiB, duplicateId),
+        topology.waitForCursor(topology.apiA, duplicateId),
+        topology.waitForCursor(topology.apiB, duplicateId),
+      ]);
+      expect(editorA.rawRevocationCounts.get(boardA)).toBe(1);
+      expect(editorB.rawRevocationCounts.get(boardA)).toBe(1);
+      expect(viewer.rawRevocationCounts.get(boardA)).toBeUndefined();
+
+      await expect(topology.runWorkerCycle()).resolves.toMatchObject({
+        claimed: 1,
+        outcomes: ["published"],
+      });
+      await Promise.all([
+        topology.waitForClientOperation(viewer, afterRevocation.opId),
+        topology.waitForHandled(topology.apiA, pendingOperation.eventId),
+        topology.waitForHandled(topology.apiB, pendingOperation.eventId),
+      ]);
+      expect(editorA.rawOperationCounts.get(afterRevocation.opId)).toBeUndefined();
+      expect(editorB.rawOperationCounts.get(afterRevocation.opId)).toBeUndefined();
+
+      const unrelatedHttp = await topology.apiA.context.app.inject({
+        method: "GET",
+        url: `/v1/boards/${boardB}`,
+        headers: testAuthorizationHeaders(tokens.editor),
+      });
+      expect(unrelatedHttp.statusCode).toBe(200);
+
+      const replay = await topology.removeMember(topology.apiB, boardA, identities.editor.id);
+      expect(replay).toMatchObject({ removed: false, eventId: null });
+      await expect(topology.runWorkerCycle()).resolves.toMatchObject({ claimed: 0, outcomes: [] });
+      const revocationCount = await requireAssertionPool().query<{ count: string }>(
+        `SELECT count(*) FROM outbox_events
+         WHERE board_id = $1 AND event_type = 'board.membership.revoked'`,
+        [boardA],
+      );
+      expect(revocationCount.rows[0]?.count).toBe("1");
+      expect(await consumerGroups(topology.streamKey)).toEqual([]);
+    });
+  });
+
+  it("lets API B enforce revocation while API A's consumer is stopped", async () => {
+    await withUnhandledRejectionAudit(async () => {
+      const topology = await TestTopology.create({}, "m25");
+      const boardId = await topology.createBoard();
+      const { client: editorA } = await topology.connect(topology.apiA, tokens.editor, boardId);
+      const { client: editorB } = await topology.connect(topology.apiB, tokens.editor, boardId);
+      const stoppedCursor = topology.apiA.evidence.consumer?.lastHandledCursor;
+      await topology.apiA.evidence.runtime?.stop();
+
+      const removal = await topology.removeMember(topology.apiB, boardId, identities.editor.id);
+      if (!removal.eventId) throw new Error("Expected a committed revocation event ID");
+      await topology.runWorkerCycle();
+      const published = await revocationEvidence(removal.eventId);
+      if (!published.redisEntryId) throw new Error("Expected a revocation Redis entry ID");
+      await Promise.all([
+        topology.waitForRevocation(editorB, boardId),
+        topology.waitForHandled(topology.apiB, removal.eventId),
+      ]);
+
+      expect(roomHas(topology.apiB, boardId, editorB)).toBe(false);
+      expect(roomHas(topology.apiA, boardId, editorA)).toBe(true);
+      expect(editorA.revocations.entries).toEqual([]);
+      expect(topology.apiA.evidence.consumer?.lastHandledCursor).toBe(stoppedCursor);
+      expect(topology.apiB.evidence.consumer?.lastHandledCursor).toBe(published.redisEntryId);
+      expect(published.status).toBe("published");
+    });
+  });
+
+  it("publishes nothing for rolled-back and no-op removals", async () => {
+    await withUnhandledRejectionAudit(async () => {
+      const topology = await TestTopology.create({}, "m25");
+      const rollbackBoard = await topology.createBoard();
+      const otherBoard = await topology.createBoard();
+      const absentBoard = await topology.createBoard(false);
+      const { client: rollbackEditor } = await topology.connect(
+        topology.apiA,
+        tokens.editor,
+        rollbackBoard,
+      );
+      const { client: otherBoardEditor } = await topology.connect(
+        topology.apiB,
+        tokens.editor,
+        otherBoard,
+      );
+      const rollbackRepository = new BoardRepository(requireAssertionPool(), {
+        afterMembershipDelete: () => Promise.reject(new Error("forced revocation rollback")),
+      });
+
+      await expect(
+        rollbackRepository.removeBoardMember(
+          identities.owner.id,
+          rollbackBoard,
+          identities.editor.id,
+        ),
+      ).rejects.toThrow("forced revocation rollback");
+      const noOp = await topology.removeMember(topology.apiA, absentBoard, identities.editor.id);
+      expect(noOp).toMatchObject({ removed: false, eventId: null });
+      await expect(topology.runWorkerCycle()).resolves.toMatchObject({ claimed: 0, outcomes: [] });
+
+      const evidence = await requireAssertionPool().query<{
+        membership_exists: boolean;
+        revocation_count: string;
+      }>(
+        `SELECT
+           EXISTS(
+             SELECT 1 FROM board_members WHERE board_id = $1 AND user_id = $3
+           ) membership_exists,
+           (
+             SELECT count(*) FROM outbox_events
+             WHERE board_id = ANY($2::uuid[]) AND event_type = 'board.membership.revoked'
+           ) revocation_count`,
+        [rollbackBoard, [rollbackBoard, absentBoard], identities.editor.id],
+      );
+      expect(evidence.rows[0]).toEqual({ membership_exists: true, revocation_count: "0" });
+      expect(roomHas(topology.apiA, rollbackBoard, rollbackEditor)).toBe(true);
+      expect(roomHas(topology.apiB, otherBoard, otherBoardEditor)).toBe(true);
+      expect(rollbackEditor.revocations.entries).toEqual([]);
+      expect(otherBoardEditor.revocations.entries).toEqual([]);
+      expect(await consumerGroups(topology.streamKey)).toEqual([]);
     });
   });
 });

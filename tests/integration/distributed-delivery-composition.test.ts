@@ -9,11 +9,14 @@ import type {
 import type { Environment } from "@converge/api/env";
 import { BoardRepository, createPool } from "@converge/database";
 import {
+  boardAccessRevokedEventSchema,
   committedOperationSchema,
   deliveryEnvelopeSchema,
+  type BoardAccessRevokedEvent,
   type CommittedOperation,
   type DurableCommand,
   type JoinBoardAck,
+  type MembershipRevokedDeliveryEnvelope,
   type OperationAck,
 } from "@converge/protocol";
 import { createRectangleCommand, createTestSocket, TestAuthAdapter } from "@converge/testkit";
@@ -64,7 +67,6 @@ beforeAll(async () => {
     deliveryMode: {
       mode: "distributed",
       createRuntime,
-      membershipRevoked: vi.fn(() => Promise.resolve()),
     },
   });
   await context.app.listen({ host: "127.0.0.1", port: 0 });
@@ -113,6 +115,18 @@ function nextOperation(socket: TestSocket): Promise<CommittedOperation> {
   return new Promise((resolve) => socket.once("operation:committed", resolve));
 }
 
+function nextRevocation(socket: TestSocket): Promise<BoardAccessRevokedEvent> {
+  return new Promise((resolve) =>
+    socket.once("board:access-revoked", (event) =>
+      resolve(boardAccessRevokedEventSchema.parse(event)),
+    ),
+  );
+}
+
+function roomHas(boardId: string, socket: TestSocket): boolean {
+  return context.io.sockets.adapter.rooms.get(`board:${boardId}`)?.has(socket.id ?? "") ?? false;
+}
+
 async function operationOutbox(boardId: string) {
   return pool.query<{ payload: unknown }>(
     `SELECT payload FROM outbox_events
@@ -128,6 +142,86 @@ function handlers(): DeliveryRuntimeEventHandlers {
 }
 
 describe("distributed delivery composition", () => {
+  it("enforces a consumed membership revocation against matching local sockets", async () => {
+    const boardId = await createBoard();
+    const otherBoardId = await createBoard();
+    await pool.query(
+      `INSERT INTO board_members(board_id, user_id, role)
+       VALUES ($1, $3, 'editor'), ($2, $3, 'editor')`,
+      [boardId, otherBoardId, identities.editor.id],
+    );
+    const editor = await connect(tokens.editor);
+    await Promise.all([
+      expect(join(editor, boardId)).resolves.toMatchObject({ ok: true }),
+      expect(join(editor, otherBoardId)).resolves.toMatchObject({ ok: true }),
+    ]);
+    const removal = await repository.removeBoardMember(
+      identities.owner.id,
+      boardId,
+      identities.editor.id,
+    );
+    if (!removal.event) throw new Error("Expected a committed revocation envelope");
+
+    const revoked = nextRevocation(editor);
+    await handlers().membershipRevoked(removal.event);
+
+    await expect(revoked).resolves.toEqual({
+      schemaVersion: 1,
+      boardId,
+      code: "ACCESS_REVOKED",
+      message: "Board access was revoked",
+    });
+    expect(roomHas(boardId, editor)).toBe(false);
+    expect(roomHas(otherBoardId, editor)).toBe(true);
+    await pool.query(
+      "INSERT INTO board_members(board_id, user_id, role) VALUES ($1, $2, 'editor')",
+      [boardId, identities.editor.id],
+    );
+    await expect(join(editor, boardId)).resolves.toMatchObject({
+      ok: false,
+      code: "FORBIDDEN",
+    });
+    await expect(submit(editor, createRectangleCommand(boardId))).resolves.toMatchObject({
+      ok: false,
+      code: "FORBIDDEN",
+    });
+    expect(roomHas(boardId, editor)).toBe(false);
+    await expect(submit(editor, createRectangleCommand(otherBoardId))).resolves.toMatchObject({
+      ok: true,
+    });
+    const unrelatedHttp = await context.app.inject({
+      method: "GET",
+      url: `/v1/boards/${otherBoardId}`,
+      headers: { authorization: `Bearer ${tokens.editor}` },
+    });
+    expect(unrelatedHttp.statusCode).toBe(200);
+  });
+
+  it("rejects malformed revocation input without inferring a target", async () => {
+    const boardId = await createBoard();
+    await pool.query(
+      "INSERT INTO board_members(board_id, user_id, role) VALUES ($1, $2, 'editor')",
+      [boardId, identities.editor.id],
+    );
+    const editor = await connect(tokens.editor);
+    await expect(join(editor, boardId)).resolves.toMatchObject({ ok: true });
+    const malformed = {
+      schemaVersion: 1,
+      eventId: crypto.randomUUID(),
+      boardId,
+      deliverySeq: 1,
+      eventType: "board.membership.revoked",
+      occurredAt: new Date().toISOString(),
+      payload: {
+        revokedUserId: "not-a-principal-id",
+        initiatedByUserId: identities.owner.id,
+      },
+    } as unknown as MembershipRevokedDeliveryEnvelope;
+
+    await expect(handlers().membershipRevoked(malformed)).rejects.toThrow();
+    expect(roomHas(boardId, editor)).toBe(true);
+  });
+
   it("acknowledges the PostgreSQL commit, suppresses the local shortcut, and emits only consumed envelopes", async () => {
     const boardId = await createBoard();
     const otherBoardId = await createBoard();

@@ -532,8 +532,9 @@ canonical hash without a trigger mutation. Redis is therefore the live fan-out t
 PostgreSQL remains the durable recovery source.
 
 This is test-only activation. Production `server.ts` continues to construct the local delivery mode,
-and local mode remains the production default. Distributed membership revocation, readiness
-enforcement, and the PostgreSQL watchdog remain M2.5 gates before production activation.
+and local mode remains the production default. M2.5 Slice 1 adds distributed membership-revocation
+enforcement to this test-only composition; readiness enforcement and the PostgreSQL watchdog remain
+later gates before production activation.
 
 Socket.IO connection-state recovery is deliberately unnecessary for correctness and remains disabled
 for M2. It could later supplement transport recovery, but it cannot replace Converge authentication,
@@ -569,6 +570,29 @@ the API emits no later operation and disconnects the entire local board room bef
 the no-post-revocation-information-leakage boundary. Direct administrative SQL remains outside the
 application event contract; if supported operationally, it must also insert a correctly ordered
 revocation event in the same transaction or trigger global session invalidation.
+
+### M2.5 Slice 1 distributed-revocation evidence
+
+Distributed application composition now injects the existing M1 local revocation behavior directly
+into the required runtime handler. A strictly validated consumed envelope selects only local sockets
+whose authenticated principal matches `revokedUserId` and whose rooms contain the exact revoked board.
+Each target receives the existing content-free `board:access-revoked` event, is removed from that room,
+and records a per-connection board fence that rejects later joins and submissions without a new
+authenticated socket. Other principals, other rooms on the same socket, other API processes, and
+unrelated HTTP authorization remain unchanged.
+
+The distributed HTTP removal path performs no immediate local eviction. PostgreSQL commits membership
+deletion and one ordered outbox row first; a post-commit/pre-publication join is therefore rejected by
+database authorization, while already-associated sockets remain until their own API consumes the
+worker publication. The real two-API `converge:test:m25:*` topology proves both replicas enforce one
+revocation independently, an unrelated board publishes while revocation publication is gated, an
+operation before revocation arrives first, and the later same-board operation cannot overtake it.
+Duplicate Redis evidence advances both transport cursors without a second socket effect. Rollback,
+no-op removal, and exact removal replay create no new revocation publication.
+
+This slice does not activate distributed mode in production and does not add global delivery
+readiness, Redis-loss socket gating, or the PostgreSQL board-head watchdog. Those remain M2.5 Slice 2
+or later work.
 
 ### Worker crash boundaries
 

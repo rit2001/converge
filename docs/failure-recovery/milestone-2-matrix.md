@@ -81,7 +81,17 @@ include bounded cursor, lifecycle, stream-ID, and board diagnostics. The evidenc
 database acknowledgement precedes optional Redis publication, duplicate transport entries advance
 each consumer cursor but apply one stable operation, other boards/APIs continue independently, and a
 fresh offline instance recovers missed durable state from the PostgreSQL join-watermark/range path.
-Membership-revocation, readiness, and watchdog portions remain intentionally untested until M2.5.
+At M2.4B completion, membership-revocation, readiness, and watchdog portions remained intentionally
+untested pending M2.5.
+
+M2.5 Slice 1 now covers the operation-ordered revocation portion of F12 and F13 in the real two-API
+topology. One committed removal is independently consumed by both replicas and evicts only matching
+local principal/board sockets. A deterministic worker barrier proves an unrelated board progresses
+while revocation publication is unresolved, and a later same-board operation remains behind the
+revocation head. Duplicate strict `XADD` evidence is harmless; a stopped API-A consumer cannot prevent
+API B enforcement; rollback, no-op removal, and exact removal replay produce no additional revocation
+event. The readiness, Redis-loss, watchdog, and whole-room gap-disconnect portions of F09 and F13-F31
+remain intentionally deferred.
 
 ## Acceptance rules
 
