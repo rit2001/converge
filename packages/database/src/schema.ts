@@ -94,6 +94,42 @@ export const boardOperations = pgTable(
   ],
 );
 
+export const boardSnapshots = pgTable(
+  "board_snapshots",
+  {
+    id: uuid("id").primaryKey(),
+    boardId: uuid("board_id")
+      .notNull()
+      .references(() => boards.id, { onDelete: "cascade" }),
+    snapshotSeq: bigint("snapshot_seq", { mode: "number" }).notNull(),
+    snapshotDeliverySeq: bigint("snapshot_delivery_seq", { mode: "number" }).notNull(),
+    schemaVersion: integer("schema_version").notNull(),
+    projection: jsonb("projection").notNull(),
+    canonicalHash: text("canonical_hash").notNull(),
+    objectCount: integer("object_count").notNull(),
+    byteSize: integer("byte_size").notNull(),
+    status: text("status").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("board_snapshots_board_seq_uq").on(table.boardId, table.snapshotSeq),
+    index("board_snapshots_latest_verified_idx").on(table.boardId, table.status, table.snapshotSeq),
+    check("board_snapshots_snapshot_seq_check", sql`${table.snapshotSeq} >= 0`),
+    check(
+      "board_snapshots_delivery_seq_check",
+      sql`${table.snapshotDeliverySeq} >= ${table.snapshotSeq}`,
+    ),
+    check("board_snapshots_schema_version_check", sql`${table.schemaVersion} > 0`),
+    check("board_snapshots_object_count_check", sql`${table.objectCount} >= 0`),
+    check("board_snapshots_byte_size_check", sql`${table.byteSize} BETWEEN 1 AND 16777216`),
+    check(
+      "board_snapshots_status_check",
+      sql`${table.status} IN ('creating', 'verified', 'invalid')`,
+    ),
+  ],
+);
+
 export const outboxEvents = pgTable(
   "outbox_events",
   {
