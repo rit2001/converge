@@ -93,7 +93,6 @@ describe("HTTP error sanitization", () => {
       expect(health.statusCode).toBe(200);
       expect(health.json()).toEqual({ ok: true });
     } finally {
-      await context.io.close();
       await context.app.close();
     }
   });
@@ -118,7 +117,6 @@ describe("HTTP error sanitization", () => {
       for (const forbidden of ["FST_ERR", "RangeError", oversizedMarker, "/Users/", "node_modules"])
         expect(oversized.body).not.toContain(forbidden);
     } finally {
-      await context.io.close();
       await context.app.close();
     }
   });
@@ -159,7 +157,6 @@ describe("HTTP error sanitization", () => {
       expect(response.body).not.toContain(forged.message);
       expect(response.body).not.toContain(forged.code);
     } finally {
-      await Promise.all([rateLimitContext.io.close(), forgedContext.io.close()]);
       await Promise.all([rateLimitContext.app.close(), forgedContext.app.close()]);
     }
   });
@@ -213,7 +210,6 @@ describe("HTTP error sanitization", () => {
         expect(allLogs).not.toContain("caller-secret");
         expect(allLogs).not.toContain("sensitive-request-body");
       } finally {
-        await context.io.close();
         await context.app.close();
       }
     },
@@ -279,11 +275,6 @@ describe("HTTP error sanitization", () => {
         retryable: false,
       });
     } finally {
-      await Promise.all([
-        authenticationContext.io.close(),
-        validationContext.io.close(),
-        domainContext.io.close(),
-      ]);
       await Promise.all([
         authenticationContext.app.close(),
         validationContext.app.close(),

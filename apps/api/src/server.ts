@@ -6,10 +6,9 @@ import { parseEnvironment } from "./env.js";
 const environment = parseEnvironment(process.env);
 const pool = createPool(environment.DATABASE_URL);
 const authentication = new DevelopmentAuthAdapter(environment);
-const { app, io } = await buildApp(environment, pool, authentication);
+const { app } = await buildApp(environment, pool, authentication);
 
 const shutdown = async (): Promise<void> => {
-  await io.close();
   await app.close();
   await pool.end();
 };

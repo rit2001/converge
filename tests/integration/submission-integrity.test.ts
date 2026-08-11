@@ -53,7 +53,6 @@ beforeAll(async () => {
 
 afterAll(async () => {
   for (const socket of sockets) socket.disconnect();
-  await context.io.close();
   await context.app.close();
   await pool.end();
 });

@@ -13,6 +13,7 @@ import {
 import {
   MAX_SYNC_BATCH_SIZE,
   boardAccessRevokedEventSchema,
+  committedOperationSchema,
   createBoardRequestSchema,
   durableCommandSchema,
   httpInternalErrorResponseSchema,
@@ -33,6 +34,11 @@ import {
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
 import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
+import type {
+  DeliveryRuntimeEventHandlers,
+  DeliveryRuntimeFactory,
+  DeliveryRuntimeOwner,
+} from "./delivery-runtime.js";
 import type { Environment } from "./env.js";
 
 function errorStatus(code: RepositoryError["code"]): number {
@@ -192,11 +198,20 @@ export interface DeliveryHooks {
   afterMembershipCommit?: (context: { boardId: string; revokedUserId: string }) => Promise<void>;
 }
 
+export type ApplicationDeliveryMode =
+  | { mode: "local" }
+  | {
+      mode: "distributed";
+      createRuntime: DeliveryRuntimeFactory;
+      membershipRevoked: DeliveryRuntimeEventHandlers["membershipRevoked"];
+    };
+
 export interface BuildAppOptions {
   synchronizationBatchSize?: number;
   synchronizationHooks?: SynchronizationHooks;
   deliveryCoordinator?: BoardDeliveryCoordinator;
   deliveryHooks?: DeliveryHooks;
+  deliveryMode?: ApplicationDeliveryMode;
   repositoryHooks?: BoardRepositoryHooks;
   loggerStream?: Writable;
 }
@@ -218,6 +233,7 @@ export async function buildApp(
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   const repository = new BoardRepository(pool, options.repositoryHooks);
   const deliveryCoordinator = options.deliveryCoordinator ?? new BoardDeliveryCoordinator();
+  const deliveryMode = options.deliveryMode ?? { mode: "local" as const };
   const synchronizationBatchSize = z
     .number()
     .int()
@@ -493,10 +509,11 @@ export async function buildApp(
           } catch (error) {
             app.log.warn({ error, boardId: command.boardId }, "operation delivery hook failed");
           }
-          publishWithoutThrow(
-            () => io.to(boardRoom(command.boardId)).emit("operation:committed", result.operation),
-            reportDeliveryFailure,
-          );
+          if (deliveryMode.mode === "local")
+            publishWithoutThrow(
+              () => io.to(boardRoom(command.boardId)).emit("operation:committed", result.operation),
+              reportDeliveryFailure,
+            );
           return result;
         });
         acknowledgeWithoutThrow(
@@ -510,5 +527,71 @@ export async function buildApp(
       }
     });
   });
+
+  let deliveryRuntime: DeliveryRuntimeOwner | undefined;
+  let deliveryRuntimeStartPromise: Promise<void> | undefined;
+  let deliveryRuntimeStopPromise: Promise<void> | undefined;
+  let socketIoClosePromise: Promise<void> | undefined;
+  let acceptsDistributedDeliveries = false;
+  const stopDeliveryRuntimeOnce = (): Promise<void> => {
+    deliveryRuntimeStopPromise ??= deliveryRuntime?.stop() ?? Promise.resolve();
+    return deliveryRuntimeStopPromise;
+  };
+  const closeSocketIoOnce = (): Promise<void> => {
+    socketIoClosePromise ??= io.close();
+    return socketIoClosePromise;
+  };
+  app.addHook("onReady", async () => {
+    if (!deliveryRuntime) return;
+    acceptsDistributedDeliveries = true;
+    try {
+      deliveryRuntimeStartPromise ??= deliveryRuntime.start();
+      await deliveryRuntimeStartPromise;
+    } catch (error) {
+      acceptsDistributedDeliveries = false;
+      await stopDeliveryRuntimeOnce().catch(() => undefined);
+      throw error;
+    }
+  });
+  app.addHook("preClose", async () => {
+    acceptsDistributedDeliveries = false;
+    await stopDeliveryRuntimeOnce();
+    await closeSocketIoOnce();
+  });
+
+  if (deliveryMode.mode === "distributed") {
+    if (
+      typeof deliveryMode.createRuntime !== "function" ||
+      typeof deliveryMode.membershipRevoked !== "function"
+    ) {
+      await app.close();
+      throw new TypeError("Distributed delivery mode requires a runtime and every event handler");
+    }
+    try {
+      deliveryRuntime = deliveryMode.createRuntime({
+        operationCommitted: (envelope) => {
+          if (!acceptsDistributedDeliveries) return Promise.resolve();
+          return deliveryCoordinator.run(envelope.boardId, () => {
+            if (!acceptsDistributedDeliveries) return Promise.resolve();
+            const operation = committedOperationSchema.parse(envelope.payload.operation);
+            if (operation.boardId !== envelope.boardId)
+              throw new Error("Committed operation board does not match its delivery envelope");
+            io.local.to(boardRoom(envelope.boardId)).emit("operation:committed", operation);
+            return Promise.resolve();
+          });
+        },
+        membershipRevoked: (envelope) => {
+          if (!acceptsDistributedDeliveries) return Promise.resolve();
+          return deliveryCoordinator.run(envelope.boardId, () => {
+            if (!acceptsDistributedDeliveries) return Promise.resolve();
+            return deliveryMode.membershipRevoked(envelope);
+          });
+        },
+      });
+    } catch (error) {
+      await app.close();
+      throw error;
+    }
+  }
   return { app, io };
 }
