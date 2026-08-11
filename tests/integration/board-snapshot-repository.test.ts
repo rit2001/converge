@@ -83,7 +83,7 @@ beforeAll(async () => {
   const migrations = await pool.query<{ name: string }>(
     "SELECT name FROM converge_migrations ORDER BY name",
   );
-  expect(migrations.rows.at(-1)?.name).toBe("0007_verified_board_snapshots.sql");
+  expect(migrations.rows.map(({ name }) => name)).toContain("0007_verified_board_snapshots.sql");
 });
 
 afterEach(async () => {

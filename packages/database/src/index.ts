@@ -531,5 +531,6 @@ export class BoardRepository {
 
 export type DatabasePool = pg.Pool;
 
+export * from "./board-recovery-material-repository.js";
 export * from "./board-snapshot-repository.js";
 export * from "./outbox-repository.js";

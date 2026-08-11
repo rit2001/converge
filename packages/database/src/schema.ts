@@ -111,6 +111,8 @@ export const boardSnapshots = pgTable(
     status: text("status").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    invalidationCode: text("invalidation_code"),
+    invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
   },
   (table) => [
     uniqueIndex("board_snapshots_board_seq_uq").on(table.boardId, table.snapshotSeq),
@@ -126,6 +128,18 @@ export const boardSnapshots = pgTable(
     check(
       "board_snapshots_status_check",
       sql`${table.status} IN ('creating', 'verified', 'invalid')`,
+    ),
+    check(
+      "board_snapshots_invalidation_state_check",
+      sql`((
+        ${table.status} IN ('creating', 'verified')
+        AND ${table.invalidationCode} IS NULL
+        AND ${table.invalidatedAt} IS NULL
+      ) OR (
+        ${table.status} = 'invalid'
+        AND ${table.invalidationCode} ~ '^[A-Z][A-Z0-9_]{0,63}$'
+        AND ${table.invalidatedAt} IS NOT NULL
+      )) IS TRUE`,
     ),
   ],
 );

@@ -88,7 +88,7 @@ export interface BoardSnapshotRepositoryHooks {
   afterInsert?: (snapshotId: string) => Promise<void>;
 }
 
-interface SnapshotRow {
+export interface BoardSnapshotStorageRow {
   id: unknown;
   board_id: unknown;
   snapshot_seq: unknown;
@@ -101,6 +101,8 @@ interface SnapshotRow {
   status: unknown;
   created_at: unknown;
   verified_at: unknown;
+  invalidation_code?: unknown;
+  invalidated_at?: unknown;
 }
 
 interface ProjectionRow {
@@ -244,7 +246,10 @@ function parseDate(value: unknown): string {
   return date.toISOString();
 }
 
-function verifySnapshotRow(row: SnapshotRow, requireVerified: boolean): VerifiedBoardSnapshot {
+export function verifyStoredBoardSnapshot(
+  row: BoardSnapshotStorageRow,
+  requireVerified: boolean,
+): VerifiedBoardSnapshot {
   if (!idSchema.safeParse(row.id).success || !idSchema.safeParse(row.board_id).success)
     throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
   if (row.schema_version !== BOARD_SNAPSHOT_SCHEMA_VERSION)
@@ -372,14 +377,14 @@ export class BoardSnapshotRepository {
         ],
       );
       await this.hooks.afterInsert?.(snapshotId);
-      const reread = await client.query<SnapshotRow>(
+      const reread = await client.query<BoardSnapshotStorageRow>(
         "SELECT * FROM board_snapshots WHERE id = $1",
         [snapshotId],
       );
       const insertedRow = reread.rows[0];
       if (!insertedRow) throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
-      verifySnapshotRow(insertedRow, false);
-      const verified = await client.query<SnapshotRow>(
+      verifyStoredBoardSnapshot(insertedRow, false);
+      const verified = await client.query<BoardSnapshotStorageRow>(
         `UPDATE board_snapshots
          SET status = 'verified', verified_at = clock_timestamp()
          WHERE id = $1 AND status = 'creating'
@@ -388,7 +393,7 @@ export class BoardSnapshotRepository {
       );
       const verifiedRow = verified.rows[0];
       if (!verifiedRow) throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
-      const result = verifySnapshotRow(verifiedRow, true);
+      const result = verifyStoredBoardSnapshot(verifiedRow, true);
       await client.query("COMMIT");
       return result;
     } catch (error) {
@@ -402,7 +407,7 @@ export class BoardSnapshotRepository {
 
   async loadLatest(boardId: string): Promise<VerifiedBoardSnapshot | null> {
     if (!idSchema.safeParse(boardId).success) throw new BoardSnapshotError("SNAPSHOT_CORRUPT");
-    const result = await this.pool.query<SnapshotRow>(
+    const result = await this.pool.query<BoardSnapshotStorageRow>(
       `SELECT * FROM board_snapshots
        WHERE board_id = $1
        ORDER BY snapshot_seq DESC, created_at DESC, id DESC
@@ -410,6 +415,6 @@ export class BoardSnapshotRepository {
       [boardId],
     );
     const row = result.rows[0];
-    return row ? verifySnapshotRow(row, true) : null;
+    return row ? verifyStoredBoardSnapshot(row, true) : null;
   }
 }
