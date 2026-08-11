@@ -501,6 +501,40 @@ Each API uses `io.local.to(boardRoom).emit(...)` or a tested equivalent local-on
 iterates only its local namespace sockets for revocation. No Socket.IO Redis adapter is installed, so
 independent API consumption is the sole cross-instance fan-out and cannot be adapter-rebroadcast.
 
+### M2.4B Slice 2 multi-instance evidence
+
+The deterministic `tests/failure/multi-instance-delivery.test.ts` topology uses one temporary
+PostgreSQL database migrated through `0006`, one uniquely named `converge:test:m24b:*` Redis Stream,
+the real outbox repository and worker publisher, and two independently built API applications on
+dynamic ports. Each API owns a distinct control connection, blocking-read connection, consumer, and
+process-memory cursor. There is no Socket.IO Redis adapter, Pub/Sub channel, consumer group, shared
+consumer, shared cursor, or in-process bus between the applications.
+
+The suite proves the complete commit-to-fan-out path in both directions: PostgreSQL commits the
+operation, projection, heads, and outbox atomically; the command acknowledgement returns while the
+outbox is still pending; neither distributed-mode local room emits before publication; one worker
+cycle claims and `XADD`s the strict envelope; PostgreSQL records the returned stream ID; then each API
+independently reads that same stream ID and emits only to its matching local room. Both authorized
+clients converge on the same operation identity, actor, server timestamp, canvas/delivery sequences,
+ordered objects, and sequence-specific canonical hash.
+
+Two valid Redis IDs carrying the same stable envelope are observed by both consumers. Their global
+cursors advance across both transport entries while board/event and client operation identity suppress
+the second logical application. This is at-least-once evidence, not an exactly-once network claim.
+Rapid same-board operations remain ordered, independent boards progress while one publisher callback
+is gated, an API-local publication failure does not affect PostgreSQL or the other API, and stopping
+one consumer does not stop the worker or its peer.
+
+A fresh API process intentionally captures the current validated Redis tail rather than replaying
+entries published while it was offline. Its reconnecting client uses the existing join watermark and
+PostgreSQL operation-range catch-up to reach the authoritative sequence, ordered projection, and
+canonical hash without a trigger mutation. Redis is therefore the live fan-out transport;
+PostgreSQL remains the durable recovery source.
+
+This is test-only activation. Production `server.ts` continues to construct the local delivery mode,
+and local mode remains the production default. Distributed membership revocation, readiness
+enforcement, and the PostgreSQL watchdog remain M2.5 gates before production activation.
+
 Socket.IO connection-state recovery is deliberately unnecessary for correctness and remains disabled
 for M2. It could later supplement transport recovery, but it cannot replace Converge authentication,
 delivery-gap handling, or application snapshot-plus-tail catch-up.

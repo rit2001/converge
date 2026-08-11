@@ -11,9 +11,11 @@
   },
   "dependencies": {
     "@converge/api": "workspace:*",
+    "@converge/canvas-engine": "workspace:*",
     "@converge/database": "workspace:*",
     "@converge/observability": "workspace:*",
     "@converge/protocol": "workspace:*",
+    "@converge/testkit": "workspace:*",
     "@converge/worker": "workspace:*",
     "redis": "6.2.0"
   },

@@ -1,6 +1,6 @@
 # Project status
 
-Last reviewed: 2026-08-07
+Last reviewed: 2026-08-11
 
 ## Milestone 1 implemented invariants
 
@@ -37,8 +37,10 @@ Run the exact local commands from the root `README.md`. CI repeats them with an 
 
 ## Deferred by design
 
-- Redis multi-instance Socket.IO fan-out
-- Transactional-outbox dispatch and crash-after-commit recovery
+- Production activation of Redis multi-instance Socket.IO fan-out (the test-only two-API topology is
+  proven; M2.5 revocation/readiness gates remain)
+- Production activation of transactional-outbox dispatch (the repository, worker publisher, and
+  crash-boundary failure evidence are implemented)
 - Snapshot creation, historical recovery, and operation-log compaction
 - Historical per-sequence authoritative hashes
 - Production OAuth

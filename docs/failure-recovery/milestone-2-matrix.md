@@ -67,6 +67,22 @@ barriers so the important boundary is exact.
 | F34 | The stream's first/last entry contains oversized malformed sentinel or arbitrary fields during startup metadata inspection.           | Direct read-only `XINFO STREAM` materializes the fields under the trusted-broker boundary; strict post-decoding shape and complete-entry byte checks return only a bounded constant diagnostic, with no delivery or cursor advancement. This does not claim pre-decoding protection from an unauthorized writer or malicious broker.                                                             | Real-Redis failure         |
 | F35 | Redis credentials or the Redis server are compromised and an attacker appends an oversized live entry.                                | Treat as an infrastructure-security incident: revoke/rotate credentials, isolate the private endpoint, stop affected consumers, inspect writer/growth monitoring, and rebuild delivery availability from PostgreSQL. Application post-decoding limits are not claimed to prevent node-redis allocation.                                                                                          | Deployment/runbook         |
 
+## M2.4B Slice 2 evidence
+
+The real-Redis multi-instance failure suite now covers the operation-only portions of F01, F03/F10,
+F06, F18, F29, and F30 with one isolated PostgreSQL database, the real outbox worker, and two
+independent API consumers. Both APIs observe the same worker `XADD` through their own plain-`XREAD`
+connections and cursors, then emit through their own local Socket.IO rooms. `XINFO GROUPS` remains
+empty and no Socket.IO adapter participates.
+
+The deterministic controls pause publication, gate one board's worker callback, stop/restart one API
+runtime, inject a duplicate strict `XADD`, and fail one API-local Socket.IO handler. Explicit deadlines
+include bounded cursor, lifecycle, stream-ID, and board diagnostics. The evidence confirms that the
+database acknowledgement precedes optional Redis publication, duplicate transport entries advance
+each consumer cursor but apply one stable operation, other boards/APIs continue independently, and a
+fresh offline instance recovers missed durable state from the PostgreSQL join-watermark/range path.
+Membership-revocation, readiness, and watchdog portions remain intentionally untested until M2.5.
+
 ## Acceptance rules
 
 - Tests assert at-least-once publication and idempotent effects; they must not assert or describe
