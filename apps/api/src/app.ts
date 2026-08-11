@@ -576,48 +576,56 @@ export async function buildApp(
       try {
         requireSocketReadiness();
         const request = joinBoardRequestSchema.parse(raw);
-        const joinWatermark = await deliveryCoordinator.run(request.boardId, async () => {
-          requireSocketReadiness();
-          if (socket.data.revokedBoards.has(request.boardId))
-            throw new RepositoryError("FORBIDDEN", "Board access was revoked");
-          const role = await repository.roleFor(request.boardId, user.id);
-          requireSocketReadiness();
-          if (!role) throw new RepositoryError("FORBIDDEN", "Board membership required");
-          const alreadyTracked = socketTracksBoard(socket.id, request.boardId);
-          let deliveryBaseline: number | undefined;
-          if (
-            deliveryMode.mode === "distributed" &&
-            !alreadyTracked &&
-            !trackedBoards.has(request.boardId)
-          ) {
-            const [head] = await repository.getBoardDeliveryHeads([request.boardId]);
+        const room = boardRoom(request.boardId);
+        let newlyTracked = false;
+        let newlyJoined = false;
+        let joinWatermark: number;
+        try {
+          await deliveryCoordinator.run(request.boardId, async () => {
             requireSocketReadiness();
-            deliveryBaseline = head?.lastDeliverySeq;
-          }
-          const watermark = await repository.getBoardSequence(request.boardId, user.id);
+            if (socket.data.revokedBoards.has(request.boardId))
+              throw new RepositoryError("FORBIDDEN", "Board access was revoked");
+            const role = await repository.roleFor(request.boardId, user.id);
+            requireSocketReadiness();
+            if (!role) throw new RepositoryError("FORBIDDEN", "Board membership required");
+            const alreadyTracked = socketTracksBoard(socket.id, request.boardId);
+            let deliveryBaseline: number | undefined;
+            if (
+              deliveryMode.mode === "distributed" &&
+              !alreadyTracked &&
+              !trackedBoards.has(request.boardId)
+            ) {
+              const [head] = await repository.getBoardDeliveryHeads([request.boardId]);
+              requireSocketReadiness();
+              deliveryBaseline = head?.lastDeliverySeq;
+            }
+            newlyTracked = deliveryMode.mode === "distributed" && !alreadyTracked;
+            newlyJoined = !socket.rooms.has(room);
+            if (newlyTracked) trackBoardJoin(socket.id, request.boardId, deliveryBaseline);
+            await socket.join(room);
+          });
+          await options.synchronizationHooks?.afterRoomJoin?.({
+            boardId: request.boardId,
+            userId: user.id,
+            socketId: socket.id,
+          });
           requireSocketReadiness();
-          if (deliveryMode.mode === "distributed" && !alreadyTracked)
-            trackBoardJoin(socket.id, request.boardId, deliveryBaseline);
-          try {
-            await socket.join(boardRoom(request.boardId));
-          } catch (error) {
-            if (deliveryMode.mode === "distributed" && !alreadyTracked)
-              releaseBoardJoin(socket.id, request.boardId);
-            throw error;
-          }
-          return watermark;
-        });
-        await options.synchronizationHooks?.afterRoomJoin?.({
-          boardId: request.boardId,
-          userId: user.id,
-          socketId: socket.id,
-        });
-        requireSocketReadiness();
-        if (request.lastAppliedSeq > joinWatermark)
-          throw new RepositoryError(
-            "RESYNC_REQUIRED",
-            "Client sequence exceeds authoritative board head",
-          );
+          joinWatermark = await deliveryCoordinator.run(request.boardId, async () => {
+            requireSocketReadiness();
+            const watermark = await repository.getBoardSequence(request.boardId, user.id);
+            requireSocketReadiness();
+            if (request.lastAppliedSeq > watermark)
+              throw new RepositoryError(
+                "RESYNC_REQUIRED",
+                "Client sequence exceeds authoritative board head",
+              );
+            return watermark;
+          });
+        } catch (error) {
+          if (newlyJoined) await Promise.resolve(socket.leave(room)).catch(() => undefined);
+          if (newlyTracked) releaseBoardJoin(socket.id, request.boardId);
+          throw error;
+        }
         acknowledge(
           joinBoardAckSchema.parse({
             ok: true,

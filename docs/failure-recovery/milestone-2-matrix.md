@@ -84,14 +84,30 @@ fresh offline instance recovers missed durable state from the PostgreSQL join-wa
 At M2.4B completion, membership-revocation, readiness, and watchdog portions remained intentionally
 untested pending M2.5.
 
-M2.5 Slice 1 now covers the operation-ordered revocation portion of F12 and F13 in the real two-API
+M2.5 Slice 1 covers the operation-ordered revocation portion of F12 and F13 in the real two-API
 topology. One committed removal is independently consumed by both replicas and evicts only matching
 local principal/board sockets. A deterministic worker barrier proves an unrelated board progresses
 while revocation publication is unresolved, and a later same-board operation remains behind the
 revocation head. Duplicate strict `XADD` evidence is harmless; a stopped API-A consumer cannot prevent
 API B enforcement; rollback, no-op removal, and exact removal replay produce no additional revocation
-event. The readiness, Redis-loss, watchdog, and whole-room gap-disconnect portions of F09 and F13-F31
-remain intentionally deferred.
+event.
+
+The final M2.5 acceptance topology activates both APIs with `API_DELIVERY_MODE=distributed` through
+the production server-runtime composition. It covers the activated boundaries of F09, F10, F12,
+F18, F27, F28, and F30: neither dynamic API port accepts a socket before consumer establishment;
+PostgreSQL acknowledgement precedes the worker's optional `XADD`; two independent plain-`XREAD`
+consumers and API-local rooms converge; and a deterministic 5,000 ms watchdog clock keeps sockets
+ready inside the grace period before failing both replica-local readiness gates closed at the
+deadline. After publication, consumers advance through the retained entry and new sockets recover
+the durable gap from PostgreSQL join-watermark/range reads.
+
+The Redis interruption case destroys only API A's real blocking-read connection and gates its next
+real reconnect. API A becomes unavailable and closes its sockets while API B and the worker continue;
+continuity-valid reconnect catches up the missing stream entry once and reopens only API A. This is
+not a broker restart or Redis-durability claim. A committed membership removal is then independently
+enforced by both activated APIs, unrelated principal/board sockets remain authorized, and a duplicate
+strict revocation `XADD` advances both transport cursors without a second harmful transition. The
+suite retains the at-least-once model and compares recovered client hashes with PostgreSQL authority.
 
 ## Acceptance rules
 

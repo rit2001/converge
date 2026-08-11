@@ -35,12 +35,14 @@ The verification categories are:
 Run the exact local commands from the root `README.md`. CI repeats them with an explicit test
 `DATABASE_URL` and a clean PostgreSQL service.
 
-## Milestone 2 activation status
+## Milestone 2.5 delivery activation status
 
 The API server can now explicitly select `local` or `distributed` delivery through strict runtime
 configuration. Distributed selection composes the existing Redis consumer, API-local routing,
-Socket.IO readiness gate, and PostgreSQL board-head watchdog. This is an activation path only;
-deployment and final M2.5 acceptance remain deferred.
+Socket.IO readiness gate, and PostgreSQL board-head watchdog. M2.5 acceptance is complete against an
+isolated real PostgreSQL/Redis topology with two independently configured APIs, the real outbox
+worker, deterministic watchdog time, a single-connection Redis interruption, PostgreSQL catch-up,
+and distributed membership revocation. Deployment remains deferred.
 
 ## Deferred by design
 

@@ -1,9 +1,14 @@
 import { execFile } from "node:child_process";
-import type { AddressInfo } from "node:net";
+import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { buildApp, type AppContext } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
+import {
+  BoardDeliveryHeadWatchdog,
+  type BoardDeliveryHeadWatchdogLifecycleEvent,
+  type BoardDeliveryHeadWatchdogScheduler,
+} from "../../apps/api/src/board-delivery-head-watchdog.js";
 import {
   RedisDeliveryConsumer,
   defaultDeliveryConsumerConfiguration,
@@ -17,12 +22,23 @@ import {
   type DeliveryStreamMetadata,
 } from "@converge/api/delivery-consumer";
 import {
+  configuredDeliveryBuildOptions,
+  type DistributedDeliveryStackFactories,
+} from "../../apps/api/src/distributed-delivery-stack.js";
+import {
   ApiDeliveryRuntime,
+  type ApiDeliveryRuntimeOptions,
   type DeliveryRuntimeFactory,
   type DeliveryRuntimeLifecycleEvent,
+  type DeliveryRuntimeObserver,
 } from "@converge/api/delivery-runtime";
 import { parseEnvironment, type Environment } from "@converge/api/env";
 import { RedisDeliveryConsumerTransport } from "@converge/api/redis-delivery-transport";
+import {
+  createApiServer,
+  type ApiServerDependencies,
+  type ApiServerOwner,
+} from "../../apps/api/src/server-runtime.js";
 import {
   applyCommitted,
   emptyBoardState,
@@ -44,6 +60,7 @@ import {
   deliveryEnvelopeSchema,
   encodeDeliveryStreamFields,
   operationRangeResponseSchema,
+  protocolErrorSchema,
   removeBoardMemberResponseSchema,
   type BoardAccessRevokedEvent,
   type BoardSnapshot,
@@ -182,12 +199,18 @@ class AuditedRedisTransport implements DeliveryConsumerTransport {
   connectCalls = 0;
   cancelCalls = 0;
   closeCalls = 0;
+  private reconnectGate: ReturnType<typeof deferred<void>> | undefined;
 
   constructor(readonly delegate: RedisDeliveryConsumerTransport) {}
 
-  connect(): Promise<void> {
+  async connect(): Promise<void> {
     this.connectCalls += 1;
-    return this.delegate.connect();
+    if (this.connectCalls > 1 && this.reconnectGate) {
+      const gate = this.reconnectGate;
+      await gate.promise;
+      if (this.reconnectGate === gate) this.reconnectGate = undefined;
+    }
+    await this.delegate.connect();
   }
 
   initializeStream(input: {
@@ -223,7 +246,23 @@ class AuditedRedisTransport implements DeliveryConsumerTransport {
 
   close(): Promise<void> {
     this.closeCalls += 1;
+    this.releaseReconnect();
     return this.delegate.close();
+  }
+
+  pauseReconnect(): void {
+    if (this.reconnectGate) throw new Error("Redis reconnect is already paused");
+    this.reconnectGate = deferred<void>();
+  }
+
+  releaseReconnect(): void {
+    this.reconnectGate?.resolve();
+  }
+
+  interruptReader(): void {
+    const reader = (this.delegate as unknown as { reader?: RedisClientType }).reader;
+    if (!reader?.isOpen) throw new Error("Redis blocking-read connection is unavailable");
+    reader.destroy();
   }
 
   get connectionIdentities(): { control: unknown; reader: unknown } {
@@ -237,9 +276,15 @@ interface ApiEvidence {
   handled: Journal<DeliveryContext>;
   cursorAdvances: Journal<string>;
   quarantines: Journal<BoardQuarantineEvent>;
+  watchdogLifecycle: Journal<BoardDeliveryHeadWatchdogLifecycleEvent>;
   transport: AuditedRedisTransport | undefined;
   consumer: RedisDeliveryConsumer | undefined;
   runtime: ApiDeliveryRuntime | undefined;
+  runtimeObserver: DeliveryRuntimeObserver | undefined;
+  watchdog: BoardDeliveryHeadWatchdog | undefined;
+  watchdogScheduler: ControlledWatchdogScheduler | undefined;
+  environment: Environment | undefined;
+  rejectedBeforeEstablished: boolean;
 }
 
 interface ApiInstance {
@@ -247,6 +292,7 @@ interface ApiInstance {
   context: AppContext;
   pool: DatabasePool;
   url: string;
+  server?: ApiServerOwner;
   close(): Promise<void>;
 }
 
@@ -259,6 +305,7 @@ class ClientProbe {
   readonly localProbes = new Journal<string>();
   readonly rawOperationCounts = new Map<string, number>();
   readonly rawRevocationCounts = new Map<string, number>();
+  readonly disconnects = new Journal<string>();
   state: BoardState;
 
   constructor(
@@ -288,10 +335,59 @@ class ClientProbe {
     socket.onAny((event: string, value: unknown) => {
       if (event === "m24b:local-probe" && typeof value === "string") this.localProbes.push(value);
     });
+    socket.on("disconnect", (reason) => this.disconnects.push(reason));
   }
 
   applyCatchUp(operations: readonly CommittedOperation[]): void {
     for (const operation of operations) this.state = applyCommitted(this.state, operation);
+  }
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+class ControlledWatchdogScheduler implements BoardDeliveryHeadWatchdogScheduler {
+  private currentTime = 0;
+  private nextTaskId = 1;
+  private readonly tasks = new Map<
+    number,
+    { resolve: () => void; signal: AbortSignal; abort: () => void }
+  >();
+
+  now = (): number => this.currentTime;
+  random = (): number => 0.5;
+
+  wait(_delayMs: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const taskId = this.nextTaskId++;
+      const settle = (): void => {
+        const task = this.tasks.get(taskId);
+        if (!task) return;
+        this.tasks.delete(taskId);
+        signal.removeEventListener("abort", task.abort);
+        resolve();
+      };
+      const task = { resolve: settle, signal, abort: settle };
+      this.tasks.set(taskId, task);
+      signal.addEventListener("abort", settle, { once: true });
+    });
+  }
+
+  async elapse(milliseconds: number): Promise<void> {
+    if (!Number.isSafeInteger(milliseconds) || milliseconds < 0)
+      throw new Error("Watchdog clock advance must be a non-negative safe integer");
+    this.currentTime += milliseconds;
+    await flushMicrotasks();
+  }
+
+  get pendingTasks(): number {
+    return this.tasks.size;
   }
 }
 
@@ -330,7 +426,9 @@ function requireDatabaseUrl(): string {
   return isolatedDatabaseUrl;
 }
 
-function uniqueStreamKey(namespace: "m24b" | "m25"): string {
+type TestNamespace = "m24b" | "m25" | "m25-final";
+
+function uniqueStreamKey(namespace: TestNamespace): string {
   const key = `converge:test:${namespace}:${crypto.randomUUID()}`;
   ownedStreamKeys.add(key);
   return key;
@@ -365,6 +463,82 @@ function environment(): Environment {
   });
 }
 
+function activatedEnvironment(streamKey: string, port: number): Environment {
+  return parseEnvironment({
+    NODE_ENV: "test",
+    HOST: "127.0.0.1",
+    API_PORT: String(port),
+    WEB_ORIGIN: "http://127.0.0.1:3000",
+    DATABASE_URL: requireDatabaseUrl(),
+    API_DELIVERY_MODE: "distributed",
+    REDIS_URL: redisUrl,
+    REDIS_STREAM_KEY: streamKey,
+    DELIVERY_WATCHDOG_INTERVAL_MS: "5000",
+    DELIVERY_WATCHDOG_GRACE_MS: "5000",
+    DELIVERY_WATCHDOG_QUERY_TIMEOUT_MS: "5000",
+    DELIVERY_WATCHDOG_BATCH_SIZE: "100",
+    DELIVERY_WATCHDOG_JITTER_RATIO: "0",
+    LOG_LEVEL: "silent",
+    DEV_AUTH_USER_NAME: "Unused development identity",
+  });
+}
+
+async function allocatePort(): Promise<number> {
+  const server = createNetServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address() as AddressInfo;
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return address.port;
+}
+
+async function expectSocketConnectionRejected(url: string, token: string): Promise<void> {
+  const socket = createTestSocket(url, token);
+  try {
+    const error = await withDeadline(
+      new Promise<Error>((resolve) => {
+        socket.once("connect_error", resolve);
+        socket.connect();
+      }),
+      `socket rejection at ${url}`,
+      () => ({ url, connected: socket.connected }),
+    );
+    expect(socket.connected).toBe(false);
+    const data = (error as Error & { data?: unknown }).data;
+    if (data !== undefined)
+      expect(protocolErrorSchema.parse(data)).toMatchObject({ retryable: true });
+  } finally {
+    socket.disconnect();
+  }
+}
+
+async function expectSocketReadinessRejected(api: ApiInstance, token: string): Promise<void> {
+  const socket = createTestSocket(api.url, token);
+  try {
+    const error = await withDeadline(
+      new Promise<Error>((resolve) => {
+        socket.once("connect_error", resolve);
+        socket.connect();
+      }),
+      `${api.evidence.label} readiness rejection`,
+      () => apiDiagnostics(api.evidence),
+    );
+    expect(protocolErrorSchema.parse((error as Error & { data: unknown }).data)).toEqual({
+      ok: false,
+      code: "INTERNAL_ERROR",
+      message: "Realtime delivery is temporarily unavailable",
+      retryable: true,
+    });
+    expect(socket.connected).toBe(false);
+  } finally {
+    socket.disconnect();
+  }
+}
+
 function apiDiagnostics(evidence: ApiEvidence): unknown {
   return {
     label: evidence.label,
@@ -379,6 +553,8 @@ function apiDiagnostics(evidence: ApiEvidence): unknown {
     cursor: evidence.consumer?.lastHandledCursor,
     boardCapacity: evidence.consumer?.boardStateCapacityDiagnostics,
     readCursors: evidence.transport?.readCursors.slice(-10),
+    watchdogLifecycle: evidence.watchdogLifecycle.entries.slice(-10),
+    watchdog: evidence.watchdog?.diagnostics,
   };
 }
 
@@ -390,11 +566,18 @@ async function createApiInstance(label: string, streamKey: string): Promise<ApiI
     handled: new Journal(),
     cursorAdvances: new Journal(),
     quarantines: new Journal(),
+    watchdogLifecycle: new Journal(),
     transport: undefined,
     consumer: undefined,
     runtime: undefined,
+    runtimeObserver: undefined,
+    watchdog: undefined,
+    watchdogScheduler: undefined,
+    environment: undefined,
+    rejectedBeforeEstablished: false,
   };
   const createRuntime: DeliveryRuntimeFactory = (handlers, applicationObserver) => {
+    evidence.runtimeObserver = applicationObserver;
     const runtime = new ApiDeliveryRuntime({
       createConsumer: (callbacks: DeliveryConsumerCallbacks) => {
         const transport = new AuditedRedisTransport(
@@ -482,6 +665,136 @@ async function createApiInstance(label: string, streamKey: string): Promise<ApiI
   }
 }
 
+async function createActivatedApiInstance(label: string, streamKey: string): Promise<ApiInstance> {
+  const port = await allocatePort();
+  const apiEnvironment = activatedEnvironment(streamKey, port);
+  const pool = createPool(requireDatabaseUrl());
+  const scheduler = new ControlledWatchdogScheduler();
+  const evidence: ApiEvidence = {
+    label,
+    lifecycle: new Journal(),
+    handled: new Journal(),
+    cursorAdvances: new Journal(),
+    quarantines: new Journal(),
+    watchdogLifecycle: new Journal(),
+    transport: undefined,
+    consumer: undefined,
+    runtime: undefined,
+    runtimeObserver: undefined,
+    watchdog: undefined,
+    watchdogScheduler: scheduler,
+    environment: apiEnvironment,
+    rejectedBeforeEstablished: false,
+  };
+  const factories = {
+    createTransport: (url: string, key: string) => {
+      const transport = new AuditedRedisTransport(new RedisDeliveryConsumerTransport(url, key));
+      evidence.transport = transport;
+      return transport;
+    },
+    createConsumer: (transport, callbacks, configuration) => {
+      const consumer = new RedisDeliveryConsumer(
+        transport,
+        {
+          deliver: async (context) => {
+            evidence.handled.push(context);
+            await callbacks.deliver(context);
+          },
+          quarantine: async (event) => {
+            evidence.quarantines.push(event);
+            await callbacks.quarantine(event);
+          },
+          lifecycle: (event) => callbacks.lifecycle(event),
+        },
+        configuration,
+        systemDeliveryConsumerScheduler,
+        {
+          afterCursorAdvance: (entryId) => {
+            evidence.cursorAdvances.push(entryId);
+            return Promise.resolve();
+          },
+        },
+      );
+      evidence.consumer = consumer;
+      return consumer;
+    },
+    createRuntime: (options: ApiDeliveryRuntimeOptions) => {
+      evidence.runtimeObserver = options.observer;
+      const runtime = new ApiDeliveryRuntime({
+        ...options,
+        observer: {
+          lifecycle: async (event) => {
+            evidence.lifecycle.push(event);
+            await options.observer.lifecycle(event);
+          },
+          quarantine: (event) => options.observer.quarantine(event),
+        },
+      });
+      evidence.runtime = runtime;
+      return runtime;
+    },
+    createWatchdog: (input, configuration) => {
+      const watchdog = new BoardDeliveryHeadWatchdog(
+        input.repository,
+        input.activeBoards,
+        input.deliveryProgress,
+        {
+          lifecycle: async (event) => {
+            evidence.watchdogLifecycle.push(event);
+            await input.observer.lifecycle(event);
+          },
+        },
+        configuration,
+        scheduler,
+      );
+      evidence.watchdog = watchdog;
+      return watchdog;
+    },
+  } satisfies DistributedDeliveryStackFactories;
+  let context: AppContext | undefined;
+  const dependencies: ApiServerDependencies = {
+    createDatabasePool: () => pool,
+    createAuthentication: () => auth,
+    createDeliveryOptions: (parsed) => configuredDeliveryBuildOptions(parsed, factories),
+    buildApplication: async (parsed, database, authentication, options) => {
+      context = await buildApp(parsed, database, authentication, options);
+      return context;
+    },
+  };
+  let server: ApiServerOwner | undefined;
+  try {
+    server = await createApiServer(apiEnvironment, dependencies);
+    const url = `http://127.0.0.1:${port}`;
+    await expectSocketConnectionRejected(url, tokens.owner);
+    evidence.rejectedBeforeEstablished = true;
+    await withDeadline(server.listen(), `${label} activated API startup`, () =>
+      apiDiagnostics(evidence),
+    );
+    await withDeadline(
+      evidence.lifecycle.waitFor(({ state }) => state === "established"),
+      `${label} activated consumer establishment`,
+      () => apiDiagnostics(evidence),
+    );
+    if (!context) throw new Error(`${label} activated API context was not constructed`);
+    let closePromise: Promise<void> | undefined;
+    return {
+      evidence,
+      context,
+      pool,
+      url,
+      server,
+      close: () => {
+        closePromise ??= server!.close();
+        return closePromise;
+      },
+    };
+  } catch (error) {
+    if (server) await server.close().catch(() => undefined);
+    else await pool.end().catch(() => undefined);
+    throw error;
+  }
+}
+
 class TestTopology {
   readonly streamKey: string;
   readonly repository = new BoardRepository(requireAssertionPool());
@@ -496,7 +809,7 @@ class TestTopology {
   apiB!: ApiInstance;
   private closePromise: Promise<void> | undefined;
 
-  private constructor(hooks: OutboxWorkerHooks, namespace: "m24b" | "m25") {
+  private constructor(hooks: OutboxWorkerHooks, namespace: TestNamespace) {
     this.streamKey = uniqueStreamKey(namespace);
     this.workerStream = new RedisDeliveryStream(
       redisUrl,
@@ -524,15 +837,17 @@ class TestTopology {
 
   static async create(
     hooks: OutboxWorkerHooks = {},
-    namespace: "m24b" | "m25" = "m24b",
+    namespace: TestNamespace = "m24b",
+    activated = false,
   ): Promise<TestTopology> {
     const topology = new TestTopology(hooks, namespace);
     activeTopologies.add(topology);
     try {
       await topology.workerStream.connect();
+      const createInstance = activated ? createActivatedApiInstance : createApiInstance;
       [topology.apiA, topology.apiB] = await Promise.all([
-        createApiInstance("api-a", topology.streamKey),
-        createApiInstance("api-b", topology.streamKey),
+        createInstance("api-a", topology.streamKey),
+        createInstance("api-b", topology.streamKey),
       ]);
       topology.apis.add(topology.apiA);
       topology.apis.add(topology.apiB);
@@ -541,6 +856,10 @@ class TestTopology {
       await topology.close();
       throw error;
     }
+  }
+
+  static createActivated(): Promise<TestTopology> {
+    return TestTopology.create({}, "m25-final", true);
   }
 
   diagnostics(): unknown {
@@ -673,6 +992,45 @@ class TestTopology {
       `${api.evidence.label} XREAD evidence ${redisEntryId}`,
       () => this.diagnostics(),
     );
+  }
+
+  waitForLifecycle(
+    api: ApiInstance,
+    predicate: (event: DeliveryRuntimeLifecycleEvent) => boolean,
+    label: string,
+  ): Promise<DeliveryRuntimeLifecycleEvent> {
+    return withDeadline(api.evidence.lifecycle.waitFor(predicate), label, () => this.diagnostics());
+  }
+
+  waitForWatchdog(
+    api: ApiInstance,
+    predicate: (event: BoardDeliveryHeadWatchdogLifecycleEvent) => boolean,
+    label: string,
+  ): Promise<BoardDeliveryHeadWatchdogLifecycleEvent> {
+    return withDeadline(api.evidence.watchdogLifecycle.waitFor(predicate), label, () =>
+      this.diagnostics(),
+    );
+  }
+
+  runWatchdogChecks(): Promise<void> {
+    const checks = [this.apiA, this.apiB].map((api) => {
+      const watchdog = api.evidence.watchdog;
+      if (!watchdog) throw new Error(`Missing ${api.evidence.label} watchdog`);
+      return watchdog.runCheck();
+    });
+    return withDeadline(
+      Promise.all(checks).then(() => undefined),
+      "watchdog checks",
+      () => this.diagnostics(),
+    );
+  }
+
+  async elapseWatchdogClock(milliseconds: number): Promise<void> {
+    for (const api of [this.apiA, this.apiB]) {
+      const scheduler = api.evidence.watchdogScheduler;
+      if (!scheduler) throw new Error(`Missing ${api.evidence.label} watchdog scheduler`);
+      await scheduler.elapse(milliseconds);
+    }
   }
 
   async restartApiB(): Promise<ApiInstance> {
@@ -1543,6 +1901,361 @@ describe.sequential("M2.5 distributed membership revocation across API replicas"
       expect(rollbackEditor.revocations.entries).toEqual([]);
       expect(otherBoardEditor.revocations.entries).toEqual([]);
       expect(await consumerGroups(topology.streamKey)).toEqual([]);
+    });
+  });
+});
+
+describe.sequential("M2.5 activated distributed readiness and failure recovery", () => {
+  it("fails closed and recovers across watchdog, Redis, and revocation boundaries", async () => {
+    await withUnhandledRejectionAudit(async () => {
+      const topology = await TestTopology.createActivated();
+      const apiA = topology.apiA;
+      const apiB = topology.apiB;
+      expect(apiA.evidence.environment?.API_DELIVERY_MODE).toBe("distributed");
+      expect(apiB.evidence.environment?.API_DELIVERY_MODE).toBe("distributed");
+      expect(apiA.evidence.rejectedBeforeEstablished).toBe(true);
+      expect(apiB.evidence.rejectedBeforeEstablished).toBe(true);
+      expect(apiA.evidence.lifecycle.entries).toContainEqual({ state: "established" });
+      expect(apiB.evidence.lifecycle.entries).toContainEqual({ state: "established" });
+      expect(apiA.context.io.of("/").adapter.constructor.name).toBe("Adapter");
+      expect(apiB.context.io.of("/").adapter.constructor.name).toBe("Adapter");
+
+      const boardId = await topology.createBoard(true, true);
+      const otherBoardId = await topology.createBoard();
+      const { client: clientA } = await topology.connect(apiA, tokens.editor, boardId);
+      const { client: clientB } = await topology.connect(apiB, tokens.owner, boardId);
+      const { client: otherBoardClient } = await topology.connect(
+        apiA,
+        tokens.editor,
+        otherBoardId,
+      );
+      await topology.runWatchdogChecks();
+
+      const first = createRectangleCommand(boardId);
+      await expect(topology.submit(clientA, first)).resolves.toMatchObject({
+        ok: true,
+        duplicate: false,
+        operation: { opId: first.opId, seq: 1 },
+      });
+      const pendingFirst = await operationEvidence(first.opId);
+      expect(pendingFirst).toMatchObject({ status: "pending", redisEntryId: null });
+      expect(clientA.operations.entries).toEqual([]);
+      expect(clientB.operations.entries).toEqual([]);
+      expect(otherBoardClient.operations.entries).toEqual([]);
+
+      await expect(topology.runWorkerCycle()).resolves.toMatchObject({
+        claimed: 1,
+        outcomes: ["published"],
+      });
+      const publishedFirst = await operationEvidence(first.opId);
+      if (!publishedFirst.redisEntryId) throw new Error("Missing activated publication ID");
+      const [deliveredA, deliveredB, handledA, handledB] = await Promise.all([
+        topology.waitForClientOperation(clientA, first.opId),
+        topology.waitForClientOperation(clientB, first.opId),
+        topology.waitForHandled(apiA, publishedFirst.eventId),
+        topology.waitForHandled(apiB, publishedFirst.eventId),
+      ]);
+      expect(deliveredA).toEqual(deliveredB);
+      expect(handledA.redisEntryId).toBe(publishedFirst.redisEntryId);
+      expect(handledB.redisEntryId).toBe(publishedFirst.redisEntryId);
+      expect(otherBoardClient.rawOperationCounts.get(first.opId)).toBeUndefined();
+      expect(publishedFirst).toMatchObject({
+        status: "published",
+        canvasSeq: 1,
+        deliverySeq: 1,
+      });
+      expect(apiA.evidence.transport).not.toBe(apiB.evidence.transport);
+      expect(apiA.evidence.consumer).not.toBe(apiB.evidence.consumer);
+      expect(apiA.evidence.consumer?.lastHandledCursor).toBe(publishedFirst.redisEntryId);
+      expect(apiB.evidence.consumer?.lastHandledCursor).toBe(publishedFirst.redisEntryId);
+      expect(await consumerGroups(topology.streamKey)).toEqual([]);
+      await expectConverged(clientA, boardId);
+      await expectConverged(clientB, boardId);
+      const stateAfterFirst = structuredClone(clientA.state);
+
+      const paused = createRectangleCommand(boardId);
+      await expect(topology.submit(clientA, paused)).resolves.toMatchObject({
+        ok: true,
+        operation: { opId: paused.opId, seq: 2 },
+      });
+      const pendingPaused = await operationEvidence(paused.opId);
+      expect(pendingPaused).toMatchObject({ status: "pending", redisEntryId: null });
+      expect(await streamContainsEvent(topology.streamKey, pendingPaused.eventId)).toBe(false);
+      expect(clientA.rawOperationCounts.get(paused.opId)).toBeUndefined();
+      expect(clientB.rawOperationCounts.get(paused.opId)).toBeUndefined();
+
+      await topology.runWatchdogChecks();
+      await topology.elapseWatchdogClock(4_999);
+      await topology.runWatchdogChecks();
+      expect(apiA.evidence.watchdogLifecycle.entries).toEqual([]);
+      expect(apiB.evidence.watchdogLifecycle.entries).toEqual([]);
+      expect(clientA.socket.connected).toBe(true);
+      expect(clientB.socket.connected).toBe(true);
+      const { client: beforeDeadline, joined: beforeDeadlineJoin } = await topology.connect(
+        apiB,
+        tokens.viewer,
+        boardId,
+        1,
+        structuredClone(stateAfterFirst),
+      );
+      expect(beforeDeadlineJoin).toMatchObject({ ok: true, joinWatermark: 2 });
+
+      await topology.elapseWatchdogClock(1);
+      await topology.runWatchdogChecks();
+      await Promise.all([
+        withDeadline(
+          clientA.disconnects.waitFor(() => true),
+          "API A watchdog disconnect",
+          () => topology.diagnostics(),
+        ),
+        withDeadline(
+          clientB.disconnects.waitFor(() => true),
+          "API B watchdog disconnect",
+          () => topology.diagnostics(),
+        ),
+        withDeadline(
+          beforeDeadline.disconnects.waitFor(() => true),
+          "pre-deadline watchdog disconnect",
+          () => topology.diagnostics(),
+        ),
+      ]);
+      expect(apiA.evidence.watchdogLifecycle.entries).toContainEqual({
+        state: "unavailable",
+        code: "DELIVERY_HEAD_DIVERGED",
+        boardIds: [boardId],
+      });
+      expect(apiB.evidence.watchdogLifecycle.entries).toContainEqual({
+        state: "unavailable",
+        code: "DELIVERY_HEAD_DIVERGED",
+        boardIds: [boardId],
+      });
+      await expectSocketReadinessRejected(apiA, tokens.owner);
+      await expectSocketReadinessRejected(apiB, tokens.owner);
+      const healthyHttp = await apiA.context.app.inject({
+        method: "GET",
+        url: `/v1/boards/${boardId}`,
+        headers: testAuthorizationHeaders(tokens.owner),
+      });
+      expect(healthyHttp.statusCode).toBe(200);
+
+      await expect(topology.runWorkerCycle()).resolves.toMatchObject({ outcomes: ["published"] });
+      const publishedPaused = await operationEvidence(paused.opId);
+      if (!publishedPaused.redisEntryId)
+        throw new Error("Missing watchdog recovery publication ID");
+      await Promise.all([
+        topology.waitForHandled(apiA, pendingPaused.eventId),
+        topology.waitForHandled(apiB, pendingPaused.eventId),
+        topology.waitForCursor(apiA, publishedPaused.redisEntryId),
+        topology.waitForCursor(apiB, publishedPaused.redisEntryId),
+      ]);
+      expect(clientA.rawOperationCounts.get(paused.opId)).toBeUndefined();
+      expect(clientB.rawOperationCounts.get(paused.opId)).toBeUndefined();
+
+      await topology.runWatchdogChecks();
+      await Promise.all([
+        topology.waitForWatchdog(
+          apiA,
+          ({ state }) => state === "recovered",
+          "API A watchdog recovery",
+        ),
+        topology.waitForWatchdog(
+          apiB,
+          ({ state }) => state === "recovered",
+          "API B watchdog recovery",
+        ),
+      ]);
+      const { client: recoveredA, joined: recoveredJoinA } = await topology.connect(
+        apiA,
+        tokens.editor,
+        boardId,
+        1,
+        structuredClone(stateAfterFirst),
+      );
+      const { client: recoveredB, joined: recoveredJoinB } = await topology.connect(
+        apiB,
+        tokens.owner,
+        boardId,
+        1,
+        structuredClone(stateAfterFirst),
+      );
+      expect(recoveredJoinA).toMatchObject({ ok: true, joinWatermark: 2 });
+      expect(recoveredJoinB).toMatchObject({ ok: true, joinWatermark: 2 });
+      const recoveredOperationsA = await catchUp(apiA, boardId, tokens.editor, 1, 2);
+      const recoveredOperationsB = await catchUp(apiB, boardId, tokens.owner, 1, 2);
+      recoveredA.applyCatchUp(recoveredOperationsA);
+      recoveredB.applyCatchUp(recoveredOperationsB);
+      await expectConverged(recoveredA, boardId);
+      await expectConverged(recoveredB, boardId);
+
+      const apiBUnavailableBefore = apiB.evidence.lifecycle.entries.filter(
+        ({ state }) => state === "unavailable",
+      ).length;
+      const transportA = apiA.evidence.transport;
+      if (!transportA) throw new Error("Missing API A Redis transport");
+      transportA.pauseReconnect();
+      transportA.interruptReader();
+      await Promise.all([
+        topology.waitForLifecycle(
+          apiA,
+          ({ state }) => state === "unavailable",
+          "API A Redis interruption",
+        ),
+        topology.waitForLifecycle(
+          apiA,
+          ({ state }) => state === "recovering",
+          "API A Redis recovering",
+        ),
+        withDeadline(
+          recoveredA.disconnects.waitFor(() => true),
+          "API A Redis-interruption disconnect",
+          () => topology.diagnostics(),
+        ),
+      ]);
+      expect(recoveredB.socket.connected).toBe(true);
+      await expectSocketReadinessRejected(apiA, tokens.owner);
+      const httpDuringRedisRecovery = await apiA.context.app.inject({
+        method: "GET",
+        url: `/v1/boards/${boardId}`,
+        headers: testAuthorizationHeaders(tokens.owner),
+      });
+      expect(httpDuringRedisRecovery.statusCode).toBe(200);
+
+      const duringRedisInterruption = createRectangleCommand(boardId);
+      await expect(topology.submit(recoveredB, duringRedisInterruption)).resolves.toMatchObject({
+        ok: true,
+        operation: { seq: 3 },
+      });
+      await topology.runWorkerCycle();
+      const interruptionPublication = await operationEvidence(duringRedisInterruption.opId);
+      if (!interruptionPublication.redisEntryId)
+        throw new Error("Missing Redis-interruption publication ID");
+      await topology.waitForClientOperation(recoveredB, duringRedisInterruption.opId);
+      expect(
+        apiA.evidence.handled.entries.some(
+          ({ envelope }) => envelope.eventId === interruptionPublication.eventId,
+        ),
+      ).toBe(false);
+
+      transportA.releaseReconnect();
+      await Promise.all([
+        topology.waitForLifecycle(
+          apiA,
+          ({ state }) => state === "recovered",
+          "API A Redis recovery",
+        ),
+        topology.waitForHandled(apiA, interruptionPublication.eventId),
+        topology.waitForCursor(apiA, interruptionPublication.redisEntryId),
+      ]);
+      expect(
+        apiA.evidence.handled.entries.filter(
+          ({ envelope }) => envelope.eventId === interruptionPublication.eventId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        apiB.evidence.handled.entries.filter(
+          ({ envelope }) => envelope.eventId === interruptionPublication.eventId,
+        ),
+      ).toHaveLength(1);
+      expect(
+        apiB.evidence.lifecycle.entries.filter(({ state }) => state === "unavailable"),
+      ).toHaveLength(apiBUnavailableBefore);
+      expect(recoveredB.rawOperationCounts.get(duringRedisInterruption.opId)).toBe(1);
+
+      const { client: postInterruptA, joined: postInterruptJoin } = await topology.connect(
+        apiA,
+        tokens.editor,
+        boardId,
+        2,
+        structuredClone(recoveredA.state),
+      );
+      expect(postInterruptJoin).toMatchObject({ ok: true, joinWatermark: 3 });
+      postInterruptA.applyCatchUp(await catchUp(apiA, boardId, tokens.editor, 2, 3));
+      await expectConverged(postInterruptA, boardId);
+      await expectConverged(recoveredB, boardId);
+
+      const { client: editorB } = await topology.connect(
+        apiB,
+        tokens.editor,
+        boardId,
+        3,
+        structuredClone(recoveredB.state),
+      );
+      const { client: viewer } = await topology.connect(
+        apiB,
+        tokens.viewer,
+        boardId,
+        3,
+        structuredClone(recoveredB.state),
+      );
+      const { client: editorOtherBoard } = await topology.connect(
+        apiA,
+        tokens.editor,
+        otherBoardId,
+      );
+      const removal = await topology.removeMember(apiB, boardId, identities.editor.id);
+      if (!removal.eventId) throw new Error("Missing activated revocation event ID");
+      const pendingRevocation = await revocationEvidence(removal.eventId);
+      expect(pendingRevocation).toMatchObject({ status: "pending", redisEntryId: null });
+      expect(postInterruptA.revocations.entries).toEqual([]);
+      expect(editorB.revocations.entries).toEqual([]);
+
+      await topology.runWorkerCycle();
+      const publishedRevocation = await revocationEvidence(removal.eventId);
+      if (!publishedRevocation.redisEntryId)
+        throw new Error("Missing activated revocation publication ID");
+      await Promise.all([
+        topology.waitForRevocation(postInterruptA, boardId),
+        topology.waitForRevocation(editorB, boardId),
+        topology.waitForHandled(apiA, removal.eventId),
+        topology.waitForHandled(apiB, removal.eventId),
+      ]);
+      expect(roomHas(apiA, boardId, postInterruptA)).toBe(false);
+      expect(roomHas(apiB, boardId, editorB)).toBe(false);
+      expect(roomHas(apiB, boardId, viewer)).toBe(true);
+      expect(roomHas(apiA, otherBoardId, editorOtherBoard)).toBe(true);
+      expect(viewer.revocations.entries).toEqual([]);
+      expect(editorOtherBoard.revocations.entries).toEqual([]);
+
+      const duplicateRevocationId = await appendDuplicate(
+        topology.streamKey,
+        publishedRevocation.payload,
+      );
+      await Promise.all([
+        topology.waitForReadEvidence(apiA, duplicateRevocationId),
+        topology.waitForReadEvidence(apiB, duplicateRevocationId),
+        topology.waitForCursor(apiA, duplicateRevocationId),
+        topology.waitForCursor(apiB, duplicateRevocationId),
+      ]);
+      expect(postInterruptA.rawRevocationCounts.get(boardId)).toBe(1);
+      expect(editorB.rawRevocationCounts.get(boardId)).toBe(1);
+
+      const authorizedAfterRevocation = createRectangleCommand(boardId);
+      await topology.submit(recoveredB, authorizedAfterRevocation);
+      await topology.runWorkerCycle();
+      await topology.waitForClientOperation(viewer, authorizedAfterRevocation.opId);
+      expect(postInterruptA.rawOperationCounts.get(authorizedAfterRevocation.opId)).toBeUndefined();
+      expect(editorB.rawOperationCounts.get(authorizedAfterRevocation.opId)).toBeUndefined();
+      expect(editorOtherBoard.socket.connected).toBe(true);
+      await expectConverged(recoveredB, boardId);
+      await expectConverged(viewer, boardId);
+      expect(await consumerGroups(topology.streamKey)).toEqual([]);
+
+      const closeA = apiA.close();
+      expect(apiA.close()).toBe(closeA);
+      await closeA;
+      await apiA.evidence.runtimeObserver?.lifecycle({ state: "recovered" });
+      expect(apiA.context.app.server.listening).toBe(false);
+      expect(apiA.evidence.transport?.closeCalls).toBe(1);
+      expect(apiA.evidence.watchdogScheduler?.pendingTasks).toBe(0);
+
+      const topologyClose = topology.close();
+      expect(topology.close()).toBe(topologyClose);
+      await topologyClose;
+      await apiB.evidence.runtimeObserver?.lifecycle({ state: "recovered" });
+      expect(apiB.context.app.server.listening).toBe(false);
+      expect(apiB.evidence.transport?.closeCalls).toBe(1);
+      expect(apiB.evidence.watchdogScheduler?.pendingTasks).toBe(0);
+      expect(await requireRedis().sendCommand(["EXISTS", topology.streamKey])).toBe(0);
     });
   });
 });
