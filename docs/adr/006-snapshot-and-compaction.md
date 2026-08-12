@@ -220,6 +220,26 @@ newest verified snapshot cannot immediately become the deletion floor, and at le
 snapshots plus the floor and every pinned snapshot are retained. Changing this margin cannot bypass
 hash, publication, receipt, backup, corruption, or failure-test gates.
 
+`apps/worker` owns the standalone compaction coordinator, independently from snapshot creation and
+outbox publication. It performs an immediate scan when started, then single-flight polls every
+300,000 ms with ±20% jitter. Each poll advances an in-memory deterministic board-ID cursor, inspects
+at most 100 boards, returns at most 16 advisory candidates, and runs at most two board compactions
+concurrently. Multiple workers may discover the same board; discovery creates no claim or lease and
+uses no Redis coordination. `BoardCompactionRepository` remains the sole authority for the board
+advisory lock, evidence verification, deletion, and coupled floor advancement.
+
+Blocked candidates are reported once per bounded fingerprint of board, proposed snapshot boundary,
+and current floors, then suppressed until that fingerprint changes. Thrown repository or
+infrastructure failures receive per-board full-jitter exponential backoff from 5,000 ms through a
+300,000 ms cap; unrelated boards continue. Retry and blocked-fingerprint state are separate
+deterministic-LRU maps capped at 1,000 entries and retain no board content or durable payloads.
+Coordinator shutdown is idempotent, drains only through its configured grace, fences late results,
+and clears timers, cursor, retries, suppressions, and retained scheduling state. The configuration
+names are `COMPACTION_POLL_INTERVAL_MS`, `COMPACTION_POLL_JITTER_PERCENT`,
+`COMPACTION_CANDIDATE_SCAN_LIMIT`, `COMPACTION_CANDIDATE_BATCH_SIZE`,
+`COMPACTION_MAX_CONCURRENCY`, `COMPACTION_RETRY_BASE_MS`, `COMPACTION_RETRY_CAP_MS`, and
+`COMPACTION_RETAINED_STATE_LIMIT`; activation and environment wiring remain separate work.
+
 Snapshots are recovery checkpoints, not automatically user-visible versions. A future version record
 may pin one. Restoring a version materializes its state as a new forward operation and new delivery
 event at the current heads; it never rewinds a floor or sequence and never mutates an old snapshot.

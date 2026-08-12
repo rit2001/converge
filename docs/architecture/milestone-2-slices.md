@@ -361,6 +361,19 @@ implications are approved; receipt canonicalization is stable.
 delivery floor, retains normalized command JSONB for definitive replay equality, and makes every
 below-floor reader take an explicit snapshot path.
 
+**Coordinator policy:** `apps/worker` owns a standalone, disabled-until-activation compaction
+coordinator. Start performs one immediate advisory discovery scan; later single-flight scans run at
+300,000 ms with ±20% jitter, inspect at most 100 board IDs, return at most 16 candidates, and compact
+at most two boards concurrently. The cursor, per-board full-jitter retry state (5,000 ms base,
+300,000 ms cap), and unchanged blocked-candidate suppression are in memory. Retry and blocked maps
+each use deterministic LRU with a 1,000-entry cap. Multiple workers may discover the same board
+without claims, leases, Redis locks, or singleton ownership; `BoardCompactionRepository` revalidates
+and remains authoritative. Configuration names are `COMPACTION_POLL_INTERVAL_MS`,
+`COMPACTION_POLL_JITTER_PERCENT`, `COMPACTION_CANDIDATE_SCAN_LIMIT`,
+`COMPACTION_CANDIDATE_BATCH_SIZE`, `COMPACTION_MAX_CONCURRENCY`,
+`COMPACTION_RETRY_BASE_MS`, `COMPACTION_RETRY_CAP_MS`, and
+`COMPACTION_RETAINED_STATE_LIMIT`. Startup and environment activation are deferred.
+
 **Expected files/packages:**
 
 - `packages/database` receipt/floor migration, compaction repository, and tests;
