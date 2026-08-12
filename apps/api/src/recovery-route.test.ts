@@ -150,6 +150,7 @@ describe("verified recovery HTTP route", () => {
 
   it.each([
     "MISSING_REQUIRED_SNAPSHOT",
+    "SNAPSHOT_BELOW_RECOVERY_FLOOR",
     "SNAPSHOT_CORRUPT",
     "UNSUPPORTED_SNAPSHOT_VERSION",
     "TAIL_GAP",

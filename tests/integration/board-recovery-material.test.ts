@@ -5,6 +5,7 @@ import { BoardRecoveryService, buildApp, type AppContext } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
 import { parseEnvironment } from "@converge/api/env";
 import {
+  BoardCompactionRepository,
   BoardRecoveryMaterialRepository,
   BoardRecoveryError,
   BoardRecoveryRefreshInfrastructureError,
@@ -12,6 +13,7 @@ import {
   BoardSnapshotRepository,
   createPool,
   type RecoveryOperationEvidence,
+  type RepositoryError,
 } from "@converge/database";
 import {
   createRectangleCommand,
@@ -24,6 +26,7 @@ import {
   boardSnapshotSchema,
   httpInternalErrorResponseSchema,
   operationRangeResponseSchema,
+  protocolErrorSchema,
 } from "@converge/protocol";
 import type { DurableCommand } from "@converge/protocol";
 
@@ -38,6 +41,7 @@ let pool: ReturnType<typeof createPool>;
 let boards: BoardRepository;
 let snapshots: BoardSnapshotRepository;
 let recovery: BoardRecoveryMaterialRepository;
+let compaction: BoardCompactionRepository;
 let api: AppContext;
 const recoveryToken = "snapshot-recovery-owner-token";
 
@@ -87,6 +91,30 @@ async function corruptHash(snapshotId: string): Promise<void> {
   }
 }
 
+async function publish(eventId: string): Promise<void> {
+  await pool.query(
+    `UPDATE outbox_events
+     SET status = 'published', next_attempt_at = 'infinity'::timestamptz,
+         redis_entry_id = $2, published_at = clock_timestamp(), updated_at = clock_timestamp()
+     WHERE id = $1`,
+    [eventId, `recovery-floor-${crypto.randomUUID()}`],
+  );
+}
+
+async function compactableBoard(label: string) {
+  const boardId = await board(label);
+  const genesis = await snapshots.create(boardId);
+  const firstCommand: DurableCommand = { ...createRectangleCommand(boardId), baseSeq: 0 };
+  const first = await boards.commitOperation(fixtureIds.user, firstCommand);
+  await publish(first.event.eventId);
+  const boundary = await snapshots.create(boardId);
+  const secondCommand: DurableCommand = { ...createRectangleCommand(boardId), baseSeq: 1 };
+  const second = await boards.commitOperation(fixtureIds.user, secondCommand);
+  await publish(second.event.eventId);
+  const newest = await snapshots.create(boardId);
+  return { boardId, genesis, boundary, newest, firstCommand, first, second };
+}
+
 async function logicalBoardState(boardId: string): Promise<unknown> {
   const result = await pool.query<{ state: unknown }>(
     `SELECT jsonb_build_object(
@@ -121,6 +149,7 @@ beforeAll(async () => {
   boards = new BoardRepository(pool);
   snapshots = new BoardSnapshotRepository(pool);
   recovery = new BoardRecoveryMaterialRepository(pool);
+  compaction = new BoardCompactionRepository(pool);
   api = await buildApp(
     parseEnvironment({
       NODE_ENV: "test",
@@ -162,6 +191,156 @@ afterAll(async () => {
 });
 
 describe("snapshot plus contiguous operation-tail recovery", () => {
+  it("enforces range floors and reconstructs from retained compacted material", async () => {
+    const context = await compactableBoard("range-floor");
+    const beforeRange = await logicalBoardState(context.boardId);
+    const zeroFloor = await boards.getOperationBatch(context.boardId, fixtureIds.user, 0, 2, 100);
+    expect("outcome" in zeroFloor ? zeroFloor : zeroFloor.operations.map(({ seq }) => seq)).toEqual(
+      [1, 2],
+    );
+
+    await expect(compaction.compact(context.boardId)).resolves.toMatchObject({
+      outcome: "compacted",
+      snapshotId: context.boundary.id,
+      newOperationFloor: 1,
+      newDeliveryFloor: 1,
+    });
+    const compactedState = await logicalBoardState(context.boardId);
+    await expect(
+      boards.getOperationBatch(context.boardId, fixtureIds.user, 0, 2, 100),
+    ).resolves.toEqual({ outcome: "range_below_floor", boardId: context.boardId });
+    const atFloor = await boards.getOperationBatch(context.boardId, fixtureIds.user, 1, 2, 100);
+    expect("outcome" in atFloor ? atFloor : atFloor.operations.map(({ seq }) => seq)).toEqual([2]);
+    const aboveFloor = await boards.getOperationBatch(context.boardId, fixtureIds.user, 2, 2, 100);
+    expect(aboveFloor).toMatchObject({ operations: [], nextSeq: 2, hasMore: false });
+    expect(await logicalBoardState(context.boardId)).toEqual(compactedState);
+    expect(beforeRange).not.toEqual(compactedState);
+
+    const belowFloorHttp = await api.app.inject({
+      method: "GET",
+      url: `/v1/boards/${context.boardId}/operations?after=0&watermark=2`,
+      headers: testAuthorizationHeaders(recoveryToken),
+    });
+    expect(belowFloorHttp.statusCode).toBe(409);
+    expect(protocolErrorSchema.parse(belowFloorHttp.json())).toEqual({
+      ok: false,
+      code: "RESYNC_REQUIRED",
+      message: "Operation range is unavailable",
+      retryable: true,
+    });
+    expect(belowFloorHttp.body).not.toContain("floor");
+
+    const newestMaterial = await recovery.load(context.boardId);
+    expect(newestMaterial.snapshotId).toBe(context.newest.id);
+    expect(newestMaterial.reconstructedState.lastSeq).toBe(2);
+    await corruptHash(context.newest.id);
+    const boundaryMaterial = await recovery.load(context.boardId);
+    expect(boundaryMaterial).toMatchObject({
+      snapshotId: context.boundary.id,
+      snapshotCanvasSeq: 1,
+      snapshotDeliverySeq: 1,
+      capturedCanvasSeq: 2,
+      capturedDeliverySeq: 2,
+    });
+    expect(boundaryMaterial.operations.map(({ seq }) => seq)).toEqual([2]);
+    expect(
+      await pool.query("SELECT status FROM board_snapshots WHERE id = $1", [context.genesis.id]),
+    ).toMatchObject({ rows: [{ status: "verified" }] });
+
+    const beforeReplay = await logicalBoardState(context.boardId);
+    await expect(
+      boards.commitOperation(fixtureIds.user, context.firstCommand),
+    ).resolves.toMatchObject({ duplicate: true, operation: context.first.operation });
+    expect(await logicalBoardState(context.boardId)).toEqual(beforeReplay);
+
+    await pool.query("DELETE FROM board_operations WHERE board_id = $1 AND seq = 2", [
+      context.boardId,
+    ]);
+    await expect(
+      boards.getOperationBatch(context.boardId, fixtureIds.user, 1, 2, 100),
+    ).rejects.toMatchObject({ code: "RESYNC_REQUIRED" } satisfies Partial<RepositoryError>);
+  });
+
+  it("serializes a concurrent range wholly after compaction", async () => {
+    const context = await compactableBoard("range-compaction-boundary");
+    const locked = deferred();
+    const release = deferred();
+    const holdingCompactor = new BoardCompactionRepository(pool, {
+      afterAdvisoryLock: async () => {
+        locked.resolve();
+        await release.promise;
+      },
+    });
+    const compacting = holdingCompactor.compact(context.boardId);
+    await locked.promise;
+    const reading = boards.getOperationBatch(context.boardId, fixtureIds.user, 0, 2, 100);
+    release.resolve();
+    await expect(compacting).resolves.toMatchObject({ outcome: "compacted" });
+    await expect(reading).resolves.toEqual({
+      outcome: "range_below_floor",
+      boardId: context.boardId,
+    });
+  });
+
+  it("blocks floor-ineligible recovery without invalidation or refresh", async () => {
+    const boardId = await board("floor-ineligible");
+    const genesis = await snapshots.create(boardId);
+    const committed = await boards.commitOperation(
+      fixtureIds.user,
+      createRectangleCommand(boardId),
+    );
+    await pool.query(
+      `UPDATE boards
+       SET operation_recovery_floor = 0, delivery_recovery_floor = $2
+       WHERE id = $1`,
+      [boardId, committed.event.deliverySeq],
+    );
+    await expect(recovery.load(boardId)).rejects.toMatchObject({
+      code: "SNAPSHOT_BELOW_RECOVERY_FLOOR",
+    });
+    const response = await api.app.inject({
+      method: "GET",
+      url: `/v1/boards/${boardId}/recovery`,
+      headers: testAuthorizationHeaders(recoveryToken),
+    });
+    expect(response.statusCode).toBe(409);
+    expect(protocolErrorSchema.parse(response.json())).toMatchObject({
+      code: "RECOVERY_BLOCKED",
+      retryable: false,
+    });
+    expect(
+      await pool.query("SELECT status FROM board_snapshots WHERE id = $1", [genesis.id]),
+    ).toMatchObject({ rows: [{ status: "verified" }] });
+    expect(
+      await pool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM board_snapshots WHERE board_id = $1",
+        [boardId],
+      ),
+    ).toMatchObject({ rows: [{ count: "1" }] });
+  });
+
+  it("fails closed on invalid floor and head evidence", async () => {
+    const boardId = await board("invalid-floor-evidence");
+    await pool.query("ALTER TABLE boards DROP CONSTRAINT boards_operation_recovery_floor_check");
+    await pool.query("UPDATE boards SET operation_recovery_floor = 1 WHERE id = $1", [boardId]);
+    try {
+      await expect(boards.getOperationBatch(boardId, fixtureIds.user, 0, 0, 100)).rejects.toThrow(
+        "Invalid board recovery boundary",
+      );
+      await expect(recovery.load(boardId)).rejects.toMatchObject({ code: "MISSING_BOARD_HEAD" });
+    } finally {
+      await pool.query("ALTER TABLE boards DISABLE TRIGGER boards_recovery_floors_forward_only");
+      await pool.query("UPDATE boards SET operation_recovery_floor = 0 WHERE id = $1", [boardId]);
+      await pool.query("ALTER TABLE boards ENABLE TRIGGER boards_recovery_floors_forward_only");
+      await pool.query(
+        `ALTER TABLE boards
+         ADD CONSTRAINT boards_operation_recovery_floor_check CHECK (
+           operation_recovery_floor BETWEEN 0 AND 9007199254740991
+           AND operation_recovery_floor <= last_seq
+         )`,
+      );
+    }
+  });
   it("exposes exact-head recovery without changing existing snapshot and range routes", async () => {
     const boardId = await board("api-exact-head");
     const snapshot = await snapshots.create(boardId);

@@ -36,6 +36,7 @@ describe("board recovery refresh service", () => {
 
   it.each([
     "SNAPSHOT_TOO_LARGE",
+    "SNAPSHOT_BELOW_RECOVERY_FLOOR",
     "SNAPSHOT_CORRUPT",
     "UNSUPPORTED_SNAPSHOT_VERSION",
     "TAIL_GAP",

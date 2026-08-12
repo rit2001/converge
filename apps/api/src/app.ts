@@ -92,6 +92,7 @@ function failedAck(error: unknown): ProtocolError {
 const durableRecoveryFailureCodes = new Set<BoardRecoveryError["code"]>([
   "MISSING_BOARD_HEAD",
   "MISSING_REQUIRED_SNAPSHOT",
+  "SNAPSHOT_BELOW_RECOVERY_FLOOR",
   "SNAPSHOT_TOO_LARGE",
   "SNAPSHOT_CORRUPT",
   "UNSUPPORTED_SNAPSHOT_VERSION",
@@ -391,16 +392,17 @@ export async function buildApp(
       const boardId = z.string().uuid().parse(request.params.boardId);
       const range = operationRangeQuerySchema.parse(request.query);
       try {
+        const result = await repository.getOperationBatch(
+          boardId,
+          user.id,
+          range.after,
+          range.watermark,
+          synchronizationBatchSize,
+        );
+        if ("outcome" in result)
+          throw new RepositoryError("RESYNC_REQUIRED", "Operation range is unavailable");
         return {
-          ...operationRangeResponseSchema.parse(
-            await repository.getOperationBatch(
-              boardId,
-              user.id,
-              range.after,
-              range.watermark,
-              synchronizationBatchSize,
-            ),
-          ),
+          ...operationRangeResponseSchema.parse(result),
         };
       } catch (error) {
         if (error instanceof RepositoryError)

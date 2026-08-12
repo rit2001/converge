@@ -1036,38 +1036,56 @@ describe("authoritative resynchronization and pending interaction", () => {
     expect(test.scheduler.delays()).toEqual([500]);
   });
 
-  it("reloads the snapshot when the durable operation range is unavailable", async () => {
-    let snapshotLoads = 0;
+  it("routes range RESYNC_REQUIRED through verified recovery while preserving pending", async () => {
+    const item = pending(1);
+    const material = await recoveryMaterial();
+    const urls: string[] = [];
     const test = harness({
-      fetcher: () =>
-        Promise.resolve(
-          new Response(
-            JSON.stringify({
-              ok: false,
-              code: "RESYNC_REQUIRED",
-              message: "Operation range is unavailable",
-              retryable: true,
-            }),
-            { status: 409, headers: { "content-type": "application/json" } },
-          ),
-        ),
-      loadRecovery: () => {
-        snapshotLoads += 1;
-        return recoveryMaterial();
+      initialPending: [item],
+      useDefaultRecovery: true,
+      fetcher: (input) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        urls.push(url);
+        return Promise.resolve(
+          url.includes("/operations?")
+            ? new Response(
+                JSON.stringify({
+                  ok: false,
+                  code: "RESYNC_REQUIRED",
+                  message: "Operation range is unavailable",
+                  retryable: true,
+                }),
+                { status: 409, headers: { "content-type": "application/json" } },
+              )
+            : new Response(JSON.stringify(material), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              }),
+        );
       },
     });
     succeedJoin(test.socket, 0, 1);
     await settle();
-    expect(snapshotLoads).toBe(1);
+    expect(urls).toEqual([
+      `http://localhost:4000/v1/boards/${boardId}/operations?after=0&watermark=1`,
+      `http://localhost:4000/v1/boards/${boardId}/recovery`,
+    ]);
     expect(useBoardStore.getState()).toMatchObject({
       connection: "retry-wait",
       committed: { lastSeq: 0 },
+      pending: [{ opId: item.opId }],
       synchronizationDiagnostics: { retryCode: "RESYNC_REQUIRED" },
     });
+    expect(test.persistence.rows.has(item.opId)).toBe(true);
+    expect(test.socket.submissions).toHaveLength(0);
     test.scheduler.runDelay(500);
     succeedJoin(test.socket, 1, 0);
     await settle();
     expect(useBoardStore.getState().connection).toBe("ready");
+    expect(test.socket.submissions).toEqual([item]);
+    expect(urls.filter((url) => url.includes("/operations?"))).toHaveLength(1);
+    expect(urls.filter((url) => url.endsWith(`/v1/boards/${boardId}`))).toHaveLength(0);
   });
 
   it("reloads an authoritative snapshot for client-ahead RESYNC_REQUIRED and preserves pending", async () => {

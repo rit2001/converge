@@ -30,6 +30,7 @@ export class BoardRecoveryError extends Error {
       | "INVALID_CONFIGURATION"
       | "MISSING_BOARD_HEAD"
       | "MISSING_REQUIRED_SNAPSHOT"
+      | "SNAPSHOT_BELOW_RECOVERY_FLOOR"
       | "SNAPSHOT_TOO_LARGE"
       | "SNAPSHOT_CORRUPT"
       | "UNSUPPORTED_SNAPSHOT_VERSION"
@@ -98,6 +99,8 @@ interface HeadRow {
   name: unknown;
   last_seq: unknown;
   last_delivery_seq: unknown;
+  operation_recovery_floor: unknown;
+  delivery_recovery_floor: unknown;
 }
 
 interface ProjectionRow {
@@ -329,7 +332,9 @@ export class BoardRecoveryMaterialRepository {
     boardId: string,
   ): Promise<VerifiedBoardRecoveryMaterial> {
     const headResult = await client.query<HeadRow>(
-      "SELECT id, name, last_seq, last_delivery_seq FROM boards WHERE id = $1 FOR UPDATE",
+      `SELECT id, name, last_seq, last_delivery_seq,
+              operation_recovery_floor, delivery_recovery_floor
+       FROM boards WHERE id = $1 FOR UPDATE`,
       [boardId],
     );
     const head = headResult.rows[0];
@@ -343,7 +348,14 @@ export class BoardRecoveryMaterialRepository {
       throw new BoardRecoveryError("MISSING_BOARD_HEAD");
     const capturedCanvasSeq = parseSequence(head.last_seq);
     const capturedDeliverySeq = parseSequence(head.last_delivery_seq);
-    if (capturedDeliverySeq < capturedCanvasSeq) throw new BoardRecoveryError("MISSING_BOARD_HEAD");
+    const operationRecoveryFloor = parseSequence(head.operation_recovery_floor);
+    const deliveryRecoveryFloor = parseSequence(head.delivery_recovery_floor);
+    if (
+      capturedDeliverySeq < capturedCanvasSeq ||
+      operationRecoveryFloor > capturedCanvasSeq ||
+      deliveryRecoveryFloor > capturedDeliverySeq
+    )
+      throw new BoardRecoveryError("MISSING_BOARD_HEAD");
     await this.hooks.afterBoundaryCaptured?.({
       boardId,
       canvasSeq: capturedCanvasSeq,
@@ -366,6 +378,15 @@ export class BoardRecoveryMaterialRepository {
     );
     let corruptionObserved = latestSnapshot.rows[0]?.status === "invalid";
     let candidateFound = false;
+    const floorIneligible = await client.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM board_snapshots
+         WHERE board_id = $1
+           AND status = 'verified'
+           AND (snapshot_seq < $2 OR snapshot_delivery_seq < $3)
+       ) AS present`,
+      [boardId, operationRecoveryFloor, deliveryRecoveryFloor],
+    );
     let beforeSnapshotSeq: number | undefined;
     let finalError: BoardRecoveryError = new BoardRecoveryError("NO_COMPLETE_RECOVERY_CHAIN");
     while (true) {
@@ -373,10 +394,12 @@ export class BoardRecoveryMaterialRepository {
         `SELECT * FROM board_snapshots
            WHERE board_id = $1
              AND status = 'verified'
-             AND ($2::bigint IS NULL OR snapshot_seq < $2)
+             AND snapshot_seq >= $2
+             AND snapshot_delivery_seq >= $3
+             AND ($4::bigint IS NULL OR snapshot_seq < $4)
            ORDER BY snapshot_seq DESC, created_at DESC, id DESC
            LIMIT 1`,
-        [boardId, beforeSnapshotSeq ?? null],
+        [boardId, operationRecoveryFloor, deliveryRecoveryFloor, beforeSnapshotSeq ?? null],
       );
       const candidate = candidateResult.rows[0];
       if (!candidate) break;
@@ -438,7 +461,12 @@ export class BoardRecoveryMaterialRepository {
     }
 
     if (corruptionObserved) throw new BoardRecoveryError("SNAPSHOT_CORRUPT");
-    if (!candidateFound) throw new BoardRecoveryError("MISSING_REQUIRED_SNAPSHOT");
+    if (!candidateFound)
+      throw new BoardRecoveryError(
+        floorIneligible.rows[0]?.present === true
+          ? "SNAPSHOT_BELOW_RECOVERY_FLOOR"
+          : "MISSING_REQUIRED_SNAPSHOT",
+      );
     throw finalError;
   }
 

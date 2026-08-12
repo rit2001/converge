@@ -41,6 +41,12 @@ export interface BoardRepositoryHooks {
   beforeSequenceLock?: (command: DurableCommand) => Promise<void>;
   afterSequenceLock?: (command: DurableCommand) => Promise<void>;
   afterReceiptInsert?: (command: DurableCommand) => Promise<void>;
+  afterOperationRangeLock?: (context: {
+    boardId: string;
+    userId: string;
+    afterSeq: number;
+    watermark: number;
+  }) => Promise<void>;
   beforeMembershipSequenceLock?: (context: {
     boardId: string;
     actorId: string;
@@ -68,6 +74,13 @@ export interface CommitOperationResult {
   operation: CommittedOperation;
   event: OperationCommittedDeliveryEnvelope;
 }
+
+export interface OperationRangeBelowFloor {
+  outcome: "range_below_floor";
+  boardId: string;
+}
+
+export type OperationBatchResult = OperationRangeResponse | OperationRangeBelowFloor;
 
 export const BOARD_DELIVERY_HEAD_QUERY_MAXIMUM = 100 as const;
 
@@ -234,44 +247,108 @@ export class BoardRepository {
     afterSeq: number,
     watermark: number,
     batchSize: number,
-  ): Promise<OperationRangeResponse> {
-    if (watermark < afterSeq)
+  ): Promise<OperationBatchResult> {
+    if (
+      !Number.isSafeInteger(afterSeq) ||
+      afterSeq < 0 ||
+      !Number.isSafeInteger(watermark) ||
+      watermark < 0 ||
+      watermark < afterSeq
+    )
       throw new RepositoryError("RESYNC_REQUIRED", "Invalid synchronization cursor");
-    const head = await this.getBoardSequence(boardId, userId);
-    if (watermark > head)
-      throw new RepositoryError("RESYNC_REQUIRED", "Synchronization watermark exceeds board head");
-    const result = await this.pool.query<{ command: unknown; seq: string; committed_at: Date }>(
-      `SELECT command, seq, committed_at
-       FROM board_operations
-       WHERE board_id = $1 AND seq > $2 AND seq <= $3
-       ORDER BY seq
-       LIMIT $4`,
-      [boardId, afterSeq, watermark, batchSize],
-    );
-    const operations = result.rows.map((row) =>
-      committedOperationSchema.parse({
-        ...durableCommandSchema.parse(row.command),
-        seq: Number(row.seq),
-        committedAt: row.committed_at.toISOString(),
-      }),
-    );
-    let expected = afterSeq + 1;
-    for (const operation of operations) {
-      if (operation.seq !== expected)
-        throw new RepositoryError("RESYNC_REQUIRED", "Operation log is not contiguous");
-      expected += 1;
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0)
+      throw new Error("Invalid operation-range batch size");
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
+      await this.hooks.afterOperationRangeLock?.({ boardId, userId, afterSeq, watermark });
+      const boundary = await client.query<{
+        last_seq: unknown;
+        last_delivery_seq: unknown;
+        operation_recovery_floor: unknown;
+        delivery_recovery_floor: unknown;
+      }>(
+        `SELECT b.last_seq, b.last_delivery_seq,
+                b.operation_recovery_floor, b.delivery_recovery_floor
+         FROM boards b
+         JOIN board_members m ON m.board_id = b.id AND m.user_id = $2
+         WHERE b.id = $1
+         FOR UPDATE OF b`,
+        [boardId, userId],
+      );
+      const row = boundary.rows[0];
+      if (!row) throw new RepositoryError("FORBIDDEN", "Board membership required");
+      const parseBoundary = (value: unknown): number => {
+        const parsed =
+          typeof value === "number"
+            ? value
+            : typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)
+              ? Number(value)
+              : Number.NaN;
+        if (!Number.isSafeInteger(parsed) || parsed < 0)
+          throw new Error("Invalid board recovery boundary");
+        return parsed;
+      };
+      const canvasHead = parseBoundary(row.last_seq);
+      const deliveryHead = parseBoundary(row.last_delivery_seq);
+      const operationFloor = parseBoundary(row.operation_recovery_floor);
+      const deliveryFloor = parseBoundary(row.delivery_recovery_floor);
+      if (deliveryHead < canvasHead || operationFloor > canvasHead || deliveryFloor > deliveryHead)
+        throw new Error("Invalid board recovery boundary");
+      if (watermark > canvasHead)
+        throw new RepositoryError(
+          "RESYNC_REQUIRED",
+          "Synchronization watermark exceeds board head",
+        );
+      if (afterSeq < operationFloor) {
+        await client.query("COMMIT");
+        return { outcome: "range_below_floor", boardId };
+      }
+      const result = await client.query<{
+        command: unknown;
+        seq: string;
+        committed_at: Date;
+      }>(
+        `SELECT command, seq, committed_at
+         FROM board_operations
+         WHERE board_id = $1 AND seq > $2 AND seq <= $3
+         ORDER BY seq
+         LIMIT $4`,
+        [boardId, afterSeq, watermark, batchSize],
+      );
+      const operations = result.rows.map((operationRow) =>
+        committedOperationSchema.parse({
+          ...durableCommandSchema.parse(operationRow.command),
+          seq: Number(operationRow.seq),
+          committedAt: operationRow.committed_at.toISOString(),
+        }),
+      );
+      let expected = afterSeq + 1;
+      for (const operation of operations) {
+        if (operation.seq !== expected)
+          throw new RepositoryError("RESYNC_REQUIRED", "Operation log is not contiguous");
+        expected += 1;
+      }
+      const nextSeq = operations.at(-1)?.seq ?? afterSeq;
+      if (nextSeq < watermark && operations.length === 0)
+        throw new RepositoryError("RESYNC_REQUIRED", "Operation range is unavailable");
+      const response: OperationRangeResponse = {
+        boardId,
+        afterSeq,
+        watermark,
+        operations,
+        nextSeq,
+        hasMore: nextSeq < watermark,
+      };
+      await client.query("COMMIT");
+      return response;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
-    const nextSeq = operations.at(-1)?.seq ?? afterSeq;
-    if (nextSeq < watermark && operations.length === 0)
-      throw new RepositoryError("RESYNC_REQUIRED", "Operation range is unavailable");
-    return {
-      boardId,
-      afterSeq,
-      watermark,
-      operations,
-      nextSeq,
-      hasMore: nextSeq < watermark,
-    };
   }
 
   async removeBoardMember(
