@@ -40,6 +40,7 @@ export class RepositoryError extends Error {
 export interface BoardRepositoryHooks {
   beforeSequenceLock?: (command: DurableCommand) => Promise<void>;
   afterSequenceLock?: (command: DurableCommand) => Promise<void>;
+  afterReceiptInsert?: (command: DurableCommand) => Promise<void>;
   beforeMembershipSequenceLock?: (context: {
     boardId: string;
     actorId: string;
@@ -376,40 +377,25 @@ export class BoardRepository {
       const authoritativeLastSeq = Number(board.rows[0]?.last_seq ?? 0);
       const authoritativeLastDeliverySeq = Number(board.rows[0]?.last_delivery_seq ?? 0);
       const duplicate = await client.query<{
+        actor_id: string;
         command: unknown;
-        seq: string;
-        committed_at: Date;
-        user_id: string;
-        event_id: string;
-        delivery_seq: string;
+        result: unknown;
         same_command: boolean;
       }>(
-        `SELECT command, seq, committed_at, user_id, event_id, delivery_seq,
+        `SELECT actor_id, command, result,
                 command = $3::jsonb AS same_command
-         FROM board_operations WHERE board_id = $1 AND op_id = $2`,
+         FROM board_operation_receipts WHERE board_id = $1 AND operation_id = $2`,
         [command.boardId, command.opId, command],
       );
       const prior = duplicate.rows[0];
       if (prior) {
-        if (prior.user_id !== userId || !prior.same_command)
+        if (prior.actor_id !== userId || !prior.same_command)
           throw new RepositoryError(
             "IDEMPOTENCY_CONFLICT",
             "Operation id was already used for a different command",
           );
-        const operation = committedOperationSchema.parse({
-          ...durableCommandSchema.parse(prior.command),
-          seq: Number(prior.seq),
-          committedAt: prior.committed_at.toISOString(),
-        });
-        const event = operationCommittedDeliveryEnvelopeSchema.parse({
-          schemaVersion: 1,
-          eventId: prior.event_id,
-          boardId: command.boardId,
-          deliverySeq: Number(prior.delivery_seq),
-          eventType: "operation.committed",
-          occurredAt: operation.committedAt,
-          payload: { operation },
-        });
+        const event = operationCommittedDeliveryEnvelopeSchema.parse(prior.result);
+        const operation = event.payload.operation;
         await client.query("COMMIT");
         return {
           duplicate: true,
@@ -518,6 +504,31 @@ export class BoardRepository {
          ) VALUES ($1,$2,$3,$4,'operation.committed',1,$5)`,
         [eventId, command.boardId, deliverySeq, seq, event],
       );
+      await client.query(
+        `INSERT INTO board_operation_receipts(
+           board_id, operation_id, actor_id, command, command_hash, hash_schema_version,
+           canvas_seq, delivery_seq, event_id, committed_at, result
+         ) VALUES (
+           $1,$2,$3,$4,
+           encode(
+             sha256(convert_to('converge.operation-command.v1:' || $4::jsonb::text, 'UTF8')),
+             'hex'
+           ),
+           1,$5,$6,$7,$8,$9
+         )`,
+        [
+          command.boardId,
+          command.opId,
+          userId,
+          command,
+          seq,
+          deliverySeq,
+          eventId,
+          committedAt,
+          event,
+        ],
+      );
+      await this.hooks.afterReceiptInsert?.(command);
       await client.query("COMMIT");
       return { duplicate: false, operation, event };
     } catch (error) {

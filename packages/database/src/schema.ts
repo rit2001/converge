@@ -21,6 +21,12 @@ export const boards = pgTable(
     createdBy: uuid("created_by").notNull(),
     lastSeq: bigint("last_seq", { mode: "number" }).notNull().default(0),
     lastDeliverySeq: bigint("last_delivery_seq", { mode: "number" }).notNull().default(0),
+    operationRecoveryFloor: bigint("operation_recovery_floor", { mode: "number" })
+      .notNull()
+      .default(0),
+    deliveryRecoveryFloor: bigint("delivery_recovery_floor", { mode: "number" })
+      .notNull()
+      .default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -29,6 +35,16 @@ export const boards = pgTable(
     check(
       "boards_delivery_head_covers_canvas_check",
       sql`${table.lastDeliverySeq} >= ${table.lastSeq}`,
+    ),
+    check(
+      "boards_operation_recovery_floor_check",
+      sql`${table.operationRecoveryFloor} BETWEEN 0 AND 9007199254740991
+          AND ${table.operationRecoveryFloor} <= ${table.lastSeq}`,
+    ),
+    check(
+      "boards_delivery_recovery_floor_check",
+      sql`${table.deliveryRecoveryFloor} BETWEEN 0 AND 9007199254740991
+          AND ${table.deliveryRecoveryFloor} <= ${table.lastDeliverySeq}`,
     ),
   ],
 );
@@ -91,6 +107,65 @@ export const boardOperations = pgTable(
     uniqueIndex("board_operations_board_op_id_uq").on(table.boardId, table.opId),
     uniqueIndex("board_operations_event_id_uq").on(table.eventId),
     uniqueIndex("board_operations_board_delivery_seq_uq").on(table.boardId, table.deliverySeq),
+  ],
+);
+
+export const boardOperationReceipts = pgTable(
+  "board_operation_receipts",
+  {
+    boardId: uuid("board_id")
+      .notNull()
+      .references(() => boards.id, { onDelete: "cascade" }),
+    operationId: uuid("operation_id").notNull(),
+    actorId: uuid("actor_id").notNull(),
+    command: jsonb("command").notNull(),
+    commandHash: text("command_hash").notNull(),
+    hashSchemaVersion: integer("hash_schema_version").notNull(),
+    canvasSeq: bigint("canvas_seq", { mode: "number" }).notNull(),
+    deliverySeq: bigint("delivery_seq", { mode: "number" }).notNull(),
+    eventId: uuid("event_id").notNull(),
+    committedAt: timestamp("committed_at", { withTimezone: true }).notNull(),
+    result: jsonb("result").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.boardId, table.operationId] }),
+    uniqueIndex("board_operation_receipts_board_canvas_seq_uq").on(table.boardId, table.canvasSeq),
+    uniqueIndex("board_operation_receipts_board_delivery_seq_uq").on(
+      table.boardId,
+      table.deliverySeq,
+    ),
+    uniqueIndex("board_operation_receipts_event_id_uq").on(table.eventId),
+    check(
+      "board_operation_receipts_canvas_seq_check",
+      sql`${table.canvasSeq} BETWEEN 1 AND 9007199254740991`,
+    ),
+    check(
+      "board_operation_receipts_delivery_seq_check",
+      sql`${table.deliverySeq} BETWEEN ${table.canvasSeq} AND 9007199254740991`,
+    ),
+    check(
+      "board_operation_receipts_command_hash_check",
+      sql`${table.commandHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "board_operation_receipts_hash_schema_version_check",
+      sql`${table.hashSchemaVersion} = 1`,
+    ),
+    check(
+      "board_operation_receipts_consistency_check",
+      sql`(converge_operation_receipt_is_valid(
+        ${table.command},
+        ${table.result},
+        ${table.boardId},
+        ${table.operationId},
+        ${table.canvasSeq},
+        ${table.deliverySeq},
+        ${table.eventId},
+        ${table.committedAt},
+        ${table.hashSchemaVersion},
+        ${table.commandHash}
+      )) IS TRUE`,
+    ),
   ],
 );
 

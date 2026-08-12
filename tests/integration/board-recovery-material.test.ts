@@ -142,7 +142,7 @@ beforeAll(async () => {
   const migration = await pool.query<{ name: string }>(
     "SELECT name FROM converge_migrations ORDER BY name DESC LIMIT 1",
   );
-  expect(migration.rows[0]?.name).toBe("0008_snapshot_invalidation_diagnostics.sql");
+  expect(migration.rows[0]?.name).toBe("0009_board_replay_receipts_and_recovery_floors.sql");
 });
 
 afterEach(async () => {
