@@ -52,18 +52,24 @@ through 0008, the real snapshot repositories/coordinator and worker supervision,
 and a real authenticated BoardTransport. The accepted boundaries cover Redis-independent bootstrap,
 threshold capture, verified snapshot-plus-tail replay, one-attempt overflow refresh, corrupt-newest
 fallback, terminal blocked evidence, retryable lock contention, atomic/stale-session fencing, and
-snapshot/writer and duplicate-capture races. Final destructive compaction acceptance remains
-deferred.
+snapshot/writer and duplicate-capture races.
 
-Compaction coordination is wired into `apps/worker` but remains explicitly opt-in with
-`COMPACTION_ENABLED=true`. Final destructive compaction acceptance is still pending; M2.7 is not yet
-complete.
+## Milestone 2.7 compaction status
+
+M2.7 acceptance is complete against a disposable PostgreSQL database migrated through 0009, the
+real snapshot, compaction-discovery, compaction, receipt, recovery-material, and operation
+repositories, the real bounded coordinator, a dynamic real API, and a real authenticated
+BoardTransport. The accepted boundaries cover safety-delayed coupled compaction, immutable-receipt
+replay, floor-aware range and full recovery, blocked evidence, advisory-lock races, rollback,
+duplicate coordinators, transient retry, and idempotent later progress. Compaction remains explicitly
+opt-in with `COMPACTION_ENABLED=true`; snapshot/receipt deletion, Redis trimming, deployment, backup
+validation, and benchmarks remain deferred.
 
 ## Deferred by design
 
 - Production activation of transactional-outbox dispatch (the repository, worker publisher, and
   crash-boundary failure evidence are implemented)
-- Operation-log compaction and recovery-floor advancement
+- Snapshot and receipt deletion, and Redis stream trimming
 - Historical per-sequence authoritative hashes
 - Production OAuth
 - Invitations, share links, and full membership administration
