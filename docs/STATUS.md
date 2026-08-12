@@ -52,8 +52,12 @@ through 0008, the real snapshot repositories/coordinator and worker supervision,
 and a real authenticated BoardTransport. The accepted boundaries cover Redis-independent bootstrap,
 threshold capture, verified snapshot-plus-tail replay, one-attempt overflow refresh, corrupt-newest
 fallback, terminal blocked evidence, retryable lock contention, atomic/stale-session fencing, and
-snapshot/writer and duplicate-capture races. Compaction and recovery-floor advancement remain
+snapshot/writer and duplicate-capture races. Final destructive compaction acceptance remains
 deferred.
+
+Compaction coordination is wired into `apps/worker` but remains explicitly opt-in with
+`COMPACTION_ENABLED=true`. Final destructive compaction acceptance is still pending; M2.7 is not yet
+complete.
 
 ## Deferred by design
 

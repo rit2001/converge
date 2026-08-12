@@ -1,6 +1,16 @@
 import { DELIVERY_ENVELOPE_MAX_BYTES } from "@converge/protocol";
 import { z } from "zod";
 import {
+  COMPACTION_CANDIDATE_BATCH_SIZE_DEFAULT,
+  COMPACTION_CANDIDATE_SCAN_LIMIT_DEFAULT,
+  COMPACTION_MAX_CONCURRENCY_DEFAULT,
+  COMPACTION_POLL_INTERVAL_MS_DEFAULT,
+  COMPACTION_POLL_JITTER_PERCENT_DEFAULT,
+  COMPACTION_RETAINED_STATE_LIMIT_DEFAULT,
+  COMPACTION_RETRY_BASE_MS_DEFAULT,
+  COMPACTION_RETRY_CAP_MS_DEFAULT,
+} from "./compaction-coordinator.js";
+import {
   SNAPSHOT_BUSY_RETRY_MS_DEFAULT,
   SNAPSHOT_FAILURE_FINGERPRINT_LIMIT_DEFAULT,
   SNAPSHOT_MAX_CONCURRENCY_DEFAULT,
@@ -21,6 +31,10 @@ import {
 const TIMER_MAXIMUM_MS = 2_147_483_647;
 const positiveSafeInteger = z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const positiveTimerSafeInteger = z.coerce.number().int().min(1).max(TIMER_MAXIMUM_MS);
+const strictBoolean = z
+  .enum(["true", "false"])
+  .default("false")
+  .transform((value) => value === "true");
 
 const redisUrlSchema = z
   .string()
@@ -95,6 +109,34 @@ const environmentShape = {
   SNAPSHOT_FAILURE_FINGERPRINT_LIMIT: positiveSafeInteger
     .max(SNAPSHOT_FAILURE_FINGERPRINT_LIMIT_DEFAULT)
     .default(SNAPSHOT_FAILURE_FINGERPRINT_LIMIT_DEFAULT),
+  COMPACTION_ENABLED: strictBoolean,
+  COMPACTION_POLL_INTERVAL_MS: positiveTimerSafeInteger.default(
+    COMPACTION_POLL_INTERVAL_MS_DEFAULT,
+  ),
+  COMPACTION_POLL_JITTER_PERCENT: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(100)
+    .default(COMPACTION_POLL_JITTER_PERCENT_DEFAULT),
+  COMPACTION_CANDIDATE_SCAN_LIMIT: positiveSafeInteger
+    .max(COMPACTION_CANDIDATE_SCAN_LIMIT_DEFAULT)
+    .default(COMPACTION_CANDIDATE_SCAN_LIMIT_DEFAULT),
+  COMPACTION_CANDIDATE_BATCH_SIZE: positiveSafeInteger
+    .max(COMPACTION_CANDIDATE_BATCH_SIZE_DEFAULT)
+    .default(COMPACTION_CANDIDATE_BATCH_SIZE_DEFAULT),
+  COMPACTION_MAX_CONCURRENCY: positiveSafeInteger
+    .max(COMPACTION_MAX_CONCURRENCY_DEFAULT)
+    .default(COMPACTION_MAX_CONCURRENCY_DEFAULT),
+  COMPACTION_RETRY_BASE_MS: positiveTimerSafeInteger
+    .max(COMPACTION_RETRY_CAP_MS_DEFAULT)
+    .default(COMPACTION_RETRY_BASE_MS_DEFAULT),
+  COMPACTION_RETRY_CAP_MS: positiveTimerSafeInteger
+    .max(COMPACTION_RETRY_CAP_MS_DEFAULT)
+    .default(COMPACTION_RETRY_CAP_MS_DEFAULT),
+  COMPACTION_RETAINED_STATE_LIMIT: positiveSafeInteger
+    .max(COMPACTION_RETAINED_STATE_LIMIT_DEFAULT)
+    .default(COMPACTION_RETAINED_STATE_LIMIT_DEFAULT),
 } satisfies z.ZodRawShape;
 
 export const workerEnvironmentVariableNames = Object.freeze(Object.keys(environmentShape));
@@ -144,6 +186,34 @@ const environmentSchema = z.object(environmentShape).superRefine((environment, c
       code: z.ZodIssueCode.custom,
       path: ["SNAPSHOT_BUSY_RETRY_MS"],
       message: "Snapshot busy jitter exceeds the timer-safe interval",
+    });
+  if (environment.COMPACTION_CANDIDATE_BATCH_SIZE > environment.COMPACTION_CANDIDATE_SCAN_LIMIT)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["COMPACTION_CANDIDATE_BATCH_SIZE"],
+      message: "Compaction candidate batch cannot exceed the scan limit",
+    });
+  if (environment.COMPACTION_MAX_CONCURRENCY > environment.COMPACTION_CANDIDATE_BATCH_SIZE)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["COMPACTION_MAX_CONCURRENCY"],
+      message: "Compaction concurrency cannot exceed the candidate batch",
+    });
+  if (environment.COMPACTION_RETRY_BASE_MS > environment.COMPACTION_RETRY_CAP_MS)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["COMPACTION_RETRY_BASE_MS"],
+      message: "Compaction retry base cannot exceed its cap",
+    });
+  if (
+    environment.COMPACTION_POLL_INTERVAL_MS *
+      (1 + environment.COMPACTION_POLL_JITTER_PERCENT / 100) >
+    TIMER_MAXIMUM_MS
+  )
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["COMPACTION_POLL_INTERVAL_MS"],
+      message: "Compaction poll jitter exceeds the timer-safe interval",
     });
 });
 

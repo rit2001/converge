@@ -1,4 +1,6 @@
 import {
+  BoardCompactionCandidateRepository,
+  BoardCompactionRepository,
   BoardSnapshotCandidateRepository,
   OutboxRepository,
   createPool,
@@ -6,6 +8,12 @@ import {
 } from "@converge/database";
 import type { StructuredLogger } from "@converge/observability";
 import type { WorkerEnvironment } from "./env.js";
+import {
+  CompactionCoordinator,
+  type CompactionCandidateDiscoveryRepository,
+  type CompactionCoordinatorConfiguration,
+  type CompactionExecutionRepository,
+} from "./compaction-coordinator.js";
 import { createWorkerLogger } from "./logger.js";
 import { RedisDeliveryStream, type DeliveryStream } from "./redis-stream.js";
 import {
@@ -29,6 +37,11 @@ export interface SnapshotCoordinatorComponent {
   stop(): Promise<void>;
 }
 
+export interface CompactionCoordinatorComponent {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
 export interface OutboxPublisherComponent {
   run(signal: AbortSignal): Promise<void>;
   stopTakingClaims(): void;
@@ -44,6 +57,18 @@ export interface WorkerApplicationFactories {
     configuration: SnapshotCoordinatorConfiguration;
     logger: StructuredLogger;
   }): SnapshotCoordinatorComponent;
+  createCompactionCandidateRepository(
+    database: WorkerApplicationDatabase,
+  ): CompactionCandidateDiscoveryRepository;
+  createBoardCompactionRepository(
+    database: WorkerApplicationDatabase,
+  ): CompactionExecutionRepository;
+  createCompactionCoordinator(input: {
+    candidates: CompactionCandidateDiscoveryRepository;
+    compaction: CompactionExecutionRepository;
+    configuration: CompactionCoordinatorConfiguration;
+    logger: StructuredLogger;
+  }): CompactionCoordinatorComponent;
   createStream(input: { environment: WorkerEnvironment; logger: StructuredLogger }): DeliveryStream;
   createOutboxPublisher(input: {
     database: WorkerApplicationDatabase;
@@ -74,6 +99,28 @@ const productionWorkerApplicationFactories: WorkerApplicationFactories = {
           ),
       },
     }),
+  createCompactionCandidateRepository: (database) =>
+    new BoardCompactionCandidateRepository(database as DatabasePool),
+  createBoardCompactionRepository: (database) =>
+    new BoardCompactionRepository(database as DatabasePool),
+  createCompactionCoordinator: ({ candidates, compaction, configuration, logger }) =>
+    new CompactionCoordinator({
+      candidates,
+      compaction,
+      configuration,
+      hooks: {
+        compacted: (result) =>
+          logger.info(
+            { component: "compaction", ...result, outcome: "compacted" },
+            "Board history compacted",
+          ),
+        blocked: (result) =>
+          logger.error(
+            { component: "compaction", ...result, outcome: "blocked" },
+            "Board compaction was blocked",
+          ),
+      },
+    }),
   createStream: ({ environment, logger }) =>
     new RedisDeliveryStream(
       environment.REDIS_URL,
@@ -100,6 +147,7 @@ export class WorkerApplication {
   constructor(
     private readonly database: WorkerApplicationDatabase,
     private readonly snapshots: SnapshotCoordinatorComponent,
+    private readonly compaction: CompactionCoordinatorComponent | undefined,
     private readonly stream: DeliveryStream,
     private readonly outbox: OutboxPublisherComponent,
     private readonly reconnectDelayMs: number,
@@ -128,6 +176,8 @@ export class WorkerApplication {
       await this.database.query("SELECT 1");
       if (this.stopping) return;
       await this.snapshots.start();
+      if (this.stopping) return;
+      await this.compaction?.start();
       if (this.stopping) return;
       this.outboxRun = this.runOutbox();
       this.redisRun = this.maintainRedisConnection();
@@ -176,13 +226,15 @@ export class WorkerApplication {
     this.stopping = true;
     this.outbox.stopTakingClaims();
     this.controller.abort();
-    const [snapshotResult, outboxResult] = await Promise.allSettled([
+    const [snapshotResult, compactionResult, outboxResult] = await Promise.allSettled([
       this.snapshots.stop(),
+      this.compaction?.stop(),
       this.outbox.drain(this.shutdownGraceMs),
     ]);
     const outboxDrained = outboxResult.status === "fulfilled" && outboxResult.value;
     if (!outboxDrained) this.outbox.abandonActiveLeases();
-    const drained = snapshotResult.status === "fulfilled" && outboxDrained;
+    const compactionDrained = compactionResult.status === "fulfilled";
+    const drained = snapshotResult.status === "fulfilled" && compactionDrained && outboxDrained;
     this.logger.info(
       { component: "worker", signal, outcome: drained ? "drained" : "grace_expired" },
       "Worker shutdown",
@@ -214,6 +266,22 @@ function snapshotConfiguration(environment: WorkerEnvironment): SnapshotCoordina
   };
 }
 
+function compactionConfiguration(
+  environment: WorkerEnvironment,
+): CompactionCoordinatorConfiguration {
+  return {
+    pollIntervalMs: environment.COMPACTION_POLL_INTERVAL_MS,
+    pollJitterPercent: environment.COMPACTION_POLL_JITTER_PERCENT,
+    candidateScanLimit: environment.COMPACTION_CANDIDATE_SCAN_LIMIT,
+    candidateResultLimit: environment.COMPACTION_CANDIDATE_BATCH_SIZE,
+    maximumConcurrency: environment.COMPACTION_MAX_CONCURRENCY,
+    retryBaseMs: environment.COMPACTION_RETRY_BASE_MS,
+    retryCapMs: environment.COMPACTION_RETRY_CAP_MS,
+    retainedStateLimit: environment.COMPACTION_RETAINED_STATE_LIMIT,
+    shutdownGraceMs: environment.WORKER_SHUTDOWN_GRACE_MS,
+  };
+}
+
 function outboxConfiguration(environment: WorkerEnvironment): OutboxWorkerConfiguration {
   return {
     owner: environment.WORKER_ID ?? `worker-${crypto.randomUUID()}`,
@@ -235,6 +303,7 @@ export async function createWorkerApplication(
   const logger = factories.createLogger(environment.LOG_LEVEL);
   let database: WorkerApplicationDatabase | undefined;
   let snapshots: SnapshotCoordinatorComponent | undefined;
+  let compaction: CompactionCoordinatorComponent | undefined;
   let stream: DeliveryStream | undefined;
   try {
     database = factories.createDatabase(environment.DATABASE_URL);
@@ -243,6 +312,16 @@ export async function createWorkerApplication(
       configuration: snapshotConfiguration(environment),
       logger,
     });
+    if (environment.COMPACTION_ENABLED) {
+      const candidates = factories.createCompactionCandidateRepository(database);
+      const boardCompaction = factories.createBoardCompactionRepository(database);
+      compaction = factories.createCompactionCoordinator({
+        candidates,
+        compaction: boardCompaction,
+        configuration: compactionConfiguration(environment),
+        logger,
+      });
+    }
     stream = factories.createStream({ environment, logger });
     const outbox = factories.createOutboxPublisher({
       database,
@@ -253,6 +332,7 @@ export async function createWorkerApplication(
     return new WorkerApplication(
       database,
       snapshots,
+      compaction,
       stream,
       outbox,
       environment.OUTBOX_IDLE_POLL_MS,
@@ -261,7 +341,12 @@ export async function createWorkerApplication(
       factories.reconnectScheduler,
     );
   } catch (error) {
-    await Promise.allSettled([snapshots?.stop(), stream?.close(true), database?.end()]);
+    await Promise.allSettled([
+      compaction?.stop(),
+      snapshots?.stop(),
+      stream?.close(true),
+      database?.end(),
+    ]);
     throw error;
   }
 }

@@ -37,7 +37,26 @@ describe("worker environment", () => {
       SNAPSHOT_RETRY_CAP_MS: 300_000,
       SNAPSHOT_BUSY_RETRY_MS: 5_000,
       SNAPSHOT_FAILURE_FINGERPRINT_LIMIT: 1_000,
+      COMPACTION_ENABLED: false,
+      COMPACTION_POLL_INTERVAL_MS: 300_000,
+      COMPACTION_POLL_JITTER_PERCENT: 20,
+      COMPACTION_CANDIDATE_SCAN_LIMIT: 100,
+      COMPACTION_CANDIDATE_BATCH_SIZE: 16,
+      COMPACTION_MAX_CONCURRENCY: 2,
+      COMPACTION_RETRY_BASE_MS: 5_000,
+      COMPACTION_RETRY_CAP_MS: 300_000,
+      COMPACTION_RETAINED_STATE_LIMIT: 1_000,
     });
+  });
+
+  it("enables compaction only for the exact true string", () => {
+    expect(parseWorkerEnvironment({ ...required, COMPACTION_ENABLED: "true" })).toMatchObject({
+      COMPACTION_ENABLED: true,
+    });
+    for (const value of ["TRUE", "1", "yes", "on", "", "false "])
+      expect(() => parseWorkerEnvironment({ ...required, COMPACTION_ENABLED: value })).toThrowError(
+        new WorkerEnvironmentConfigurationError(["COMPACTION_ENABLED"]),
+      );
   });
 
   it("rejects unsafe concurrency, timing, size, and Redis URL values", () => {
@@ -56,6 +75,13 @@ describe("worker environment", () => {
       ["SNAPSHOT_MAX_PAYLOAD_BYTES", "16777217"],
       ["SNAPSHOT_RETRY_CAP_MS", "300001"],
       ["SNAPSHOT_FAILURE_FINGERPRINT_LIMIT", "1001"],
+      ["COMPACTION_POLL_INTERVAL_MS", "0"],
+      ["COMPACTION_POLL_JITTER_PERCENT", "101"],
+      ["COMPACTION_CANDIDATE_SCAN_LIMIT", "101"],
+      ["COMPACTION_CANDIDATE_BATCH_SIZE", "17"],
+      ["COMPACTION_MAX_CONCURRENCY", "3"],
+      ["COMPACTION_RETRY_CAP_MS", "300001"],
+      ["COMPACTION_RETAINED_STATE_LIMIT", "1001"],
     ];
     for (const [field, value] of invalidValues)
       expect(() => parseWorkerEnvironment({ ...required, [field]: value })).toThrowError(
@@ -89,17 +115,51 @@ describe("worker environment", () => {
         SNAPSHOT_RETRY_CAP_MS: "5000",
       }),
     ).toThrowError(new WorkerEnvironmentConfigurationError(["SNAPSHOT_RETRY_BASE_MS"]));
+    expect(() =>
+      parseWorkerEnvironment({
+        ...required,
+        COMPACTION_CANDIDATE_SCAN_LIMIT: "1",
+        COMPACTION_CANDIDATE_BATCH_SIZE: "2",
+      }),
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["COMPACTION_CANDIDATE_BATCH_SIZE"]));
+    expect(() =>
+      parseWorkerEnvironment({
+        ...required,
+        COMPACTION_CANDIDATE_BATCH_SIZE: "1",
+        COMPACTION_MAX_CONCURRENCY: "2",
+      }),
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["COMPACTION_MAX_CONCURRENCY"]));
+    expect(() =>
+      parseWorkerEnvironment({
+        ...required,
+        COMPACTION_RETRY_BASE_MS: "5001",
+        COMPACTION_RETRY_CAP_MS: "5000",
+      }),
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["COMPACTION_RETRY_BASE_MS"]));
+    expect(() =>
+      parseWorkerEnvironment({
+        ...required,
+        COMPACTION_POLL_INTERVAL_MS: "2147483647",
+        COMPACTION_POLL_JITTER_PERCENT: "20",
+      }),
+    ).toThrowError(new WorkerEnvironmentConfigurationError(["COMPACTION_POLL_INTERVAL_MS"]));
   });
 
   it("reports only field names for secret-bearing configuration errors", () => {
     const secret = "never-log-this-secret";
     let message = "";
     try {
-      parseWorkerEnvironment({ DATABASE_URL: `invalid-${secret}`, REDIS_URL: `invalid-${secret}` });
+      parseWorkerEnvironment({
+        DATABASE_URL: `invalid-${secret}`,
+        REDIS_URL: `invalid-${secret}`,
+        COMPACTION_ENABLED: secret,
+      });
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    expect(message).toBe("Invalid worker environment configuration: DATABASE_URL, REDIS_URL");
+    expect(message).toBe(
+      "Invalid worker environment configuration: COMPACTION_ENABLED, DATABASE_URL, REDIS_URL",
+    );
     expect(message).not.toContain(secret);
   });
 
@@ -131,5 +191,34 @@ describe("worker environment", () => {
 
     expect(snapshotNames).toHaveLength(13);
     for (const name of snapshotNames) expect(entries.get(name)).toBe(String(parsed[name]));
+  });
+
+  it("documents and forwards every compaction variable with its parsed default", async () => {
+    const [example, turboSource] = await Promise.all([
+      readFile(new URL("../../../.env.example", import.meta.url), "utf8"),
+      readFile(new URL("../../../turbo.json", import.meta.url), "utf8"),
+    ]);
+    const entries = new Map(
+      example
+        .split("\n")
+        .filter((line) => line && !line.startsWith("#"))
+        .map((line) => {
+          const separator = line.indexOf("=");
+          return [line.slice(0, separator), line.slice(separator + 1)] as const;
+        }),
+    );
+    const passThrough = new Set(
+      (JSON.parse(turboSource) as { globalPassThroughEnv: string[] }).globalPassThroughEnv,
+    );
+    const parsed = parseWorkerEnvironment(required);
+    const compactionNames = workerEnvironmentVariableNames.filter((name) =>
+      name.startsWith("COMPACTION_"),
+    ) as Array<keyof typeof parsed>;
+
+    expect(compactionNames).toHaveLength(9);
+    for (const name of compactionNames) {
+      expect(entries.get(name)).toBe(String(parsed[name]));
+      expect(passThrough.has(name)).toBe(true);
+    }
   });
 });
