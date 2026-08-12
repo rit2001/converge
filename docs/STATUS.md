@@ -65,6 +65,14 @@ duplicate coordinators, transient retry, and idempotent later progress. Compacti
 opt-in with `COMPACTION_ENABLED=true`; snapshot/receipt deletion, Redis trimming, deployment, backup
 validation, and benchmarks remain deferred.
 
+## Milestone 2.8 observability status
+
+The provider-neutral bounded telemetry contract now exists in `packages/observability`, including a
+fixed low-cardinality metric catalog, bounded structured diagnostic events, no-op and deterministic
+in-memory recorders, immutable export snapshots, explicit error classification, and telemetry
+failure isolation. Production API/worker instrumentation, exporter and health endpoints, dashboards,
+alert thresholds, deployment integration, and final M2.8 acceptance remain pending.
+
 ## Deferred by design
 
 - Production activation of transactional-outbox dispatch (the repository, worker publisher, and

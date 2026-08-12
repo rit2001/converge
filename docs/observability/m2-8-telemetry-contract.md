@@ -1,0 +1,79 @@
+# M2.8 bounded telemetry contract
+
+This contract defines provider-neutral telemetry primitives. Domain code receives an injected
+recorder; it does not depend on Prometheus, OpenTelemetry, a SaaS provider, or a process-global
+registry. API and worker production-path instrumentation is intentionally deferred to later M2.8
+slices.
+
+## Metric catalog
+
+Metric names, types, labels, label values, and histogram buckets are fixed at compile time. A
+recorder rejects unknown names, missing or extra labels, unknown label values, type/name mismatches,
+and invalid numbers. It never creates a metric dynamically.
+
+| Metric                                         | Type                           | Labels                                                                                                           |
+| ---------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `converge_delivery_events_total`               | Counter                        | `event_type=operation\|membership_revoked`, `outcome=handled\|duplicate\|quarantined\|failed`                    |
+| `converge_delivery_state_transitions_total`    | Counter                        | `source=consumer\|watchdog\|socket_readiness`, `state=established\|unavailable\|recovering\|recovered\|terminal` |
+| `converge_outbox_publications_total`           | Counter                        | `outcome=published\|retry\|blocked\|stale`                                                                       |
+| `converge_snapshot_runs_total`                 | Counter                        | `outcome=captured\|busy\|no_progress\|deterministic_failure\|transient_failure`                                  |
+| `converge_compaction_runs_total`               | Counter                        | `outcome=compacted\|no_progress\|no_boundary\|blocked\|transient_failure`                                        |
+| `converge_recovery_requests_total`             | Counter                        | `outcome=snapshot_tail\|refreshed\|recovery_blocked\|retryable_failure\|authorization_failure`                   |
+| `converge_outbox_publication_duration_seconds` | Histogram                      | None                                                                                                             |
+| `converge_snapshot_duration_seconds`           | Histogram                      | None                                                                                                             |
+| `converge_compaction_duration_seconds`         | Histogram                      | None                                                                                                             |
+| `converge_recovery_duration_seconds`           | Histogram                      | None                                                                                                             |
+| `converge_socket_ready`                        | Binary gauge                   | None                                                                                                             |
+| `converge_delivery_consumer_ready`             | Binary gauge                   | None                                                                                                             |
+| `converge_outbox_active_work`                  | Nonnegative safe-integer gauge | None                                                                                                             |
+| `converge_snapshot_active_work`                | Nonnegative safe-integer gauge | None                                                                                                             |
+| `converge_compaction_active_work`              | Nonnegative safe-integer gauge | None                                                                                                             |
+
+Counters accept positive finite increments. Histograms accept nonnegative finite seconds and use
+immutable cumulative buckets at `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`,
+`5`, `10`, `30`, `60`, `120`, and `300` seconds. Readiness gauges accept only zero or one;
+active-work gauges accept nonnegative safe integers.
+
+Metric labels never contain board, principal, operation, event, snapshot, socket, Redis-entry, or
+instance identifiers. Error messages, URLs, SQL, and any caller-defined label are forbidden.
+
+## Structured diagnostic events
+
+The bounded event catalog is:
+
+- `delivery.consumer.lifecycle`
+- `delivery.cursor_lost`
+- `delivery.board_quarantined`
+- `delivery.watchdog.divergence`
+- `socket.readiness.changed`
+- `outbox.publication.result`
+- `snapshot.capture.result`
+- `compaction.result`
+- `recovery.request.result`
+- `worker.lifecycle`
+- `api.lifecycle`
+
+Every event has schema version 1, a catalog event name, severity, event-compatible component,
+canonical injected timestamp, and a bounded machine code. Each event has its own correlation-key
+allowlist drawn from `boardId`, `eventId`, `operationId`, `snapshotId`, `socketId`, `redisEntryId`, and
+`correlationId`. Values are control-character sanitized and length bounded. Unknown fields and
+event-inappropriate identifiers are rejected.
+
+Events never contain board contents, commands, envelopes, snapshot or operation payloads,
+credentials, tokens, database/Redis URLs, principal display names, SQL, raw exceptions, or stack
+traces. Error conversion is explicit: classified failures expose a bounded machine code; unexpected
+failures expose only `UNEXPECTED_ERROR` and an internal correlation ID.
+
+## Recording, export, and failure isolation
+
+The no-op recorder is safe for production defaults and never throws. The deterministic in-memory
+recorder retains only the finite metric catalog and a configurable positive bounded number of events;
+event eviction is oldest first. Snapshots contain sorted immutable copies, cumulative histogram
+buckets, counter totals, gauges, and retained events. Caller mutation cannot alter recorder state.
+
+The safe recorder wrapper contains synchronous throws and asynchronous rejections. One bounded
+fallback notification may run for each failed telemetry call; fallback failures are suppressed.
+Telemetry therefore cannot change delivery, recovery, snapshot, compaction, or other domain results.
+
+Prometheus or health endpoints, production API/worker instrumentation, dashboards, alert thresholds,
+external collectors, deployment integration, and benchmark claims remain explicitly deferred.

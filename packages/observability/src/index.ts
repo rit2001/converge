@@ -21,3 +21,5 @@ export const noOpTracer: Tracer = {
     end: () => undefined,
   }),
 };
+
+export * from "./telemetry.js";
