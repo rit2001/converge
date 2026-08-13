@@ -15,10 +15,23 @@ import {
   type BoardSessionToken,
 } from "../board-session";
 import { useBoardStore } from "../board-store";
+import type { SynchronizationStatus } from "../board-store";
 import { indexedDbPendingOperationStore } from "../pending-db";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
+import { Button, StatusPill } from "./ui/primitives";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
+
+function connectionTone(
+  status: SynchronizationStatus,
+): "success" | "warning" | "danger" | "reconnecting" | "recovering" | "unavailable" {
+  if (status === "ready") return "success";
+  if (status === "catching-up") return "recovering";
+  if (status === "connecting" || status === "joining" || status === "retry-wait")
+    return "reconnecting";
+  if (status === "authorization-failed" || status === "error") return "danger";
+  return "unavailable";
+}
 
 function commandBase(boardId: string, clientId: string, targetId: string, lastSeq: number) {
   return {
@@ -186,13 +199,20 @@ export function Workspace(): React.JSX.Element {
             <span>{store.name}</span>
           </div>
         </div>
-        <div className="connection">
-          <i className={store.connection} />
-          {store.connection}
-        </div>
-        <button className="avatar" title="Development identity">
+        <StatusPill
+          className="connection"
+          label={store.connection}
+          tone={connectionTone(store.connection)}
+          accessibleLabel={`Synchronization status: ${store.connection}`}
+        />
+        <Button
+          variant="ghost"
+          className="avatar"
+          aria-label="Development identity"
+          title="Development identity"
+        >
           LD
-        </button>
+        </Button>
       </header>
       <aside className="toolbar" aria-label="Canvas tools">
         <button

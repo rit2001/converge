@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { PortalRoots } from "../src/components/ui/portal-roots";
 import "./styles.css";
 
 export const metadata: Metadata = {
@@ -11,7 +12,10 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>): React.JSX.Element {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <div id="application-root">{children}</div>
+        <PortalRoots />
+      </body>
     </html>
   );
 }

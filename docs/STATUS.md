@@ -118,8 +118,10 @@ capacity, scalability, deployment, or 10,000-user claim is currently supported.
 
 The premium product experience architecture, original product language, frontend layering/motion
 decision, accessibility and performance budgets, durable Layers-panel capability audit, and eight
-independently reviewable implementation slices are defined. This is architecture and UX planning
-only: no M3 production code, dependency, protocol, database, route, or deployment change has begun.
-Visual direction, typography/icon sourcing, theme timing, responsive editing policy, authentication,
-presence, durable reorder, member/share, and version-history scope require the approvals recorded in
-the M3 architecture before their applicable slices start.
+independently reviewable implementation slices are defined. M3.1 now establishes the light-theme
+semantic token system, dark-compatible token values, reduced-motion and forced-color policies,
+centralized workspace layers and portal hosts, accessible UI primitives, and tokenized existing
+workspace connection chrome. It adds no dependency and changes no synchronization, protocol,
+database, canvas-authority, route, or deployment behavior. Complete workspace composition, landing
+and board-entry surfaces, canvas-tool redesign, collaboration presence, product dialogs, theme
+switching, responsive policy, and performance acceptance remain in M3.2–M3.8.

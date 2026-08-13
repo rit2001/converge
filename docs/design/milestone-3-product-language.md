@@ -41,6 +41,13 @@ Tokens must support light and dark from M3.1. Human approval chooses either:
 Theme switching must not reconstruct the board session or Konva stage. Persist only the preference,
 not board data. Canvas object colors remain content and are not automatically inverted.
 
+M3.1 resolves the initial delivery choice in favor of a polished light shipping theme. The semantic
+token contract includes dark-compatible values, but no automatic activation or theme switcher is
+shipped in this slice. The existing privacy-safe system font stack remains in use and no icon, font,
+animation, or UI-framework dependency is added. Alpha is limited to focus rings, subtle selection,
+shadows, and small floating chrome where the opaque fallback preserves contrast; large editor
+surfaces and authoritative state indicators remain opaque.
+
 ## Surface language
 
 ### Public and board entry
