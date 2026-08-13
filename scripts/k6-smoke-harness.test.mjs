@@ -3,7 +3,9 @@ import test from "node:test";
 import {
   CleanupStack,
   assertSanitizedArtifact,
+  collectPostFailureEvidence,
   durableEvidenceSql,
+  readK6FailureDiagnostic,
   runWithOwnedCleanup,
   validateDurableEvidence,
   validateEnvironmentArtifact,
@@ -39,6 +41,21 @@ test("accepts only the required sanitized environment metadata", () => {
     profile: "smoke",
     virtualUsers: 2,
     duration: "30s",
+    apiReplicas: 1,
+    workerReplicas: 1,
+    configuration: { delivery: "distributed", transport: "socket.io-v4" },
+  });
+  validateEnvironmentArtifact({
+    timestampUtc: "2026-08-13T00:00:00.000Z",
+    gitCommitSha: "b".repeat(40),
+    k6Version: "0.57.0",
+    nodeVersion: "22.18.0",
+    pnpmVersion: "10.15.0",
+    os: "darwin",
+    architecture: "arm64",
+    profile: "baseline",
+    virtualUsers: 10,
+    duration: "2m",
     apiReplicas: 1,
     workerReplicas: 1,
     configuration: { delivery: "distributed", transport: "socket.io-v4" },
@@ -88,6 +105,40 @@ test("propagates nonzero k6 status and threshold failures", async () => {
   const failed = passingSummary();
   failed.metrics.converge_command_ack_duration.thresholds.gate = true;
   assert.throws(() => validateK6Summary(failed), /k6 threshold failed/);
+});
+
+test("nonzero k6 status retains fixed diagnostics without hiding the original failure", async () => {
+  const originalFailure = new Error("workload failed");
+  const summary = {
+    metrics: {
+      iterations: { count: 40 },
+      converge_iteration_failures: { passes: 1 },
+      converge_protocol_failures: { passes: 0 },
+      converge_sequence_gaps: { count: 0 },
+      converge_commands_acknowledged: { count: 400 },
+      converge_live_events_received: { count: 790 },
+      converge_duplicate_events: { count: 12 },
+    },
+  };
+  assert.deepEqual(readK6FailureDiagnostic(summary), {
+    iterations: 40,
+    iterationFailures: 1,
+    protocolFailures: 0,
+    sequenceGaps: 0,
+    acknowledgements: 400,
+    liveEvents: 790,
+    transportDuplicates: 12,
+  });
+  const collected = await collectPostFailureEvidence(originalFailure, async () => ({
+    operations: 400,
+  }));
+  assert.strictEqual(collected.originalFailure, originalFailure);
+  assert.deepEqual(collected.evidence, { operations: 400 });
+  const unavailable = await collectPostFailureEvidence(originalFailure, async () => {
+    throw new Error("diagnostic query failed");
+  });
+  assert.strictEqual(unavailable.originalFailure, originalFailure);
+  assert.equal(unavailable.collectionFailed, true);
 });
 
 test("accepts observed and suppressed transport duplicates without logical reapplication", () => {
@@ -155,6 +206,25 @@ test("rejects durable operation or outbox evidence that exceeds distinct command
       validateDurableEvidence({ ...evidence, operations: 4, distinctOperations: 4, outbox: 5 }, 4),
     /logical reapplication/,
   );
+});
+
+test("accepts growing durable evidence with a bounded projection plateau", () => {
+  const evidence = {
+    lastSequence: 40,
+    deliveryHead: 40,
+    operations: 40,
+    distinctOperations: 40,
+    objects: 2,
+    outbox: 40,
+    distinctOutboxEvents: 40,
+    published: 40,
+    handled: 40,
+    identityMismatches: 0,
+    invalidPublicationIds: 0,
+    invalidPublishedState: 0,
+  };
+  assert.equal(validateDurableEvidence(evidence, 40, 2).logicalReapplications, 0);
+  assert.throws(() => validateDurableEvidence({ ...evidence, objects: 3 }, 40, 2));
 });
 
 test("durable evidence SQL uses only current relational and envelope columns", () => {

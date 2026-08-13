@@ -3,9 +3,11 @@ import test from "node:test";
 import {
   K6_ALLOWED_TAGS,
   K6_METRIC_NAMES,
+  K6_SUMMARY_TREND_STATS,
   parseWorkloadConfig,
   workloadOptions,
 } from "./config.js";
+import { deterministicUuid } from "./identity.js";
 import {
   classifyTimeout,
   createDeliveryTracker,
@@ -180,6 +182,49 @@ test("parses the direct API snapshot body into fresh iteration-owned state", () 
   );
 });
 
+test("create-only growth crosses the configured snapshot response-byte boundary", () => {
+  const limit = 131_072;
+  const objects = [];
+  let below;
+  let oversized;
+  for (let index = 1; index <= 1_024; index += 1) {
+    const id = deterministicUuid("object", 1, index, 1);
+    objects.push({
+      id,
+      kind: "rectangle",
+      x: 40,
+      y: 40,
+      width: 160,
+      height: 100,
+      rotation: 0,
+      fill: "#818cf8",
+      text: "",
+    });
+    const body = JSON.stringify({ id: ids.board, name: "bounded", lastSeq: index, objects });
+    if (body.length <= limit) below = body;
+    else {
+      oversized = body;
+      break;
+    }
+  }
+  assert.ok(below);
+  assert.ok(oversized);
+  assert.doesNotThrow(() => parseHttpJsonBody(below, limit, "SNAPSHOT_JSON"));
+  assert.throws(() => parseHttpJsonBody(oversized, limit, "SNAPSHOT_JSON"), {
+    code: "SNAPSHOT_JSON",
+  });
+  const boundedCode = "RECOVERY_JSON";
+  const sensitiveOversizedInput = `private-token${"x".repeat(limit)}`;
+  assert.throws(
+    () => parseHttpJsonBody(sensitiveOversizedInput, limit, boundedCode),
+    (error) => {
+      assert.equal(error.code, boundedCode);
+      assert.doesNotMatch(error.message, /private-token/);
+      return true;
+    },
+  );
+});
+
 test("parses live operations and detects duplicates without double application", () => {
   const parsed = parseSocketPacket(
     `42${JSON.stringify(["operation:committed", operation(1)])}`,
@@ -321,12 +366,21 @@ test("validates safe profiles explicit stateful configuration and remote opt-in"
   assert.equal(smoke.duration, "30s");
   assert.equal(smoke.commandsPerClient, 2);
   assert.deepEqual(workloadOptions(smoke).systemTags, []);
+  assert.deepEqual(workloadOptions(smoke).summaryTrendStats, [
+    "avg",
+    "min",
+    "max",
+    "p(50)",
+    "p(95)",
+    "p(99)",
+  ]);
   assert.deepEqual(
     workloadOptions(parseWorkloadConfig({ ...base, CONVERGE_DEBUG_PHASES: "true" })),
     {
       vus: 1,
       iterations: 1,
       systemTags: [],
+      summaryTrendStats: K6_SUMMARY_TREND_STATS,
       thresholds: workloadOptions(smoke).thresholds,
     },
   );
@@ -392,6 +446,22 @@ test("validates safe profiles explicit stateful configuration and remote opt-in"
   const baseline = parseWorkloadConfig({ ...base, CONVERGE_PROFILE: "baseline" });
   assert.equal(baseline.vus, 10);
   assert.equal(baseline.duration, "2m");
+  assert.equal(baseline.workloadModel, "bounded");
+  assert.equal(smoke.workloadModel, "create-only");
+  const scaleStep = parseWorkloadConfig({ ...base, CONVERGE_PROFILE: "scale-step" });
+  const debug = parseWorkloadConfig({ ...base, CONVERGE_DEBUG_PHASES: "true" });
+  for (const config of [smoke, baseline, scaleStep, debug])
+    assert.strictEqual(workloadOptions(config).summaryTrendStats, K6_SUMMARY_TREND_STATS);
+  assert.equal(Object.isFrozen(K6_SUMMARY_TREND_STATS), true);
+  assert.throws(() => K6_SUMMARY_TREND_STATS.push("p(100)"), TypeError);
+  assert.deepEqual(workloadOptions(baseline).summaryTrendStats, [
+    "avg",
+    "min",
+    "max",
+    "p(50)",
+    "p(95)",
+    "p(99)",
+  ]);
   assert.equal(
     parseWorkloadConfig({ ...base, CONVERGE_PROFILE: "scale-step" }).stages.at(-1).target,
     0,
@@ -443,7 +513,7 @@ test("validates safe profiles explicit stateful configuration and remote opt-in"
 
 test("keeps the custom metric and tag catalogs fixed and low-cardinality", () => {
   assert.equal(K6_METRIC_NAMES.length, 10);
-  assert.deepEqual(K6_ALLOWED_TAGS, ["profile", "operation_type", "outcome"]);
+  assert.deepEqual(K6_ALLOWED_TAGS, ["profile", "operation_type", "outcome", "reason"]);
   assert.doesNotMatch(
     JSON.stringify(K6_ALLOWED_TAGS),
     /board|principal|user|operation_id|event_id|socket|redis|sequence|url|error_message/i,

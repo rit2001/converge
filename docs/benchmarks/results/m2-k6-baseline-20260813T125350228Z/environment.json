@@ -1,0 +1,26 @@
+{
+  "timestampUtc": "2026-08-13T12:53:50.228Z",
+  "gitCommitSha": "cef2dd96db35a3fe66e1ab62e319f74d52fd0f62",
+  "k6Version": "0.57.0",
+  "nodeVersion": "22.23.1",
+  "pnpmVersion": "10.15.0",
+  "os": "darwin",
+  "architecture": "arm64",
+  "profile": "baseline",
+  "virtualUsers": 10,
+  "duration": "2m",
+  "apiReplicas": 1,
+  "workerReplicas": 1,
+  "configuration": {
+    "k6ImageDigest": "sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b",
+    "apiDeliveryMode": "distributed",
+    "protocol": "Engine.IO v4 / Socket.IO v4",
+    "database": "disposable PostgreSQL migrated through 0009",
+    "redis": "test-owned isolated delivery stream",
+    "compactionEnabled": false,
+    "workloadModel": "one stable object per VU with object.update mutations",
+    "commandsPerIteration": 10,
+    "projectionObjects": 10,
+    "maximumSnapshotResponseBytes": 131072
+  }
+}

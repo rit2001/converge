@@ -1,8 +1,8 @@
 # M2 k6 collaboration workload methodology
 
-This document defines a reproducible workload contract for a later controlled benchmark. It contains
-no benchmark result and makes no throughput, latency, concurrency, capacity, or 10,000-client claim.
-The profiles and thresholds are engineering inputs that must be validated by an execution slice.
+This document defines the reproducible workload contract used by the isolated correctness smoke and
+one controlled local baseline. The recorded baseline is evidence for that exact topology and profile;
+it is not a throughput-capacity, scalability, production, or 10,000-client claim.
 
 ## Protocol compatibility and workload model
 
@@ -17,8 +17,9 @@ Each virtual user:
 
 1. opens a WebSocket-only Engine.IO v4 connection and authenticates the Socket.IO namespace with the
    configured opaque token;
-2. joins one existing authorized board with a stable per-VU client ID;
-3. submits bounded `object.create` commands with stable per-VU operation and target IDs;
+2. joins one existing authorized board with fresh connection-local synchronization state;
+3. in smoke, submits create-only commands; in baseline, creates one stable object per VU and then
+   submits `object.update` mutations with unique command/operation identities;
 4. validates the committed acknowledgement against its local board and operation evidence;
 5. accepts ordered live delivery, detects duplicate logical operations without applying them twice,
    and rejects silent sequence gaps or regressions;
@@ -38,8 +39,9 @@ value is informational and is not itself a capacity or reliability failure. A lo
 is different: applying one logical operation twice, completing one command twice, accepting
 conflicting duplicate evidence, or creating extra durable operation/outbox state is a correctness
 failure. Smoke acceptance requires zero logical reapplications, proven by bounded lifecycle
-accounting and equality of distinct commands, durable operation rows, outbox events, projection and
-delivery heads, publications, and API consumer progress—not by requiring zero duplicate arrivals.
+accounting and equality of distinct commands, durable operation rows, outbox events, canvas/delivery
+heads, publications, and API consumer progress—not by requiring zero duplicate arrivals. Baseline
+projection cardinality instead plateaus at the number of initialized VUs while durable history grows.
 
 ## Safe profiles
 
@@ -99,7 +101,8 @@ Custom metric names are fixed:
 - counters: `converge_duplicate_events`, `converge_sequence_gaps`,
   `converge_commands_acknowledged`, `converge_live_events_received`.
 
-Only `profile`, `operation_type`, and `outcome` may be attached by the workload. Board, principal,
+Only `profile`, `operation_type`, `outcome`, and a fixed allowlisted failure `reason` may be attached
+by the workload. Board, principal,
 operation, event, socket, Redis-entry and sequence identifiers, URLs, and error messages are forbidden
 as tags. k6 system tags are disabled so built-in WebSocket and catch-up HTTP metrics cannot introduce
 URL or per-client cardinality.
@@ -113,7 +116,7 @@ Initial pre-benchmark thresholds are:
 - socket connection p99 below 5 seconds; and
 - board join acknowledgement p99 below 5 seconds.
 
-These gates have not yet been achieved in a controlled run. A protocol mismatch, authentication or
+These gates passed for the recorded isolated smoke and controlled local baseline. A protocol mismatch, authentication or
 join failure, uncorrelated acknowledgement, invalid committed identity, malformed live event,
 unresolved gap, failed catch-up, timeout, or unexpected disconnect is not counted as success.
 
@@ -126,13 +129,14 @@ database and Redis topology; delivery mode; profile and sanitized overrides; boa
 and whether any dependency was shared. Tokens, URLs with hosts, identifiers, commands, payloads, and
 raw frames must be excluded from artifacts.
 
-Every controlled measurement must include a separately labeled warm-up that is excluded from the
-measured window. The execution slice will choose and record warm-up length based on connection and
-runtime stabilization, then hold topology and workload constant during a declared measured window.
-Aborted, threshold-failing, or correctness-failing runs remain evidence but cannot support a capacity
-claim.
+The recorded baseline measured its complete two-minute preset and did not include a separately
+excluded warm-up window; that is an explicit limitation of this single run. Any future comparative
+or repeated study must define a separately labeled warm-up based on connection/runtime stabilization,
+exclude it from the measured window, and then hold topology and workload constant. Aborted,
+threshold-failing, or correctness-failing runs remain diagnostic evidence but cannot support a
+capacity claim.
 
-The planned artifact is a versioned directory containing sanitized run metadata, the exact command
-shape without secrets, k6 JSON summary output, threshold/correctness status, aggregate metric output,
-and operator notes. Raw application payloads and identifiers are never artifacts. Artifact schema,
-actual execution, scale results, and publication remain deferred.
+Accepted artifacts are versioned directories containing sanitized run metadata, k6 JSON summary
+output, threshold/correctness status, aggregate evidence, and operator notes. Raw application
+payloads and identifiers are never artifacts. The controlled baseline result is recorded at
+`docs/benchmarks/results/m2-k6-baseline-20260813T125350228Z/`. Scale results remain deferred.

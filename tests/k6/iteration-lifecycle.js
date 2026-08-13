@@ -75,10 +75,25 @@ export const ITERATION_FAILURE_REASONS = Object.freeze([
   "command_schedule_failed",
   "premature_terminal",
   "unknown_internal_state",
+  "connection_timeout",
+  "authentication_failed",
+  "iteration_deadline",
+  "graceful_close_failed",
+  "cleanup_failed",
+  "stale_lifecycle",
+  "infrastructure_failure",
 ]);
 
 export function classifyIterationFailure(error, context = {}) {
   const code = typeof error?.code === "string" ? error.code : "";
+  if (code === "CONNECT_TIMEOUT") return "connection_timeout";
+  if (code.startsWith("CONNECT_")) return "authentication_failed";
+  if (code === "WEBSOCKET_ERROR") return "infrastructure_failure";
+  if (code === "ITERATION_DEADLINE") return "iteration_deadline";
+  if (code === "GRACEFUL_CLOSE_FAILED") return "graceful_close_failed";
+  if (code === "CLEANUP_FAILED") return "cleanup_failed";
+  if (code === "STALE_LIFECYCLE") return "stale_lifecycle";
+  if (code === "INFRASTRUCTURE_FAILURE") return "infrastructure_failure";
   if (code.startsWith("CATCHUP_")) return code.toLowerCase();
   if (code.startsWith("SNAPSHOT_")) {
     const reason = code.toLowerCase();
@@ -90,7 +105,7 @@ export function classifyIterationFailure(error, context = {}) {
   if (code === "DELIVERY_SEQUENCE_REGRESSION") return "delivery_sequence_regression";
   if (code === "FUTURE_OPERATION_BUFFER_OVERFLOW") return "reconciliation_unknown";
   if (code === "JOIN_ACK_TIMEOUT") return "join_timeout";
-  if (code.startsWith("JOIN_") || code.startsWith("CONNECT_")) return "join_rejected";
+  if (code.startsWith("JOIN_")) return "join_rejected";
   if (code === "COMMAND_ACK_TIMEOUT") return "command_ack_timeout";
   if (code.startsWith("COMMAND_ACK_") || code === "ACK_UNCORRELATED") return "command_ack_mismatch";
   if (code.startsWith("COMMAND_")) return "command_rejected";
@@ -120,6 +135,18 @@ export function classifyIterationFailure(error, context = {}) {
   if (context.phase === "command_scheduled")
     return context.activeCommand ? "command_schedule_failed" : "active_command_missing";
   return "unknown_internal_state";
+}
+
+export function classifyPostConnectState(responseStatus, phase, lifecycle) {
+  const complete =
+    lifecycle?.terminal === true &&
+    phase === "closed" &&
+    lifecycle.attempted === lifecycle.acknowledged &&
+    lifecycle.attempted === lifecycle.delivered;
+  if (complete) return undefined;
+  if (responseStatus !== 101) return "infrastructure_failure";
+  if (lifecycle?.terminal !== true) return "stale_lifecycle";
+  return undefined;
 }
 
 export function createPreJoinDeliveryBuffer(maximumEntries) {
@@ -153,6 +180,14 @@ export function matchesActiveCommand(activeOperationId, deliveredOperationId) {
     typeof activeOperationId === "string" &&
     activeOperationId.length > 0 &&
     activeOperationId === deliveredOperationId
+  );
+}
+
+export function shouldRunCommandTimeout(scheduledOperationId, activeCommand, settledField) {
+  return (
+    activeCommand !== undefined &&
+    matchesActiveCommand(scheduledOperationId, activeCommand.value?.opId) &&
+    activeCommand[settledField] !== true
   );
 }
 

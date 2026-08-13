@@ -66,8 +66,13 @@ export function validateEnvironmentArtifact(value) {
   ];
   if (Object.keys(value).sort().join("|") !== required.sort().join("|"))
     throw new Error("Benchmark environment metadata has an unexpected shape");
-  if (value.profile !== "smoke" || value.virtualUsers !== 2 || value.duration !== "30s")
-    throw new Error("Benchmark environment metadata is not the smoke preset");
+  const preset =
+    value.profile === "smoke" && value.virtualUsers === 2 && value.duration === "30s"
+      ? "smoke"
+      : value.profile === "baseline" && value.virtualUsers === 10 && value.duration === "2m"
+        ? "baseline"
+        : undefined;
+  if (!preset) throw new Error("Benchmark environment metadata is not an approved preset");
   assertSanitizedArtifact(value);
 }
 
@@ -106,7 +111,33 @@ export function validateK6Summary(summary) {
   };
 }
 
-export function validateDurableEvidence(evidence, distinctCommands) {
+export function readK6FailureDiagnostic(summary) {
+  const metrics = summary?.metrics ?? {};
+  const value = (name, field) => Number(metrics[name]?.[field] ?? 0);
+  return Object.freeze({
+    iterations: value("iterations", "count"),
+    iterationFailures: value("converge_iteration_failures", "passes"),
+    protocolFailures: value("converge_protocol_failures", "passes"),
+    sequenceGaps: value("converge_sequence_gaps", "count"),
+    acknowledgements: value("converge_commands_acknowledged", "count"),
+    liveEvents: value("converge_live_events_received", "count"),
+    transportDuplicates: value("converge_duplicate_events", "count"),
+  });
+}
+
+export async function collectPostFailureEvidence(originalFailure, collector) {
+  try {
+    return Object.freeze({ originalFailure, evidence: await collector(), collectionFailed: false });
+  } catch {
+    return Object.freeze({ originalFailure, evidence: undefined, collectionFailed: true });
+  }
+}
+
+export function validateDurableEvidence(
+  evidence,
+  distinctCommands,
+  expectedObjects = distinctCommands,
+) {
   if (!Number.isSafeInteger(distinctCommands) || distinctCommands < 0)
     throw new Error("Distinct command evidence is invalid");
   const required = [
@@ -129,7 +160,6 @@ export function validateDurableEvidence(evidence, distinctCommands) {
     "deliveryHead",
     "operations",
     "distinctOperations",
-    "objects",
     "outbox",
     "distinctOutboxEvents",
     "published",
@@ -137,6 +167,7 @@ export function validateDurableEvidence(evidence, distinctCommands) {
   ];
   if (
     converged.some((name) => evidence[name] !== distinctCommands) ||
+    evidence.objects !== expectedObjects ||
     evidence.operations !== evidence.distinctOperations ||
     evidence.outbox !== evidence.distinctOutboxEvents ||
     evidence.identityMismatches !== 0 ||

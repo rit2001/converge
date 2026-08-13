@@ -25,8 +25,17 @@ const workloadVariables = [
   "CONVERGE_DEBUG_REPEAT",
   "CONVERGE_DEBUG_CONCURRENT",
   "CONVERGE_DEBUG_SEQUENTIAL",
+  "CONVERGE_DEBUG_BOUNDED_ONE",
+  "CONVERGE_DEBUG_BOUNDED_TWO",
+  "CONVERGE_DEBUG_BOUNDED_TEN",
+  "CONVERGE_DEBUG_FAILURES",
 ];
 const debugOnce = process.env.CONVERGE_K6_DEBUG_ONCE === "true";
+const profile = process.env.CONVERGE_PROFILE ?? "smoke";
+if (profile !== "smoke" && profile !== "baseline") {
+  process.stderr.write("The guarded runner supports only smoke and baseline profiles.\n");
+  process.exit(1);
+}
 
 if (
   summaryPath !== undefined &&
@@ -48,7 +57,7 @@ if (!native.error && native.status === 0) {
   if (debugOnce) args.push("--vus", "1", "--iterations", "1");
   if (summaryPath !== undefined) args.push("--summary-export", summaryPath);
   args.push("tests/k6/collaboration.js");
-  result = execute("k6", args, { ...process.env, CONVERGE_PROFILE: "smoke" });
+  result = execute("k6", args, { ...process.env, CONVERGE_PROFILE: profile });
 } else {
   const args = [
     "run",
@@ -65,7 +74,7 @@ if (!native.error && native.status === 0) {
     const value = process.env[name];
     if (value !== undefined) args.push("--env", `${name}=${value}`);
   }
-  args.push("--env", "CONVERGE_PROFILE=smoke");
+  args.push("--env", `CONVERGE_PROFILE=${profile}`);
   if (summaryPath !== undefined) {
     const summaryDirectory = dirname(summaryPath);
     if (!existsSync(summaryDirectory)) {

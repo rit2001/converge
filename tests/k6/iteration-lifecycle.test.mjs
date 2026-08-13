@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deterministicUuid } from "./identity.js";
+import { deterministicUuid, workloadCommandType, workloadTargetUuid } from "./identity.js";
 import {
   ITERATION_FAILURE_REASONS,
   ITERATION_PHASES,
   classifyIterationFailure,
+  classifyPostConnectState,
   createIterationLifecycle,
   createPreJoinDeliveryBuffer,
   matchesActiveCommand,
+  shouldRunCommandTimeout,
 } from "./iteration-lifecycle.js";
 
 function fixture(requiredCommands = 1) {
@@ -57,6 +59,37 @@ test("normal completion requires a command attempt acknowledgement and delivery"
   assert.deepEqual(value.phases.slice(-3), ["command_acknowledged", "delivery_observed", "closed"]);
 });
 
+test("a completed lifecycle is not invalidated by the post-connect response boundary", () => {
+  const value = fixture();
+  value.lifecycle.schedule(value.socket, () => value.lifecycle.commandSent(), 1);
+  value.timers[0].callback();
+  value.lifecycle.commandAcknowledged();
+  value.lifecycle.deliveryObserved();
+  value.lifecycle.complete();
+  assert.equal(
+    classifyPostConnectState(0, value.phases.at(-1), value.lifecycle.snapshot()),
+    undefined,
+  );
+  assert.equal(
+    classifyPostConnectState(0, "command_sent", {
+      terminal: false,
+      attempted: 1,
+      acknowledged: 0,
+      delivered: 0,
+    }),
+    "infrastructure_failure",
+  );
+  assert.equal(
+    classifyPostConnectState(101, "command_sent", {
+      terminal: false,
+      attempted: 1,
+      acknowledged: 0,
+      delivered: 0,
+    }),
+    "stale_lifecycle",
+  );
+});
+
 test("bounded missing acknowledgement and delivery failures clean pending work once", () => {
   for (const code of ["COMMAND_ACK_TIMEOUT", "LIVE_DELIVERY_TIMEOUT"]) {
     const value = fixture();
@@ -76,6 +109,17 @@ test("terminal timers cannot leak a command attempt", () => {
   assert.equal(value.lifecycle.snapshot().attempted, 0);
 });
 
+test("settled command timers cannot fail a replacement active command", () => {
+  const previous = { value: { opId: "previous" }, acknowledged: true, liveReceived: true };
+  const current = { value: { opId: "current" }, acknowledged: false, liveReceived: false };
+  assert.equal(shouldRunCommandTimeout("previous", previous, "acknowledged"), false);
+  assert.equal(shouldRunCommandTimeout("previous", current, "acknowledged"), false);
+  assert.equal(shouldRunCommandTimeout("previous", current, "liveReceived"), false);
+  assert.equal(shouldRunCommandTimeout("current", current, "acknowledged"), true);
+  assert.equal(shouldRunCommandTimeout("current", current, "liveReceived"), true);
+  assert.equal(shouldRunCommandTimeout("current", undefined, "liveReceived"), false);
+});
+
 test("distinct VUs and iterations own unique retry-stable command and object identities", () => {
   const identities = new Set();
   for (const vu of [1, 2])
@@ -88,6 +132,20 @@ test("distinct VUs and iterations own unique retry-stable command and object ide
         assert.equal(identities.has(first), false);
         identities.add(first);
       }
+});
+
+test("bounded baseline creates one VU-owned object then issues unique mutations", () => {
+  const targets = Array.from({ length: 4 }, (_, iteration) =>
+    workloadTargetUuid("bounded", 1, iteration, 1),
+  );
+  assert.equal(new Set(targets).size, 1);
+  assert.notEqual(targets[0], workloadTargetUuid("bounded", 2, 0, 1));
+  assert.equal(workloadCommandType("bounded", false, 1), "object.create");
+  assert.equal(workloadCommandType("bounded", false, 2), "object.update");
+  assert.equal(workloadCommandType("bounded", true, 1), "object.update");
+  assert.equal(workloadCommandType("bounded", false, 1), "object.create");
+  assert.notEqual(deterministicUuid("operation", 1, 1, 1), deterministicUuid("operation", 1, 2, 1));
+  assert.throws(() => workloadCommandType("unsupported", false, 1), /workload model/);
 });
 
 test("each iteration receives fresh mutable lifecycle state", () => {
@@ -133,6 +191,9 @@ test("classifies only fixed bounded sanitized failure reasons", () => {
   assert.equal(classifyIterationFailure({ code: "LIVE_OPERATION_CONTEXT" }), "delivery_mismatch");
   assert.equal(classifyIterationFailure({ code: "SEQUENCE_GAP" }), "sequence_conflict");
   assert.equal(classifyIterationFailure({ code: "WEBSOCKET_CLOSED" }), "unexpected_close");
+  assert.equal(classifyIterationFailure({ code: "CONNECT_TIMEOUT" }), "connection_timeout");
+  assert.equal(classifyIterationFailure({ code: "CONNECT_UNAUTHORIZED" }), "authentication_failed");
+  assert.equal(classifyIterationFailure({ code: "WEBSOCKET_ERROR" }), "infrastructure_failure");
   assert.equal(
     classifyIterationFailure(new Error("opaque"), { phase: "join_ack_received" }),
     "catchup_unknown",

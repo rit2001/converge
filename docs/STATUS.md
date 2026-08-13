@@ -89,9 +89,10 @@ v4 framing, strict acknowledgements and live-event validation, bounded deduplica
 safe smoke/baseline/scale-step profiles, fixed low-cardinality metrics, target safeguards, and pure
 helper tests are defined. One isolated 2-VU/30-second correctness smoke has passed against a
 production-composed distributed API and worker with disposable PostgreSQL and test-owned Redis
-state. Sanitized result artifacts record protocol, durable-state, publication, consumer-progress,
-threshold, and cleanup evidence. Baseline and scale-step execution, deployment, repeatable
-performance benchmarks, and capacity claims remain pending.
+state. One controlled local 10-VU/2-minute baseline also passed using a bounded one-object-per-VU
+working set and real `object.update` mutations. Sanitized result artifacts record protocol,
+durable-state, publication, consumer-progress, threshold, and cleanup evidence. Scale-step execution,
+deployment, repeated measurements, statistical confidence, and capacity claims remain pending.
 
 ## Deferred by design
 
@@ -108,4 +109,5 @@ The single-instance revocation path does not detect direct administrative SQL ch
 evict sockets connected to another API instance. Those distributed control-plane guarantees remain
 Milestone 2 work.
 
-No benchmark or production-capacity claim is currently supported.
+The recorded local baseline supports only its exact correctness and timing evidence; no production
+capacity, scalability, deployment, or 10,000-user claim is currently supported.

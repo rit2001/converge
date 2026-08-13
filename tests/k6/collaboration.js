@@ -2,12 +2,14 @@ import http from "k6/http";
 import ws from "k6/ws";
 import { Counter, Rate, Trend } from "k6/metrics";
 import { parseWorkloadConfig, workloadOptions } from "./config.js";
-import { deterministicUuid } from "./identity.js";
+import { deterministicUuid, workloadCommandType, workloadTargetUuid } from "./identity.js";
 import {
   classifyIterationFailure,
+  classifyPostConnectState,
   createIterationLifecycle,
   createPreJoinDeliveryBuffer,
   matchesActiveCommand,
+  shouldRunCommandTimeout,
 } from "./iteration-lifecycle.js";
 import {
   ProtocolFailure,
@@ -37,6 +39,7 @@ const duplicateEvents = new Counter("converge_duplicate_events");
 const sequenceGaps = new Counter("converge_sequence_gaps");
 const commandsAcknowledged = new Counter("converge_commands_acknowledged");
 const liveEventsReceived = new Counter("converge_live_events_received");
+let boundedObjectInitialized = false;
 
 function tags(outcome, operationType = "object.create") {
   return { profile: config.profile, operation_type: operationType, outcome };
@@ -57,8 +60,11 @@ function socketEndpoint(origin) {
   return `${secure ? "wss" : "ws"}://${authority}/socket.io/?EIO=4&transport=websocket`;
 }
 
-function command(clientId, ordinal, baseSequence) {
-  const targetId = identity("object", ordinal);
+function command(clientId, ordinal, baseSequence, objectInitialized) {
+  const vu = Number(globalThis.__VU ?? 0);
+  const iteration = Number(globalThis.__ITER ?? 0);
+  const targetId = workloadTargetUuid(config.workloadModel, vu, iteration, ordinal);
+  const type = workloadCommandType(config.workloadModel, objectInitialized, ordinal);
   return {
     schemaVersion: 1,
     opId: identity("operation", ordinal),
@@ -67,18 +73,23 @@ function command(clientId, ordinal, baseSequence) {
     baseSeq: baseSequence,
     targetId,
     clientTimestamp: new Date().toISOString(),
-    type: "object.create",
-    payload: {
-      id: targetId,
-      kind: "rectangle",
-      x: 40 + (ordinal % 20),
-      y: 40 + (ordinal % 20),
-      width: 160,
-      height: 100,
-      rotation: 0,
-      fill: "#818cf8",
-      text: "",
-    },
+    type,
+    payload:
+      type === "object.create"
+        ? {
+            id: targetId,
+            kind: "rectangle",
+            x: 40 + vu,
+            y: 40 + vu,
+            width: 160,
+            height: 100,
+            rotation: 0,
+            fill: "#818cf8",
+            text: "",
+          }
+        : {
+            fill: `#${((iteration * 100 + ordinal + vu) % 0xffffff).toString(16).padStart(6, "0")}`,
+          },
   };
 }
 
@@ -110,6 +121,8 @@ function snapshotFailure(reason, evidence = {}) {
     status: Number.isInteger(evidence.status) ? evidence.status : 0,
     lastSequence: Number.isSafeInteger(evidence.lastSequence) ? evidence.lastSequence : 0,
     objectCount: Number.isSafeInteger(evidence.objectCount) ? evidence.objectCount : 0,
+    responseBytes: Number.isSafeInteger(evidence.responseBytes) ? evidence.responseBytes : 0,
+    configuredLimit: Number.isSafeInteger(evidence.configuredLimit) ? evidence.configuredLimit : 0,
   });
   return error;
 }
@@ -139,6 +152,8 @@ export default function collaborationWorkload() {
   let tracker;
   let activeCommand;
   let currentPhase = "authenticated";
+  let failurePhase;
+  let failureReason;
   const pendingAcknowledgements = new Map();
   const preJoinDeliveries = createPreJoinDeliveryBuffer(256);
   const lifecycle = createIterationLifecycle({
@@ -170,18 +185,19 @@ export default function collaborationWorkload() {
       if (failed) return;
       failed = true;
       protocolFailed = protocolFailed || error instanceof ProtocolFailure;
-      if (config.debugPhases) {
-        const reason = classifyIterationFailure(error, {
-          phase: currentPhase,
-          terminal: lifecycle.snapshot().terminal,
-          activeCommand: activeCommand !== undefined,
-        });
+      failurePhase = currentPhase;
+      failureReason = classifyIterationFailure(error, {
+        phase: failurePhase,
+        terminal: lifecycle.snapshot().terminal,
+        activeCommand: activeCommand !== undefined,
+      });
+      if (config.debugPhases || config.debugFailures) {
         const evidence = error?.snapshotEvidence;
         const overlap = error?.reconciliationEvidence;
         globalThis.console.log(
-          `converge_failure vu=${globalThis.__VU} iteration=${globalThis.__ITER} phase=${currentPhase} reason=${reason}${
+          `converge_failure vu=${globalThis.__VU} iteration=${globalThis.__ITER} phase=${failurePhase} reason=${failureReason}${
             evidence
-              ? ` status=${evidence.status} last_sequence=${evidence.lastSequence} objects=${evidence.objectCount}`
+              ? ` status=${evidence.status} last_sequence=${evidence.lastSequence} objects=${evidence.objectCount} response_bytes=${evidence.responseBytes} configured_limit=${evidence.configuredLimit}`
               : ""
           }${
             overlap
@@ -262,7 +278,11 @@ export default function collaborationWorkload() {
       try {
         body = parseHttpJsonBody(result.body, config.maxPacketBytes, "SNAPSHOT_JSON");
       } catch {
-        throw snapshotFailure("snapshot_json_invalid", { status: result.status });
+        throw snapshotFailure("snapshot_json_invalid", {
+          status: result.status,
+          responseBytes: typeof result.body === "string" ? result.body.length : 0,
+          configuredLimit: config.maxPacketBytes,
+        });
       }
       lifecycle.note("snapshot_body_parsed");
       let snapshot;
@@ -299,7 +319,12 @@ export default function collaborationWorkload() {
         () => {
           if (failed || complete) return;
           commandOrdinal += 1;
-          const value = command(clientId, commandOrdinal, tracker.snapshot().lastSequence);
+          const value = command(
+            clientId,
+            commandOrdinal,
+            tracker.snapshot().lastSequence,
+            boundedObjectInitialized,
+          );
           const id = ++acknowledgementId;
           activeCommand = {
             value,
@@ -311,7 +336,7 @@ export default function collaborationWorkload() {
           lifecycle.commandSent();
           socket.send(encodeEvent("operation:submit", value, id));
           socket.setTimeout(() => {
-            if (!activeCommand?.acknowledged && !failed) {
+            if (!failed && shouldRunCommandTimeout(value.opId, activeCommand, "acknowledged")) {
               classifyTimeout("command_ack");
               fail(new ProtocolFailure("COMMAND_ACK_TIMEOUT"));
             }
@@ -321,13 +346,19 @@ export default function collaborationWorkload() {
       );
     };
 
+    const advanceAfterCurrentCommand = () => {
+      if (config.workloadModel === "bounded" && activeCommand?.value.type === "object.create")
+        boundedObjectInitialized = true;
+      scheduleNextCommand();
+    };
+
     const confirmCommandDelivery = (operation) => {
       if (!activeCommand || !matchesActiveCommand(activeCommand.value.opId, operation.opId)) return;
       if (activeCommand.liveReceived) return;
       activeCommand.liveReceived = true;
       lifecycle.deliveryObserved();
       liveDeliveryDuration.add(Date.now() - activeCommand.sentAt, tags("live"));
-      if (activeCommand.acknowledged) scheduleNextCommand();
+      if (activeCommand.acknowledged) advanceAfterCurrentCommand();
     };
 
     const observeOperation = (operation) => {
@@ -413,23 +444,27 @@ export default function collaborationWorkload() {
           lifecycle.commandAcknowledged();
           activeCommand.acknowledged = true;
           if (!activeCommand.liveReceived) {
+            const acknowledgedOperationId = pending.value.opId;
             socket.setTimeout(() => {
               try {
-                if (!activeCommand?.liveReceived && !failed) {
+                if (
+                  !failed &&
+                  shouldRunCommandTimeout(acknowledgedOperationId, activeCommand, "liveReceived")
+                ) {
                   classifyTimeout("live_delivery");
                   catchUp(result.operation.seq);
                   if (!tracker.has(result.operation.opId))
-                    throw new ProtocolFailure("CATCH_UP_OPERATION_MISSING");
+                    throw new ProtocolFailure("LIVE_DELIVERY_TIMEOUT");
                   activeCommand.liveReceived = true;
                   lifecycle.deliveryObserved();
                   liveDeliveryDuration.add(Date.now() - activeCommand.sentAt, tags("catch_up"));
-                  scheduleNextCommand();
+                  advanceAfterCurrentCommand();
                 }
               } catch (error) {
                 fail(error);
               }
             }, config.acknowledgementTimeoutMs);
-          } else scheduleNextCommand();
+          } else advanceAfterCurrentCommand();
           return;
         }
         if (packet.kind === "operation") {
@@ -469,12 +504,27 @@ export default function collaborationWorkload() {
     }, config.connectTimeoutMs);
   });
 
-  if (!response || response.status !== 101) failed = true;
-  if (!failed && !lifecycle.snapshot().terminal) {
+  const postConnectReason = classifyPostConnectState(
+    response?.status,
+    currentPhase,
+    lifecycle.snapshot(),
+  );
+  if (!failed && postConnectReason) {
     failed = true;
-    protocolFailed = true;
+    failurePhase = currentPhase;
+    failureReason = postConnectReason;
+    protocolFailed = postConnectReason === "stale_lifecycle";
     lifecycle.fail();
+    if (config.debugPhases || config.debugFailures)
+      globalThis.console.log(
+        `converge_failure vu=${globalThis.__VU} iteration=${globalThis.__ITER} phase=${failurePhase} reason=${failureReason}`,
+      );
   }
-  iterationFailures.add(failed, tags(failed ? "failed" : "completed"));
+  iterationFailures.add(
+    failed,
+    failed
+      ? { ...tags("failed"), reason: failureReason ?? "unknown_internal_state" }
+      : tags("completed"),
+  );
   protocolFailures.add(protocolFailed, tags(protocolFailed ? "failed" : "valid"));
 }

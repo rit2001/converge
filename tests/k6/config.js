@@ -12,7 +12,15 @@ export const K6_METRIC_NAMES = Object.freeze([
   "converge_commands_acknowledged",
   "converge_live_events_received",
 ]);
-export const K6_ALLOWED_TAGS = Object.freeze(["profile", "operation_type", "outcome"]);
+export const K6_ALLOWED_TAGS = Object.freeze(["profile", "operation_type", "outcome", "reason"]);
+export const K6_SUMMARY_TREND_STATS = Object.freeze([
+  "avg",
+  "min",
+  "max",
+  "p(50)",
+  "p(95)",
+  "p(99)",
+]);
 
 const PROFILES = Object.freeze({
   smoke: Object.freeze({ vus: 2, duration: "30s", commandsPerClient: 2, intervalMs: 1_000 }),
@@ -113,6 +121,7 @@ export function parseWorkloadConfig(env, { requireStateful = true } = {}) {
       1,
       100,
     ),
+    workloadModel: profileName === "baseline" ? "bounded" : "create-only",
     commandIntervalMs: integer(
       env,
       "CONVERGE_COMMAND_INTERVAL_MS",
@@ -127,48 +136,85 @@ export function parseWorkloadConfig(env, { requireStateful = true } = {}) {
     debugRepeat: env.CONVERGE_DEBUG_REPEAT === "true",
     debugConcurrent: env.CONVERGE_DEBUG_CONCURRENT === "true",
     debugSequential: env.CONVERGE_DEBUG_SEQUENTIAL === "true",
+    debugBoundedOne: env.CONVERGE_DEBUG_BOUNDED_ONE === "true",
+    debugBoundedTwo: env.CONVERGE_DEBUG_BOUNDED_TWO === "true",
+    debugBoundedTen: env.CONVERGE_DEBUG_BOUNDED_TEN === "true",
+    debugFailures: env.CONVERGE_DEBUG_FAILURES === "true",
   });
 }
 
 export function workloadOptions(config) {
-  const execution = config.debugSequential
+  const execution = config.debugBoundedTen
     ? {
         scenarios: {
-          debug_sequential: {
+          debug_bounded_ten: {
             executor: "per-vu-iterations",
-            vus: 1,
-            iterations: 2,
-            maxDuration: "15s",
+            vus: 10,
+            iterations: 4,
+            maxDuration: "90s",
           },
         },
       }
-    : config.debugConcurrent
+    : config.debugBoundedOne
       ? {
           scenarios: {
-            debug_concurrent: {
+            debug_bounded_one: {
               executor: "per-vu-iterations",
-              vus: 2,
-              iterations: 1,
-              maxDuration: "15s",
+              vus: 1,
+              iterations: 4,
+              maxDuration: "60s",
             },
           },
         }
-      : config.debugRepeat
+      : config.debugBoundedTwo
         ? {
             scenarios: {
-              debug_repeat: {
+              debug_bounded_two: {
                 executor: "per-vu-iterations",
                 vus: 2,
-                iterations: 4,
-                maxDuration: "30s",
+                iterations: 20,
+                maxDuration: "5m",
               },
             },
           }
-        : config.debugPhases
-          ? { vus: 1, iterations: 1 }
-          : config.profile === "scale-step"
-            ? { stages: config.stages }
-            : { vus: config.vus, duration: config.duration };
+        : config.debugSequential
+          ? {
+              scenarios: {
+                debug_sequential: {
+                  executor: "per-vu-iterations",
+                  vus: 1,
+                  iterations: 2,
+                  maxDuration: "15s",
+                },
+              },
+            }
+          : config.debugConcurrent
+            ? {
+                scenarios: {
+                  debug_concurrent: {
+                    executor: "per-vu-iterations",
+                    vus: 2,
+                    iterations: 1,
+                    maxDuration: "15s",
+                  },
+                },
+              }
+            : config.debugRepeat
+              ? {
+                  scenarios: {
+                    debug_repeat: {
+                      executor: "per-vu-iterations",
+                      vus: 2,
+                      iterations: 4,
+                      maxDuration: "30s",
+                    },
+                  },
+                }
+              : config.debugPhases
+                ? { vus: 1, iterations: 1 }
+                : config.profile === "scale-step"
+                  ? { stages: config.stages }
+                  : { vus: config.vus, duration: config.duration };
   const thresholds = {
     converge_iteration_failures: ["rate<0.01"],
     converge_protocol_failures: ["rate==0"],
@@ -180,6 +226,7 @@ export function workloadOptions(config) {
   return {
     ...execution,
     systemTags: [],
+    summaryTrendStats: K6_SUMMARY_TREND_STATS,
     thresholds,
   };
 }
