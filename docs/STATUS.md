@@ -78,8 +78,10 @@ separate lifecycle, PostgreSQL-backed core, and Redis/outbox delivery health plu
 Real distributed API observability acceptance is complete against isolated PostgreSQL and Redis
 failure boundaries. Real worker observability acceptance is complete against isolated PostgreSQL and
 Redis failure boundaries. The provider-neutral SLO, alert-threshold, inhibition/grouping, and
-incident-runbook policy is complete. Executable alert rules and provider integration, deployment
-probe selection, dashboards, and benchmarks remain pending.
+incident-runbook policy is complete. The twelve metric-backed Prometheus alerts are encoded with
+repository-level policy validation; local `promtool` binary validation remains pending. External-probe
+and stuck-work alerts, Alertmanager/provider integration, deployment probe selection, dashboards, and
+benchmarks remain pending.
 
 ## Deferred by design
 

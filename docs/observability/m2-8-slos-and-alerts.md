@@ -206,6 +206,20 @@ and
 sum(increase(converge_compaction_duration_seconds_count[15m])) >= 5
 ```
 
+### Encoded metric-backed rules
+
+The twelve metric-backed alerts above are encoded in
+`ops/prometheus/converge-alerts.yml` as the single provider-neutral
+`converge-m2-operational-alerts` group. Repository contract tests parse the YAML and enforce the
+documented order, expressions, thresholds, durations, labels, runbook references, catalog membership,
+minimum-volume guards, and privacy constraints. The four external-probe alerts and
+`ConvergeBackgroundWorkStuck` remain deferred because the required probe history and attempt-age
+evidence do not exist in the fixed metric catalog.
+
+`promtool` was not available locally when these rules were encoded, so binary PromQL validation
+remains pending for the final M2 gate. The rule file is not deployed, and Alertmanager routing,
+provider integration, and dashboards remain pending.
+
 ### Deferred stuck-work alert
 
 The manual investigation boundaries are:
