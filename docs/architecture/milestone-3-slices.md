@@ -1,0 +1,430 @@
+# Milestone 3 implementation slices
+
+Status: proposed. Each slice is independently reviewable and must preserve all M2 correctness and
+privacy guarantees. Commands are run from the repository root. New dependencies require explicit
+approval and are not implied by this plan.
+
+## Global gates
+
+Every slice starts from the accepted prior slice with a clean tree. It must keep stale-session
+fencing, persist-before-optimism, ordered acknowledgements, verified recovery, terminal revocation,
+and fail-closed readiness intact. UI language may not claim exactly-once delivery, Redis durability,
+or server persistence before acknowledgement.
+
+Stop a slice for an accessibility regression, an unexplained transport/store failure, arbitrary
+z-index or raw style proliferation, an unapproved dependency, a protocol implication not covered by
+a strict schema, or a measurable breach of its performance budget.
+
+## M3.1 — Design tokens and frontend foundations
+
+**Preconditions**
+
+- Product language, light palette, typography source, icon strategy, and theme timing are approved.
+- ADR 007 is accepted.
+
+**User-visible invariant**
+
+The existing workspace renders with one coherent, accessible visual foundation without changing any
+board/session behavior.
+
+**Scope**
+
+- Establish semantic color, typography, spacing, radius, border, elevation, motion, focus, and
+  z-index tokens.
+- Add workspace portal roots and overlay coordinator primitives.
+- Add accessible button/icon/tooltip, status badge, surface, and focus primitives.
+- Split global CSS into explicit foundation ownership while retaining App Router compatibility.
+- Add reduced-motion primitives and light/dark-ready token structure; ship dark only if approved.
+
+**Likely files**
+
+- `apps/web/app/layout.tsx`, `apps/web/app/styles.css`
+- `apps/web/src/ui/*`, `apps/web/src/styles/*`, `apps/web/src/overlays/*`
+- component/token tests and optional static token validation
+
+**Tests**
+
+- Token completeness and no arbitrary layer values.
+- Portal ownership, Escape precedence, focus restoration, reduced-motion resolution.
+- Existing 81 web tests unchanged in semantics.
+
+**Verification**
+
+```text
+pnpm --filter @converge/web test
+pnpm --filter @converge/web typecheck
+pnpm --filter @converge/web lint
+pnpm build
+pnpm exec prettier --check <changed-files>
+git diff --check
+```
+
+**Commit**
+
+`feat(web): establish premium design foundations`
+
+**Explicit exclusions**
+
+Landing content, route restructuring, canvas feature changes, presence, durable commands, and
+unapproved component/icon/motion dependencies.
+
+**Stop condition**
+
+Tokens cannot meet AA contrast, overlay focus/Escape ownership is ambiguous, or a dependency is
+required without approval.
+
+## M3.2 — Premium landing and board-entry experience
+
+**Preconditions**
+
+- M3.1 accepted.
+- Root-route and authentication-boundary decisions approved.
+
+**User-visible invariant**
+
+A visit never creates data implicitly: people deliberately create a named board or open an
+authorized board link and receive a clear unavailable/authentication state.
+
+**Scope**
+
+- Add public landing and explicit board-entry routes.
+- Add create/open forms using existing create and fetch APIs.
+- Add honest device-local recents only if approved and clearly labeled.
+- Add route loading, invalid-link, unauthorized, empty, and retry states.
+- Use code-native product demonstrations; no generated marketing imagery.
+
+**Likely files**
+
+- `apps/web/app/page.tsx`, `apps/web/app/boards/*`, `apps/web/app/boards/[boardId]/*`
+- `apps/web/src/entry/*`, route/component tests, `tests/playwright/*`
+
+**Tests**
+
+- No POST on landing/load.
+- Explicit create, open known board, invalid/forbidden link, retry, keyboard form, and focus tests.
+- Playwright landing → create/open → workspace.
+
+**Verification**
+
+Web test/typecheck/lint, root build, targeted Playwright entry flows, Prettier, and diff check.
+
+**Commit**
+
+`feat(web): add premium board entry experience`
+
+**Explicit exclusions**
+
+Production OAuth, server-backed board list/search, invitations, billing, analytics, and deployment.
+
+**Stop condition**
+
+The design requires pretending a development identity is production auth or needs an unapproved
+board-list API.
+
+## M3.3 — Layered workspace shell
+
+**Preconditions**
+
+- M3.1 accepted; editor route from M3.2 stable.
+- Workspace layer table and desktop panel placement approved.
+
+**User-visible invariant**
+
+Header, tool dock, canvas, contextual controls, panels, notifications, and terminal surfaces stack
+and focus deterministically without intercepting the wrong canvas interaction.
+
+**Scope**
+
+- Decompose the monolithic `Workspace` into session, chrome, canvas, panel, status, and terminal
+  boundaries.
+- Implement semantic layers/portals and overlay coordinator.
+- Replace raw diagnostics with a development-only details surface.
+- Add board header, accessible tool dock, sync summary, panel host, and terminal revocation/recovery
+  overlay using existing store evidence.
+- Subscribe to narrow Zustand selectors so unrelated chrome does not rerender on pointer movement.
+
+**Likely files**
+
+- `apps/web/src/components/workspace.tsx`, `apps/web/src/workspace/*`
+- `apps/web/src/components/canvas.tsx`, `apps/web/src/overlays/*`, `apps/web/app/styles.css`
+
+**Tests**
+
+- Layer order, pointer pass-through, focus/Escape precedence, terminal inert state, selector/render
+  boundaries, session replacement cleanup.
+- Existing convergence/reconnect Playwright flows.
+
+**Verification**
+
+Web tests/typecheck/lint, root build, relevant Playwright flows, interaction trace smoke, Prettier,
+and diff check.
+
+**Commit**
+
+`feat(web): compose layered workspace shell`
+
+**Explicit exclusions**
+
+New durable commands, presence transport, member/history APIs, and visual-regression tooling.
+
+**Stop condition**
+
+Any terminal surface can be bypassed, old sessions can update current UI, or arbitrary layer values
+remain necessary.
+
+## M3.4 — Canvas tools, selection, snapping, and Layers panel
+
+**Preconditions**
+
+- M3.3 accepted.
+- Single versus multi-selection scope and durable reorder decision approved.
+
+**User-visible invariant**
+
+Canvas and Layers panel reflect one authoritative object order and selection model; local previews
+remain immediate while durable mutations occur only at bounded interaction boundaries.
+
+**Scope**
+
+- Add precise pan/zoom controls, keyboard nudge, selected-object properties, rotation, snapping, and
+  alignment guides using current transform/update commands.
+- Add accessible Layers list derived from `BoardState.order`, synchronized local selection, generated
+  type labels, and session-local hide/lock only if explicitly labeled “This view.”
+- Add drag reorder/forward/back only after a separately reviewed strict durable reorder contract,
+  reducer, repository, snapshot, recovery, and concurrency policy exists.
+- Multi-selection ships only with approved batch/partial-failure semantics.
+
+**Likely files**
+
+- `apps/web/src/components/canvas.tsx`, `apps/web/src/canvas/*`, `apps/web/src/layers/*`
+- `apps/web/src/board-store.ts` only for explicit frontend selection/view state
+- If approved, protocol/canvas-engine/database/API files in a separate prerequisite commit
+
+**Tests**
+
+- Pan/zoom bounds, keyboard input guards, transform preview/one-submit boundary, snapping geometry,
+  rotation recovery, panel order/selection, local hide/lock labeling, no request per pointer event.
+- Durable reorder conflict/replay/recovery tests if that contract is approved.
+
+**Verification**
+
+Protocol/canvas/web tests as affected, integration only if durable evolution occurs, Playwright canvas
+interaction flows, production build, profiling at 100/500 objects, Prettier, and diff check.
+
+**Commit**
+
+`feat(web): refine canvas tools and layers`
+
+If durable reorder is approved, it must be an earlier separate commit such as
+`feat(protocol): add durable object ordering`.
+
+**Explicit exclusions**
+
+Durable rename/hide/lock/grouping, local-stack undo, and unreviewed multi-object command fan-out.
+
+**Stop condition**
+
+UI implies a local action is durable when no contract exists, sends per-frame commands, or loses
+authoritative order after reload/recovery.
+
+## M3.5 — Collaboration presence and synchronization UX
+
+**Preconditions**
+
+- M3.3 accepted.
+- Presence identity, privacy, rate, expiry, and reconnect semantics approved in a protocol design.
+
+**User-visible invariant**
+
+People can distinguish collaborators’ ephemeral activity from durable board state and always know
+whether their own edit is local, acknowledged, reconnecting, recovered, or terminally blocked.
+
+**Scope**
+
+- Build pending/saving/saved/reconnecting/catching-up/recovered status from existing lifecycle state.
+- Add remote cursors/selections only through an approved ephemeral Socket.IO contract with bounded
+  send rate, expiry, interpolation, and cleanup.
+- Add collaborator presence summary that never serves as membership authorization evidence.
+- Add deterministic revoked and `RECOVERY_BLOCKED` acceptance UX.
+
+**Likely files**
+
+- `apps/web/src/transport.ts`, `board-store.ts`, `board-session.ts`, `workspace/status/*`,
+  `workspace/presence/*`
+- `packages/protocol` and `apps/api` only in a separately reviewed presence contract
+
+**Tests**
+
+- Four-phase feedback model, retry countdown, queued-local wording, one recovered announcement,
+  stale-generation silence, presence bounds/expiry, peer isolation, reduced-motion cursor behavior,
+  no raw pointer request.
+- Multi-user Playwright presence, reconnect, recovery, and revocation flows.
+
+**Verification**
+
+Protocol/API/web tests as affected, deterministic failure tests for presence lifecycle, Playwright
+multi-user flows, performance trace, typecheck/lint/build, Prettier, diff check.
+
+**Commit**
+
+`feat(web): expose collaboration synchronization states`
+
+**Explicit exclusions**
+
+Using presence as membership, durable cursor history, exactly-once language, comments, voice/video,
+or silent fallback around recovery failure.
+
+**Stop condition**
+
+Presence can affect durable correctness, cursor traffic is unbounded, or UI claims saved/delivered at
+the wrong lifecycle boundary.
+
+## M3.6 — Command palette, onboarding, share, and history surfaces
+
+**Preconditions**
+
+- M3.3–M3.5 accepted.
+- Product approves which backend-missing flows remain informational versus receive separate API work.
+
+**User-visible invariant**
+
+Every exposed command is searchable, keyboard-safe, authorized, and truthful about whether the
+underlying capability exists.
+
+**Scope**
+
+- Add one command registry used by shortcuts, menus, and palette.
+- Add contextual onboarding and shortcut help.
+- Add copy-link sharing using the current authorized board URL.
+- Add synchronization/recovery details from existing client evidence.
+- Add member list/invite/remove or version browse/restore only after strict authorized APIs and
+  durable restore semantics are separately accepted.
+
+**Likely files**
+
+- `apps/web/src/commands/*`, `workspace/palette/*`, `workspace/onboarding/*`,
+  `workspace/share/*`, `workspace/history/*`
+- Protocol/database/API only in separately scoped prerequisites
+
+**Tests**
+
+- Registry uniqueness, enable/disable reasons, shortcut/input collision, palette focus, copy-link
+  privacy, unsupported-feature absence, authorization and terminal-state fencing.
+- If evolved: member/version API authorization, ordering, recovery, and Playwright flows.
+
+**Verification**
+
+Affected workspace tests, API/integration only when contracts change, Playwright keyboard/share
+flows, typecheck/lint/build, Prettier, diff check.
+
+**Commit**
+
+`feat(web): add command and guidance surfaces`
+
+**Explicit exclusions**
+
+Fake member roster, inferred sharing permissions, operational recovery mutation, local-only version
+restore, production OAuth, and billing.
+
+**Stop condition**
+
+A surface must fabricate missing server data or a palette command can bypass current readiness,
+selection, authorization, or terminal state.
+
+## M3.7 — Accessibility, responsive behavior, and themes
+
+**Preconditions**
+
+- Product surfaces stable through M3.6.
+- Tablet, phone, and dark-theme policies approved.
+
+**User-visible invariant**
+
+Application chrome is fully keyboard operable and understandable without color or motion; approved
+desktop/tablet/phone modes remain usable at zoom and high contrast.
+
+**Scope**
+
+- Complete keyboard navigation, focus order, live regions, object-list alternative, labels, and
+  contrast remediation.
+- Implement reduced motion and approved theme switch/system behavior.
+- Implement desktop-first responsive editor, tablet policy, and phone view-only or editing policy.
+- Validate 200% zoom, high contrast, touch targets, and orientation changes.
+
+**Likely files**
+
+- All web product surfaces, token/theme files, accessibility utilities, Playwright configuration
+
+**Tests**
+
+- Keyboard-only flows, focus visibility/traps, status announcements, automated accessibility scan,
+  reduced motion, light/dark, high contrast, desktop/tablet/mobile viewports, zoom, touch targets.
+
+**Verification**
+
+Web tests/typecheck/lint/build, Chromium accessibility and responsive Playwright flows, manual
+screen-reader checklist, Prettier, diff check.
+
+**Commit**
+
+`feat(web): complete accessible responsive themes`
+
+**Explicit exclusions**
+
+Unapproved phone editing, native applications, unsupported browsers, and visual changes that reduce
+contrast to preserve branding.
+
+**Stop condition**
+
+Any critical flow lacks keyboard access, AA contrast, visible focus, reduced-motion behavior, or an
+honest small-screen policy.
+
+## M3.8 — Performance, visual regression, and final acceptance
+
+**Preconditions**
+
+- M3.1–M3.7 complete.
+- Reference hardware/browser/DPR and screenshot review ownership approved.
+
+**User-visible invariant**
+
+The premium experience remains visually stable, responsive, leak-free, and correct through
+collaboration, reconnect, recovery, revocation, theme, and viewport changes.
+
+**Scope**
+
+- Add deterministic screenshot baselines and review policy, using an approved minimal tool.
+- Profile React/Konva at 100/500/1,000 object tiers and remote-presence load.
+- Enforce bundle, route-load, long-task, input-latency, request-rate, and cleanup budgets.
+- Run Chromium, Firefox, and WebKit final flows.
+- Complete M3 claim/privacy/accessibility review and document measured limitations.
+
+**Likely files**
+
+- `tests/playwright/*`, visual fixtures/baselines, performance harness, CI workflow if approved,
+  benchmark/design status documentation
+
+**Tests**
+
+- Landing/entry/workspace golden states, selected/reconnecting/recovered/revoked/blocked variants,
+  reduced motion, themes, responsive viewports, multi-user collaboration, repeated session
+  replacement, heap/listener cleanup, object-tier traces.
+
+**Verification**
+
+Full root format/lint/typecheck/test/build, integration/failure/Playwright/browser matrix as affected,
+visual and performance gates, artifact privacy check, and clean Git diff.
+
+**Commit**
+
+`test(web): accept premium product experience`
+
+**Explicit exclusions**
+
+Production deployment, new capacity claims, k6 reruns, performance optimization without a reproduced
+budget breach, and provider analytics.
+
+**Stop condition**
+
+Any M2 invariant regresses, a required browser/visual/accessibility/performance gate fails, cleanup
+leaks, or M3 documentation makes an unsupported durability/capacity claim.

@@ -113,3 +113,13 @@ Milestone 2 work.
 
 The recorded local baseline supports only its exact correctness and timing evidence; no production
 capacity, scalability, deployment, or 10,000-user claim is currently supported.
+
+## Milestone 3 planning status
+
+The premium product experience architecture, original product language, frontend layering/motion
+decision, accessibility and performance budgets, durable Layers-panel capability audit, and eight
+independently reviewable implementation slices are defined. This is architecture and UX planning
+only: no M3 production code, dependency, protocol, database, route, or deployment change has begun.
+Visual direction, typography/icon sourcing, theme timing, responsive editing policy, authentication,
+presence, durable reorder, member/share, and version-history scope require the approvals recorded in
+the M3 architecture before their applicable slices start.
