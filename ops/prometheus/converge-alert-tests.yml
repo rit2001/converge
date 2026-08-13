@@ -1,0 +1,446 @@
+rule_files:
+  - converge-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: counter presence alerts respect zero increase and fire on the documented increase
+    interval: 1m
+    input_series:
+      - series: 'converge_delivery_events_total{event_type="operation",outcome="quarantined"}'
+        values: "0+0x5 1+0x5"
+      - series: 'converge_outbox_publications_total{outcome="blocked"}'
+        values: "0+0x5 1+0x5"
+      - series: 'converge_recovery_requests_total{outcome="recovery_blocked"}'
+        values: "0+0x5 1+0x5"
+      - series: 'converge_snapshot_runs_total{outcome="deterministic_failure"}'
+        values: "0+0x5 1+0x5"
+      - series: 'converge_compaction_runs_total{outcome="blocked"}'
+        values: "0+0x5 1+0x5"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ConvergeDeliveryQuarantineDetected
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ConvergeOutboxBlockedDetected
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ConvergeRecoveryBlockedDetected
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ConvergeSnapshotFailuresElevated
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ConvergeCompactionBlockedDetected
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ConvergeDeliveryQuarantineDetected
+        exp_alerts:
+          - exp_labels: &delivery-critical
+              service: converge
+              severity: critical
+              subsystem: delivery
+            exp_annotations:
+              summary: Quarantined delivery outcome detected.
+              description: A quarantined distributed delivery outcome occurred during the last five minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#quarantined-delivery-or-cursor-loss
+      - eval_time: 6m
+        alertname: ConvergeOutboxBlockedDetected
+        exp_alerts:
+          - exp_labels: &outbox-critical
+              service: converge
+              severity: critical
+              subsystem: outbox
+            exp_annotations:
+              summary: Blocked outbox publication detected.
+              description: A durable outbox publication attempt became blocked during the last five minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#blocked-outbox-event
+      - eval_time: 6m
+        alertname: ConvergeRecoveryBlockedDetected
+        exp_alerts:
+          - exp_labels: &recovery-critical
+              service: converge
+              severity: critical
+              subsystem: recovery
+            exp_annotations:
+              summary: Blocked recovery detected.
+              description: A trustworthy recovery request became blocked during the last five minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#recovery-blocked-or-corrupt-snapshot-chain
+      - eval_time: 6m
+        alertname: ConvergeSnapshotFailuresElevated
+        exp_alerts:
+          - exp_labels: &snapshot-warning
+              service: converge
+              severity: warning
+              subsystem: snapshot
+            exp_annotations:
+              summary: Snapshot capture failures detected.
+              description: A deterministic or transient snapshot capture failure occurred during the last fifteen minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#snapshot-failure
+      - eval_time: 6m
+        alertname: ConvergeCompactionBlockedDetected
+        exp_alerts:
+          - exp_labels: &compaction-warning
+              service: converge
+              severity: warning
+              subsystem: compaction
+            exp_annotations:
+              summary: Blocked compaction detected.
+              description: An authoritative compaction attempt became blocked during the last fifteen minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#compaction-blocked-or-failed
+
+  - name: delivery failure ratio stays below its minimum volume
+    interval: 1m
+    input_series:
+      - series: 'converge_delivery_events_total{event_type="operation",outcome="handled"}'
+        values: "0+1x10"
+      - series: 'converge_delivery_events_total{event_type="operation",outcome="failed"}'
+        values: "0+0x9 2"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeDeliveryFailuresElevated
+        exp_alerts: []
+
+  - name: delivery failure ratio stays below threshold at sufficient volume
+    interval: 1m
+    input_series:
+      - series: 'converge_delivery_events_total{event_type="operation",outcome="handled"}'
+        values: "0+2x10"
+      - series: 'converge_delivery_events_total{event_type="operation",outcome="failed"}'
+        values: "0+0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeDeliveryFailuresElevated
+        exp_alerts: []
+
+  - name: delivery failure ratio fires above threshold at sufficient volume
+    interval: 1m
+    input_series:
+      - series: 'converge_delivery_events_total{event_type="operation",outcome="handled"}'
+        values: "0+0x9 19"
+      - series: 'converge_delivery_events_total{event_type="operation",outcome="failed"}'
+        values: "0+0x9 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeDeliveryFailuresElevated
+        exp_alerts:
+          - exp_labels: &delivery-warning
+              service: converge
+              severity: warning
+              subsystem: delivery
+            exp_annotations:
+              summary: Distributed delivery failures are elevated.
+              description: Failed delivery outcomes exceed one percent of handled and failed outcomes at sufficient volume.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#socket-consumerwatchdog-outage
+
+  - name: outbox retry ratio stays below its minimum volume
+    interval: 1m
+    input_series:
+      - series: 'converge_outbox_publications_total{outcome="published"}'
+        values: "0+0x9 10"
+      - series: 'converge_outbox_publications_total{outcome="retry"}'
+        values: "0+0x9 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeOutboxRetriesElevated
+        exp_alerts: []
+
+  - name: outbox retry ratio stays below threshold at sufficient volume
+    interval: 1m
+    input_series:
+      - series: 'converge_outbox_publications_total{outcome="published"}'
+        values: "0+0x9 20"
+      - series: 'converge_outbox_publications_total{outcome="retry"}'
+        values: "0+0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeOutboxRetriesElevated
+        exp_alerts: []
+
+  - name: outbox retry ratio fires above threshold at sufficient volume
+    interval: 1m
+    input_series:
+      - series: 'converge_outbox_publications_total{outcome="published"}'
+        values: "0+0x9 18"
+      - series: 'converge_outbox_publications_total{outcome="retry"}'
+        values: "0+0x9 2"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeOutboxRetriesElevated
+        exp_alerts:
+          - exp_labels: &outbox-warning
+              service: converge
+              severity: warning
+              subsystem: outbox
+            exp_annotations:
+              summary: Outbox publication retries are elevated.
+              description: Retry outcomes exceed five percent of published and retry outcomes at sufficient volume.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#redisoutbox-publication-outage
+
+  - name: recovery failure ratio stays below its minimum volume
+    interval: 1m
+    input_series:
+      - series: 'converge_recovery_requests_total{outcome="snapshot_tail"}'
+        values: "0+0x9 10"
+      - series: 'converge_recovery_requests_total{outcome="retryable_failure"}'
+        values: "0+0x9 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeRecoveryFailuresElevated
+        exp_alerts: []
+
+  - name: recovery failure ratio stays below threshold at sufficient volume
+    interval: 1m
+    input_series:
+      - series: 'converge_recovery_requests_total{outcome="snapshot_tail"}'
+        values: "0+2x10"
+      - series: 'converge_recovery_requests_total{outcome="retryable_failure"}'
+        values: "0+0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeRecoveryFailuresElevated
+        exp_alerts: []
+
+  - name: recovery failure ratio fires above threshold at sufficient volume
+    interval: 1m
+    input_series:
+      - series: 'converge_recovery_requests_total{outcome="snapshot_tail"}'
+        values: "0+0x9 19"
+      - series: 'converge_recovery_requests_total{outcome="retryable_failure"}'
+        values: "0+0x9 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ConvergeRecoveryFailuresElevated
+        exp_alerts:
+          - exp_labels: &recovery-warning
+              service: converge
+              severity: warning
+              subsystem: recovery
+            exp_annotations:
+              summary: Retryable recovery failures are elevated.
+              description: Retryable recovery failures exceed one percent of successful and retryable outcomes at sufficient volume.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#high-recovery-or-publication-latency
+
+  - name: outbox latency respects volume threshold distribution and for duration
+    interval: 1m
+    input_series:
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="0.005"}'
+        values: &hist-zero "0+0x61"
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="0.01"}'
+        values: *hist-zero
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="0.025"}'
+        values: *hist-zero
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="0.05"}'
+        values: *hist-zero
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="0.1"}'
+        values: *hist-zero
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="0.25"}'
+        values: *hist-zero
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="0.5"}'
+        values: *hist-zero
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="1"}'
+        values: *hist-zero
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="2.5"}'
+        values: &outbox-low "0+0x15 2+2x14 30+0x30"
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="5"}'
+        values: *outbox-low
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="10"}'
+        values: &outbox-total "0+0x14 1 3+2x44"
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="30"}'
+        values: *outbox-total
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="60"}'
+        values: *outbox-total
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="120"}'
+        values: *outbox-total
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="300"}'
+        values: *outbox-total
+      - series: 'converge_outbox_publication_duration_seconds_bucket{le="+Inf"}'
+        values: *outbox-total
+      - series: converge_outbox_publication_duration_seconds_count
+        values: *outbox-total
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ConvergeOutboxPublicationLatencyHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ConvergeOutboxPublicationLatencyHigh
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: ConvergeOutboxPublicationLatencyHigh
+        exp_alerts: []
+      - eval_time: 46m
+        alertname: ConvergeOutboxPublicationLatencyHigh
+        exp_alerts:
+          - exp_labels: *outbox-warning
+            exp_annotations:
+              summary: Outbox publication latency is high.
+              description: Publication p99 exceeds five seconds with sufficient observations for fifteen minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#high-recovery-or-publication-latency
+
+  - name: snapshot latency respects volume threshold distribution and for duration
+    interval: 1m
+    input_series:
+      - series: 'converge_snapshot_duration_seconds_bucket{le="0.005"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="0.01"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="0.025"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="0.05"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="0.1"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="0.25"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="0.5"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="1"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="2.5"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="5"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="10"}'
+        values: *hist-zero
+      - series: 'converge_snapshot_duration_seconds_bucket{le="30"}'
+        values: &snapshot-low "0+0x15 1+1x14 15+0x30"
+      - series: 'converge_snapshot_duration_seconds_bucket{le="60"}'
+        values: *snapshot-low
+      - series: 'converge_snapshot_duration_seconds_bucket{le="120"}'
+        values: &snapshot-total "0+0x14 1 2+1x44"
+      - series: 'converge_snapshot_duration_seconds_bucket{le="300"}'
+        values: *snapshot-total
+      - series: 'converge_snapshot_duration_seconds_bucket{le="+Inf"}'
+        values: *snapshot-total
+      - series: converge_snapshot_duration_seconds_count
+        values: *snapshot-total
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ConvergeSnapshotLatencyHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ConvergeSnapshotLatencyHigh
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: ConvergeSnapshotLatencyHigh
+        exp_alerts: []
+      - eval_time: 46m
+        alertname: ConvergeSnapshotLatencyHigh
+        exp_alerts:
+          - exp_labels: *snapshot-warning
+            exp_annotations:
+              summary: Snapshot capture latency is high.
+              description: Snapshot capture p99 exceeds sixty seconds with sufficient observations for fifteen minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#snapshot-failure
+
+  - name: compaction latency respects volume threshold distribution and for duration
+    interval: 1m
+    input_series:
+      - series: 'converge_compaction_duration_seconds_bucket{le="0.005"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="0.01"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="0.025"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="0.05"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="0.1"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="0.25"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="0.5"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="1"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="2.5"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="5"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="10"}'
+        values: *hist-zero
+      - series: 'converge_compaction_duration_seconds_bucket{le="30"}'
+        values: &compaction-low "0+0x15 1+1x14 15+0x30"
+      - series: 'converge_compaction_duration_seconds_bucket{le="60"}'
+        values: *compaction-low
+      - series: 'converge_compaction_duration_seconds_bucket{le="120"}'
+        values: &compaction-total "0+0x14 1 2+1x44"
+      - series: 'converge_compaction_duration_seconds_bucket{le="300"}'
+        values: *compaction-total
+      - series: 'converge_compaction_duration_seconds_bucket{le="+Inf"}'
+        values: *compaction-total
+      - series: converge_compaction_duration_seconds_count
+        values: *compaction-total
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ConvergeCompactionLatencyHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ConvergeCompactionLatencyHigh
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: ConvergeCompactionLatencyHigh
+        exp_alerts: []
+      - eval_time: 46m
+        alertname: ConvergeCompactionLatencyHigh
+        exp_alerts:
+          - exp_labels: *compaction-warning
+            exp_annotations:
+              summary: Compaction latency is high.
+              description: Compaction p99 exceeds sixty seconds with sufficient observations for fifteen minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#compaction-blocked-or-failed
+
+  - name: recovery latency respects volume threshold distribution and for duration
+    interval: 1m
+    input_series:
+      - series: 'converge_recovery_duration_seconds_bucket{le="0.005"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="0.01"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="0.025"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="0.05"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="0.1"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="0.25"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="0.5"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="1"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="2.5"}'
+        values: *hist-zero
+      - series: 'converge_recovery_duration_seconds_bucket{le="5"}'
+        values: &recovery-low "0+0x15 2+2x14 30+0x30"
+      - series: 'converge_recovery_duration_seconds_bucket{le="10"}'
+        values: *recovery-low
+      - series: 'converge_recovery_duration_seconds_bucket{le="30"}'
+        values: &recovery-total "0+0x14 1 3+2x44"
+      - series: 'converge_recovery_duration_seconds_bucket{le="60"}'
+        values: *recovery-total
+      - series: 'converge_recovery_duration_seconds_bucket{le="120"}'
+        values: *recovery-total
+      - series: 'converge_recovery_duration_seconds_bucket{le="300"}'
+        values: *recovery-total
+      - series: 'converge_recovery_duration_seconds_bucket{le="+Inf"}'
+        values: *recovery-total
+      - series: converge_recovery_duration_seconds_count
+        values: *recovery-total
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ConvergeRecoveryLatencyHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ConvergeRecoveryLatencyHigh
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: ConvergeRecoveryLatencyHigh
+        exp_alerts: []
+      - eval_time: 46m
+        alertname: ConvergeRecoveryLatencyHigh
+        exp_alerts:
+          - exp_labels: *recovery-warning
+            exp_annotations:
+              summary: Recovery request latency is high.
+              description: Recovery p99 exceeds ten seconds with sufficient observations for fifteen minutes.
+              runbook: docs/observability/runbooks/m2-8-incidents.md#high-recovery-or-publication-latency

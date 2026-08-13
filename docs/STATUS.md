@@ -79,9 +79,9 @@ Real distributed API observability acceptance is complete against isolated Postg
 failure boundaries. Real worker observability acceptance is complete against isolated PostgreSQL and
 Redis failure boundaries. The provider-neutral SLO, alert-threshold, inhibition/grouping, and
 incident-runbook policy is complete. The twelve metric-backed Prometheus alerts are encoded with
-repository-level policy validation; local `promtool` binary validation remains pending. External-probe
-and stuck-work alerts, Alertmanager/provider integration, deployment probe selection, dashboards, and
-benchmarks remain pending.
+repository-level policy validation and pinned Prometheus 3.5.0 syntax, PromQL, and deterministic rule
+fixtures enforced locally and in CI. External-probe and stuck-work alerts, Alertmanager/provider
+integration, deployment probe selection, dashboards, and benchmarks remain pending.
 
 ## Deferred by design
 

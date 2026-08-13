@@ -216,9 +216,14 @@ minimum-volume guards, and privacy constraints. The four external-probe alerts a
 `ConvergeBackgroundWorkStuck` remain deferred because the required probe history and attempt-age
 evidence do not exist in the fixed metric catalog.
 
-`promtool` was not available locally when these rules were encoded, so binary PromQL validation
-remains pending for the final M2 gate. The rule file is not deployed, and Alertmanager routing,
-provider integration, and dashboards remain pending.
+Prometheus 3.5.0
+(`prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996`)
+now validates rule syntax, PromQL, and deterministic firing/non-firing fixtures for exactly those 12
+alerts through `pnpm check:prometheus`, locally and in CI. The runner accepts an explicitly supplied
+`PROMTOOL_BIN`; otherwise it uses the pinned official multi-platform image with only the Prometheus
+rule directory mounted read-only. The four probe alerts and stuck-work alert remain deferred. The rule
+file is not deployed, and Alertmanager routing, provider integration, dashboards, and benchmarks
+remain pending.
 
 ### Deferred stuck-work alert
 

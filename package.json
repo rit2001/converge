@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "turbo build",
+    "check:prometheus": "node scripts/check-prometheus.mjs",
     "dev": "node scripts/root-environment.mjs pnpm run dev:workspace",
     "dev:workspace": "turbo dev --parallel",
     "format": "prettier --write .",
