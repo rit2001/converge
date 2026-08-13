@@ -16,6 +16,11 @@ import type {
 } from "./compaction-coordinator.js";
 import { parseWorkerEnvironment } from "./env.js";
 import type { DeliveryStream } from "./redis-stream.js";
+import {
+  InstanceWorkerOperationalState,
+  WorkerOperationalListenerStartupError,
+  type WorkerOperationalListener,
+} from "./operational.js";
 
 async function flush(): Promise<void> {
   await Promise.resolve();
@@ -217,6 +222,22 @@ class ControlledReconnectScheduler {
   }
 }
 
+class FakeOperationalListener implements WorkerOperationalListener {
+  startCalls = 0;
+  closeCalls = 0;
+  startFailure: Error | undefined;
+
+  start(): Promise<void> {
+    this.startCalls += 1;
+    return this.startFailure ? Promise.reject(this.startFailure) : Promise.resolve();
+  }
+
+  close(): Promise<void> {
+    this.closeCalls += 1;
+    return Promise.resolve();
+  }
+}
+
 function harness(stream = new FakeStream(), compactionEnabled = false) {
   const database = new FakeDatabase();
   const snapshots = new FakeSnapshots();
@@ -281,6 +302,83 @@ function harness(stream = new FakeStream(), compactionEnabled = false) {
 }
 
 describe("worker application supervision", () => {
+  it("does not construct an operational listener when operations are disabled", async () => {
+    const state = harness();
+    const createOperationalListener = vi.fn();
+    state.factories.createOperationalListener = createOperationalListener;
+    const application = await createWorkerApplication(state.environment, state.factories);
+    expect(createOperationalListener).not.toHaveBeenCalled();
+    await application.shutdown("PROCESS_END");
+  });
+
+  it("sanitizes listener bind failure and cleans every partially owned resource once", async () => {
+    const state = harness(new FakeStream(), true);
+    const listener = new FakeOperationalListener();
+    listener.startFailure = new Error("private host token URL");
+    state.factories.createOperationalListener = vi.fn(() => listener);
+    const environment = {
+      ...state.environment,
+      WORKER_OPERATIONS_ENABLED: true,
+    };
+    const application = await createWorkerApplication(environment, state.factories);
+
+    const error = await application.start().catch((caught: unknown) => caught);
+    expect(error).toEqual(new WorkerOperationalListenerStartupError());
+    expect(String(error)).not.toMatch(/private|host|token|URL/);
+    expect(listener.startCalls).toBe(1);
+    expect(listener.closeCalls).toBe(1);
+    expect(state.snapshots.startCalls).toBe(0);
+    expect(state.snapshots.stopCalls).toBe(1);
+    expect(state.compaction.stopCalls).toBe(1);
+    expect(state.stream.closeCalls).toEqual([false]);
+    expect(state.database.endCalls).toBe(1);
+    await application.shutdown("SIGTERM");
+    expect(listener.closeCalls).toBe(1);
+  });
+
+  it("composes core and Redis/outbox readiness and fences recovery after shutdown", async () => {
+    const state = harness(new FakeStream(), true);
+    const listener = new FakeOperationalListener();
+    const operationalState = new InstanceWorkerOperationalState();
+    state.stream.connectOutcomes.push(new Error("redis unavailable"));
+    state.factories.createOperationalListener = vi.fn(() => listener);
+    const environment = {
+      ...state.environment,
+      WORKER_OPERATIONS_ENABLED: true,
+    };
+    const application = await createWorkerApplication(environment, state.factories, {
+      operationalState,
+    });
+
+    await application.start();
+    await flush();
+    expect(listener.startCalls).toBe(1);
+    expect(operationalState.isCoreReady()).toBe(true);
+    expect(operationalState.isDeliveryReady()).toBe(false);
+    state.snapshots.capture();
+    state.compaction.runCycle();
+    expect(state.snapshots.captures).toBe(1);
+    expect(state.compaction.cycles).toBe(1);
+
+    await state.scheduler.continue();
+    expect(operationalState.isDeliveryReady()).toBe(true);
+    state.stream.ready = false;
+    state.stream.connectOutcomes.push(new Error("redis lost"));
+    await state.scheduler.continue();
+    expect(operationalState.isCoreReady()).toBe(true);
+    expect(operationalState.isDeliveryReady()).toBe(false);
+
+    const first = application.shutdown("SIGINT");
+    expect(application.shutdown("SIGTERM")).toBe(first);
+    await first;
+    operationalState.setCoreReady(true);
+    operationalState.setRedisReady(true);
+    operationalState.setOutboxAccepting(true);
+    expect(operationalState.isCoreReady()).toBe(false);
+    expect(operationalState.isDeliveryReady()).toBe(false);
+    expect(listener.closeCalls).toBe(1);
+  });
+
   it("starts snapshots before Redis and runs both components when Redis is ready", async () => {
     const state = harness();
     const telemetry = new InMemoryTelemetryRecorder();

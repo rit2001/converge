@@ -3,6 +3,7 @@ export * from "./compaction-coordinator.js";
 export * from "./env.js";
 export * from "./lifecycle.js";
 export * from "./logger.js";
+export * from "./operational.js";
 export * from "./redis-stream.js";
 export * from "./snapshot-coordinator.js";
 export * from "./telemetry.js";

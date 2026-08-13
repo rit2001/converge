@@ -73,8 +73,9 @@ in-memory recorders, immutable export snapshots, explicit error classification, 
 failure isolation. Distributed API delivery/recovery instrumentation is complete. Worker
 outbox/snapshot/compaction instrumentation is complete. Deterministic Prometheus text rendering is
 complete. API liveness, PostgreSQL-backed HTTP readiness, composite socket-readiness, and opt-in
-Bearer-protected metrics endpoints are complete. Worker operational endpoints, deployment probe
-selection, alerts, dashboards, and benchmarks remain pending.
+Bearer-protected metrics endpoints are complete. The opt-in worker operational listener now exposes
+separate lifecycle, PostgreSQL-backed core, and Redis/outbox delivery health plus protected metrics.
+Deployment probe selection, alerts, dashboards, and benchmarks remain pending.
 
 ## Deferred by design
 

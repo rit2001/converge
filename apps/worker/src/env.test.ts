@@ -46,6 +46,11 @@ describe("worker environment", () => {
       COMPACTION_RETRY_BASE_MS: 5_000,
       COMPACTION_RETRY_CAP_MS: 300_000,
       COMPACTION_RETAINED_STATE_LIMIT: 1_000,
+      WORKER_OPERATIONS_ENABLED: false,
+      WORKER_OPERATIONS_HOST: "127.0.0.1",
+      WORKER_OPERATIONS_PORT: 9_091,
+      WORKER_METRICS_ENABLED: false,
+      WORKER_METRICS_BEARER_TOKEN: "",
     });
   });
 
@@ -57,6 +62,61 @@ describe("worker environment", () => {
       expect(() => parseWorkerEnvironment({ ...required, COMPACTION_ENABLED: value })).toThrowError(
         new WorkerEnvironmentConfigurationError(["COMPACTION_ENABLED"]),
       );
+  });
+
+  it("strictly validates opt-in worker operations and protected metrics", () => {
+    const token = "m".repeat(32);
+    expect(
+      parseWorkerEnvironment({
+        ...required,
+        WORKER_OPERATIONS_ENABLED: "true",
+        WORKER_OPERATIONS_HOST: "127.0.0.1",
+        WORKER_OPERATIONS_PORT: "9091",
+        WORKER_METRICS_ENABLED: "true",
+        WORKER_METRICS_BEARER_TOKEN: token,
+      }),
+    ).toMatchObject({
+      WORKER_OPERATIONS_ENABLED: true,
+      WORKER_OPERATIONS_HOST: "127.0.0.1",
+      WORKER_OPERATIONS_PORT: 9_091,
+      WORKER_METRICS_ENABLED: true,
+      WORKER_METRICS_BEARER_TOKEN: token,
+    });
+    for (const field of ["WORKER_OPERATIONS_ENABLED", "WORKER_METRICS_ENABLED"])
+      expect(() => parseWorkerEnvironment({ ...required, [field]: "TRUE" })).toThrowError(
+        new WorkerEnvironmentConfigurationError([field]),
+      );
+    expect(() =>
+      parseWorkerEnvironment({ ...required, WORKER_METRICS_ENABLED: "true" }),
+    ).toThrowError(
+      new WorkerEnvironmentConfigurationError([
+        "WORKER_METRICS_BEARER_TOKEN",
+        "WORKER_METRICS_ENABLED",
+      ]),
+    );
+  });
+
+  it("rejects unsafe operational hosts, ports, and secret tokens without exposing values", () => {
+    const secret = `secret-token\n${"x".repeat(257)}`;
+    const cases: Array<[string, string]> = [
+      ["WORKER_OPERATIONS_HOST", "bad\nhost"],
+      ["WORKER_OPERATIONS_PORT", "0"],
+      ["WORKER_OPERATIONS_PORT", "65536"],
+      ["WORKER_METRICS_BEARER_TOKEN", "short"],
+      ["WORKER_METRICS_BEARER_TOKEN", `${"x".repeat(31)}\n`],
+      ["WORKER_METRICS_BEARER_TOKEN", secret],
+    ];
+    for (const [field, value] of cases) {
+      let message = "";
+      try {
+        parseWorkerEnvironment({ ...required, [field]: value });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toBe(`Invalid worker environment configuration: ${field}`);
+      expect(message).not.toContain("secret-token");
+      expect(message).not.toContain("bad");
+    }
   });
 
   it("rejects unsafe concurrency, timing, size, and Redis URL values", () => {
@@ -220,5 +280,27 @@ describe("worker environment", () => {
       expect(entries.get(name)).toBe(String(parsed[name]));
       expect(passThrough.has(name)).toBe(true);
     }
+  });
+
+  it("documents every worker operational variable with its parsed default", async () => {
+    const example = await readFile(new URL("../../../.env.example", import.meta.url), "utf8");
+    const entries = new Map(
+      example
+        .split("\n")
+        .filter((line) => line && !line.startsWith("#"))
+        .map((line) => {
+          const separator = line.indexOf("=");
+          return [line.slice(0, separator), line.slice(separator + 1)] as const;
+        }),
+    );
+    const parsed = parseWorkerEnvironment(required);
+    for (const name of [
+      "WORKER_OPERATIONS_ENABLED",
+      "WORKER_OPERATIONS_HOST",
+      "WORKER_OPERATIONS_PORT",
+      "WORKER_METRICS_ENABLED",
+      "WORKER_METRICS_BEARER_TOKEN",
+    ] as const)
+      expect(entries.get(name)).toBe(String(parsed[name]));
   });
 });

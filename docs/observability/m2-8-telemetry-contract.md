@@ -112,5 +112,22 @@ comparison rather than board/user authentication. Missing and invalid credential
 the Prometheus content type and body, and return one fixed plain-text 503 response if snapshotting or
 rendering fails. Scrapes emit no telemetry and perform no board, PostgreSQL, or Redis work.
 
-Worker HTTP exposition, deployment probe selection, dashboards, alert thresholds, external
-collectors, deployment integration, and benchmark claims remain explicitly deferred.
+## Worker operational endpoints
+
+The worker optionally owns a separate Node HTTP listener when `WORKER_OPERATIONS_ENABLED` is exactly
+`true`; disabled operation constructs and binds no listener. Its three fixed-body health signals are
+deliberately separate. `GET /health/live` reports the worker lifecycle. `GET /health/ready` reports
+the PostgreSQL-verified core after snapshot coordination and optional compaction have started. `GET
+/health/delivery-ready` additionally requires the current Redis connection and an outbox publisher
+that is accepting work. Redis failure can therefore make delivery readiness unavailable while
+snapshot and compaction work remains ready.
+
+Worker metrics are a second opt-in through `WORKER_METRICS_ENABLED=true`, require the operational
+listener, and use a dedicated bounded Bearer token with timing-safe comparison. Authorized scrapes
+render the existing worker-owned recorder without invoking PostgreSQL, Redis, outbox, snapshot, or
+compaction work. Listener, snapshot, rendering, and fallback failures use fixed sanitized responses
+and cannot change worker scheduling or shutdown. Shutdown makes all health unavailable before drain
+and closes the listener through the existing idempotent ownership boundary.
+
+Deployment probe selection, dashboards, alert thresholds, external collectors, deployment
+integration, and benchmark claims remain explicitly deferred.

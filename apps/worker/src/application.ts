@@ -11,6 +11,7 @@ import {
   safeTelemetryRecorder,
   type StructuredLogger,
   type TelemetryRecorder,
+  type TelemetrySnapshot,
 } from "@converge/observability";
 import type { WorkerEnvironment } from "./env.js";
 import {
@@ -20,6 +21,14 @@ import {
   type CompactionExecutionRepository,
 } from "./compaction-coordinator.js";
 import { createWorkerLogger } from "./logger.js";
+import {
+  InstanceWorkerOperationalState,
+  WorkerOperationalListenerStartupError,
+  createNodeWorkerOperationalListener,
+  type WorkerOperationalListener,
+  type WorkerOperationalListenerFactory,
+  type WorkerOperationalState,
+} from "./operational.js";
 import { RedisDeliveryStream, type DeliveryStream } from "./redis-stream.js";
 import {
   SnapshotCoordinator,
@@ -88,6 +97,7 @@ export interface WorkerApplicationFactories {
     telemetry: TelemetryRecorder;
     telemetryClock: WorkerTelemetryClock;
   }): OutboxPublisherComponent;
+  createOperationalListener: WorkerOperationalListenerFactory;
   reconnectScheduler: Pick<WorkerScheduler, "sleep">;
 }
 
@@ -163,6 +173,7 @@ const productionWorkerApplicationFactories: WorkerApplicationFactories = {
       telemetry,
       telemetryClock,
     ),
+  createOperationalListener: createNodeWorkerOperationalListener,
   reconnectScheduler: systemWorkerScheduler,
 };
 
@@ -185,6 +196,8 @@ export class WorkerApplication {
     private readonly compaction: CompactionCoordinatorComponent | undefined,
     private readonly stream: DeliveryStream,
     private readonly outbox: OutboxPublisherComponent,
+    private readonly operationalState: WorkerOperationalState,
+    private readonly operationalListener: WorkerOperationalListener | undefined,
     private readonly reconnectDelayMs: number,
     private readonly shutdownGraceMs: number,
     private readonly logger: StructuredLogger,
@@ -212,12 +225,19 @@ export class WorkerApplication {
   private async startOnce(): Promise<void> {
     this.transitionLifecycle("starting");
     try {
+      try {
+        await this.operationalListener?.start();
+      } catch {
+        throw new WorkerOperationalListenerStartupError();
+      }
       await this.database.query("SELECT 1");
       if (this.stopping) return;
       await this.snapshots.start();
       if (this.stopping) return;
       await this.compaction?.start();
       if (this.stopping) return;
+      this.updateOperational(() => this.operationalState.setCoreReady(true));
+      this.updateOperational(() => this.operationalState.setOutboxAccepting(true));
       this.outboxRun = this.runOutbox();
       this.redisRun = this.maintainRedisConnection();
       this.transitionLifecycle("ready");
@@ -237,20 +257,29 @@ export class WorkerApplication {
           { component: "outbox", code: "OUTBOX_PUBLISHER_STOPPED" },
           "Outbox publisher stopped unexpectedly",
         );
+    } finally {
+      this.updateOperational(() => this.operationalState.setOutboxAccepting(false));
     }
   }
 
   private async maintainRedisConnection(): Promise<void> {
     while (!this.controller.signal.aborted) {
+      this.updateOperational(() => this.operationalState.setRedisReady(this.stream.isReady()));
       if (!this.stream.isReady()) {
         try {
           await this.stream.connect();
+          this.updateOperational(() =>
+            this.operationalState.setRedisReady(
+              !this.controller.signal.aborted && this.stream.isReady(),
+            ),
+          );
           if (!this.controller.signal.aborted && this.stream.isReady())
             this.logger.info(
               { component: "worker", outcome: "ready" },
               "Worker connected to Redis",
             );
         } catch {
+          this.updateOperational(() => this.operationalState.setRedisReady(false));
           if (!this.controller.signal.aborted)
             this.logger.warn(
               { component: "redis", code: "REDIS_CONNECT_FAILED" },
@@ -272,6 +301,7 @@ export class WorkerApplication {
       this.snapshots.stop(),
       this.compaction?.stop(),
       this.outbox.drain(this.shutdownGraceMs),
+      this.operationalListener?.close(),
     ]);
     const outboxDrained = outboxResult.status === "fulfilled" && outboxResult.value;
     if (!outboxDrained) this.outbox.abandonActiveLeases();
@@ -297,6 +327,7 @@ export class WorkerApplication {
   ): void {
     if (this.lifecycle === next || this.lifecycle === "stopped") return;
     this.lifecycle = next;
+    this.updateOperational(() => this.operationalState.transition(next));
     this.telemetry.emit({
       schemaVersion: 1,
       eventName: "worker.lifecycle",
@@ -305,6 +336,14 @@ export class WorkerApplication {
       timestamp: new Date().toISOString(),
       code: next.toUpperCase(),
     });
+  }
+
+  private updateOperational(update: () => void): void {
+    try {
+      update();
+    } catch {
+      // Operational observation cannot alter worker correctness or cleanup.
+    }
   }
 }
 
@@ -362,17 +401,33 @@ export async function createWorkerApplication(
   options: {
     telemetry?: TelemetryRecorder;
     telemetryClock?: WorkerTelemetryClock;
+    telemetrySnapshot?: () => TelemetrySnapshot;
+    operationalState?: WorkerOperationalState;
   } = {},
 ): Promise<WorkerApplication> {
   const factories = { ...productionWorkerApplicationFactories, ...overrides };
   const telemetry = options.telemetry ?? noOpTelemetryRecorder;
+  const snapshotTelemetry = options.telemetrySnapshot ?? recorderSnapshot(telemetry);
   const telemetryClock = options.telemetryClock ?? systemWorkerTelemetryClock;
+  const operationalState = options.operationalState ?? new InstanceWorkerOperationalState();
   const logger = factories.createLogger(environment.LOG_LEVEL);
   let database: WorkerApplicationDatabase | undefined;
   let snapshots: SnapshotCoordinatorComponent | undefined;
   let compaction: CompactionCoordinatorComponent | undefined;
   let stream: DeliveryStream | undefined;
+  let operationalListener: WorkerOperationalListener | undefined;
   try {
+    if (environment.WORKER_OPERATIONS_ENABLED)
+      operationalListener = factories.createOperationalListener({
+        configuration: {
+          host: environment.WORKER_OPERATIONS_HOST,
+          port: environment.WORKER_OPERATIONS_PORT,
+          metricsEnabled: environment.WORKER_METRICS_ENABLED,
+          metricsBearerToken: environment.WORKER_METRICS_BEARER_TOKEN,
+        },
+        state: operationalState,
+        ...(snapshotTelemetry === undefined ? {} : { snapshotTelemetry }),
+      });
     database = factories.createDatabase(environment.DATABASE_URL);
     snapshots = factories.createSnapshotCoordinator({
       database,
@@ -408,6 +463,8 @@ export async function createWorkerApplication(
       compaction,
       stream,
       outbox,
+      operationalState,
+      operationalListener,
       environment.OUTBOX_IDLE_POLL_MS,
       environment.WORKER_SHUTDOWN_GRACE_MS,
       logger,
@@ -420,7 +477,18 @@ export async function createWorkerApplication(
       snapshots?.stop(),
       stream?.close(true),
       database?.end(),
+      operationalListener?.close(),
     ]);
     throw error;
+  }
+}
+
+function recorderSnapshot(recorder: TelemetryRecorder): (() => TelemetrySnapshot) | undefined {
+  try {
+    const snapshot = (recorder as TelemetryRecorder & { snapshot?: () => TelemetrySnapshot })
+      .snapshot;
+    return typeof snapshot === "function" ? () => snapshot.call(recorder) : undefined;
+  } catch {
+    return undefined;
   }
 }

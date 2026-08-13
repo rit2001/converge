@@ -35,6 +35,28 @@ const strictBoolean = z
   .enum(["true", "false"])
   .default("false")
   .transform((value) => value === "true");
+const operationsHost = z
+  .string()
+  .min(1)
+  .max(255)
+  .refine(
+    (value) =>
+      Buffer.byteLength(value, "utf8") <= 255 &&
+      [...value].every((character) => {
+        const code = character.charCodeAt(0);
+        return code >= 33 && code !== 127;
+      }),
+  );
+const metricsBearerToken = z.string().refine((value) => {
+  const bytes = Buffer.byteLength(value, "utf8");
+  return (
+    (bytes === 0 || (bytes >= 32 && bytes <= 256)) &&
+    [...value].every((character) => {
+      const code = character.charCodeAt(0);
+      return code >= 32 && code !== 127;
+    })
+  );
+});
 
 const redisUrlSchema = z
   .string()
@@ -46,6 +68,11 @@ const environmentShape = {
   DATABASE_URL: z.string().url(),
   REDIS_URL: redisUrlSchema.default("redis://localhost:6379"),
   LOG_LEVEL: z.enum(["error", "warn", "info", "silent"]).default("info"),
+  WORKER_OPERATIONS_ENABLED: strictBoolean,
+  WORKER_OPERATIONS_HOST: operationsHost.default("127.0.0.1"),
+  WORKER_OPERATIONS_PORT: z.coerce.number().int().min(1).max(65_535).default(9_091),
+  WORKER_METRICS_ENABLED: strictBoolean,
+  WORKER_METRICS_BEARER_TOKEN: metricsBearerToken.default(""),
   WORKER_ID: z
     .string()
     .regex(/^[A-Za-z0-9._:-]{1,128}$/)
@@ -142,6 +169,18 @@ const environmentShape = {
 export const workerEnvironmentVariableNames = Object.freeze(Object.keys(environmentShape));
 
 const environmentSchema = z.object(environmentShape).superRefine((environment, context) => {
+  if (environment.WORKER_METRICS_ENABLED && !environment.WORKER_OPERATIONS_ENABLED)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["WORKER_METRICS_ENABLED"],
+      message: "Worker metrics require the operational listener",
+    });
+  if (environment.WORKER_METRICS_ENABLED && environment.WORKER_METRICS_BEARER_TOKEN.length === 0)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["WORKER_METRICS_BEARER_TOKEN"],
+      message: "Worker metrics require a bearer token",
+    });
   if (
     environment.OUTBOX_LEASE_MS <=
     environment.REDIS_PUBLISH_TIMEOUT_MS + environment.OUTBOX_FINALIZATION_MARGIN_MS
