@@ -1,20 +1,22 @@
 import { describe, expect, it } from "vitest";
-import type { Environment } from "./env.js";
+import { parseEnvironment, type Environment } from "./env.js";
 import { AuthenticationError, DevelopmentAuthAdapter, type AuthAdapter } from "./auth.js";
 
 const configuredUserId = "00000000-0000-4000-8000-000000000011";
 
 function environment(overrides: Partial<Environment> = {}): Environment {
   return {
-    NODE_ENV: "development",
-    HOST: "127.0.0.1",
-    API_PORT: 4000,
-    WEB_ORIGIN: "http://127.0.0.1:3000",
-    DATABASE_URL: "postgresql://localhost/converge",
-    REDIS_URL: "redis://localhost:6379",
-    LOG_LEVEL: "silent",
-    DEV_AUTH_USER_ID: configuredUserId,
-    DEV_AUTH_USER_NAME: "Configured Developer",
+    ...parseEnvironment({
+      NODE_ENV: "development",
+      HOST: "127.0.0.1",
+      API_PORT: "4000",
+      WEB_ORIGIN: "http://127.0.0.1:3000",
+      DATABASE_URL: "postgresql://localhost/converge",
+      REDIS_URL: "redis://localhost:6379",
+      LOG_LEVEL: "silent",
+      DEV_AUTH_USER_ID: configuredUserId,
+      DEV_AUTH_USER_NAME: "Configured Developer",
+    }),
     ...overrides,
   };
 }

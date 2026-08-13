@@ -41,6 +41,9 @@ importers:
       '@converge/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@converge/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
       '@converge/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
@@ -53,6 +56,9 @@ importers:
       fastify:
         specifier: 5.5.0
         version: 5.5.0
+      redis:
+        specifier: 6.2.0
+        version: 6.2.0
       socket.io:
         specifier: 4.8.1
         version: 4.8.1
@@ -119,6 +125,34 @@ importers:
         specifier: 3.2.4
         version: 3.2.4(@types/node@22.18.0)(jsdom@26.1.0)(tsx@4.20.4)
 
+  apps/worker:
+    dependencies:
+      '@converge/database':
+        specifier: workspace:*
+        version: link:../../packages/database
+      '@converge/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
+      '@converge/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      redis:
+        specifier: 6.2.0
+        version: 6.2.0
+      zod:
+        specifier: 3.25.76
+        version: 3.25.76
+    devDependencies:
+      '@types/node':
+        specifier: 22.18.0
+        version: 22.18.0
+      tsx:
+        specifier: 4.20.4
+        version: 4.20.4
+      vitest:
+        specifier: 3.2.4
+        version: 3.2.4(@types/node@22.18.0)(jsdom@26.1.0)(tsx@4.20.4)
+
   packages/canvas-engine:
     dependencies:
       '@converge/protocol':
@@ -159,6 +193,9 @@ importers:
 
   packages/observability:
     devDependencies:
+      js-yaml:
+        specifier: 4.3.1
+        version: 4.3.1
       vitest:
         specifier: 3.2.4
         version: 3.2.4(@types/node@22.18.0)(jsdom@26.1.0)(tsx@4.20.4)
@@ -190,7 +227,35 @@ importers:
         version: 3.2.4(@types/node@22.18.0)(jsdom@26.1.0)(tsx@4.20.4)
 
   tests/failure:
+    dependencies:
+      '@converge/api':
+        specifier: workspace:*
+        version: link:../../apps/api
+      '@converge/canvas-engine':
+        specifier: workspace:*
+        version: link:../../packages/canvas-engine
+      '@converge/database':
+        specifier: workspace:*
+        version: link:../../packages/database
+      '@converge/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
+      '@converge/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@converge/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
+      '@converge/worker':
+        specifier: workspace:*
+        version: link:../../apps/worker
+      redis:
+        specifier: 6.2.0
+        version: 6.2.0
     devDependencies:
+      '@types/node':
+        specifier: 22.18.0
+        version: 22.18.0
       vitest:
         specifier: 3.2.4
         version: 3.2.4(@types/node@22.18.0)(jsdom@26.1.0)(tsx@4.20.4)
@@ -897,6 +962,42 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  '@redis/bloom@6.2.0':
+    resolution: {integrity: sha512-ggQvzpeCKnybwUrEiMVVtE1Np4vWnRfpeAaIP2MdZiVw7PHOhJrF4cONVuLRn1TkMi6ehp2OPjTOMK+8XmiQSQ==}
+    engines: {node: '>= 20.0.0'}
+    peerDependencies:
+      '@redis/client': ^6.2.0
+
+  '@redis/client@6.2.0':
+    resolution: {integrity: sha512-HHszna68MTBRiDZV3Wo2wANH7Z5v/nuh+ZyCAGBce0PS8tDcg1/yzZ1vqbKbUyTdz1wB54kqZxXrnPwpR8Ivdw==}
+    engines: {node: '>= 20.0.0'}
+    peerDependencies:
+      '@node-rs/xxhash': ^1.1.0
+      '@opentelemetry/api': '>=1 <2'
+    peerDependenciesMeta:
+      '@node-rs/xxhash':
+        optional: true
+      '@opentelemetry/api':
+        optional: true
+
+  '@redis/json@6.2.0':
+    resolution: {integrity: sha512-oweO7PfHWYXkgVT88K+Fm3Wx98lKYKAEXaH162gVbw1kmBOBVQHxw0Yjh1p6BYBUIQMHqLyWwYe99eK7/hD1VQ==}
+    engines: {node: '>= 20.0.0'}
+    peerDependencies:
+      '@redis/client': ^6.2.0
+
+  '@redis/search@6.2.0':
+    resolution: {integrity: sha512-chLEQfalFW3+uCPE99XoIOZhcQ3eF7S3fGxgiiaPf6MMrOZHEiTvgMnXR4xXZX0yDecyoWjGYlQQKTYag/ZExg==}
+    engines: {node: '>= 20.0.0'}
+    peerDependencies:
+      '@redis/client': ^6.2.0
+
+  '@redis/time-series@6.2.0':
+    resolution: {integrity: sha512-/H/eE/lnhZLZYpHGpI+ZN7TePb7isEaub8b07oQcTDQptPslVKdUFwNhUm+hQHks781oh+F1Leiip1WHh4HfWw==}
+    engines: {node: '>= 20.0.0'}
+    peerDependencies:
+      '@redis/client': ^6.2.0
+
   '@rollup/rollup-android-arm-eabi@4.62.4':
     resolution: {integrity: sha512-RrPokAb7dmbxFoeO3TloqHyOjgye8RkBhSqmp4aJMIex4c9r46ZstPnleDQOq1t46VOVjwIuwNogIqbodV1Vvg==}
     cpu: [arm]
@@ -1256,6 +1357,10 @@ packages:
 
   client-only@0.0.1:
     resolution: {integrity: sha512-IV3Ou0jSMzZrd3pZ48nLkT9DA7Ag1pnPzaiQhpW7c3RbcqqzvzzVu+L8gfqMp/8IM2MQtSiqaCxrrcfu8I8rMA==}
+
+  cluster-key-slot@1.1.2:
+    resolution: {integrity: sha512-RMr0FhtfXemyinomL4hrWcYJxmX6deFdCxpJzhDttxgO1+bcCnkk+9drydLVDmAMG7NE6aN/fl4F7ucU/90gAA==}
+    engines: {node: '>=0.10.0'}
 
   color-convert@2.0.1:
     resolution: {integrity: sha512-RRECPsj7iu/xb5oKYcsFHSppFNnsj/52OVTRKb4zP5onXwVF3zVmmToNcOfGC+CRDpfK/U584fMg38ZHCaElKQ==}
@@ -1992,6 +2097,10 @@ packages:
   real-require@0.2.0:
     resolution: {integrity: sha512-57frrGM/OCTLqLOAh0mhVA9VBMHd+9U7Zb2THMGdBUoZVOtGbJzjxsYGDJ3A9AYYCP4hn6y1TVbaOfzWtm5GFg==}
     engines: {node: '>= 12.13.0'}
+
+  redis@6.2.0:
+    resolution: {integrity: sha512-BShYVyT0Gx67CE80xry5XroSSv6Vxr60yKs0HRiBbUc7kHm+bY7gvSDBBgTjuiV/reWKeZWLyA1ebC5z359wRQ==}
+    engines: {node: '>= 20.0.0'}
 
   require-from-string@2.0.2:
     resolution: {integrity: sha512-Xf0nWe6RseziFMu+Ap9biiUbmplq6S9/p+7w7YXP/JBHhrUDDUhwa+vANyubuqfZWTveU//DYVGsDG7RKL/vEw==}
@@ -2848,6 +2957,26 @@ snapshots:
     dependencies:
       playwright: 1.55.0
 
+  '@redis/bloom@6.2.0(@redis/client@6.2.0)':
+    dependencies:
+      '@redis/client': 6.2.0
+
+  '@redis/client@6.2.0':
+    dependencies:
+      cluster-key-slot: 1.1.2
+
+  '@redis/json@6.2.0(@redis/client@6.2.0)':
+    dependencies:
+      '@redis/client': 6.2.0
+
+  '@redis/search@6.2.0(@redis/client@6.2.0)':
+    dependencies:
+      '@redis/client': 6.2.0
+
+  '@redis/time-series@6.2.0(@redis/client@6.2.0)':
+    dependencies:
+      '@redis/client': 6.2.0
+
   '@rollup/rollup-android-arm-eabi@4.62.4':
     optional: true
 
@@ -3200,6 +3329,8 @@ snapshots:
   check-error@2.1.3: {}
 
   client-only@0.0.1: {}
+
+  cluster-key-slot@1.1.2: {}
 
   color-convert@2.0.1:
     dependencies:
@@ -3922,6 +4053,17 @@ snapshots:
   react@19.1.1: {}
 
   real-require@0.2.0: {}
+
+  redis@6.2.0:
+    dependencies:
+      '@redis/bloom': 6.2.0(@redis/client@6.2.0)
+      '@redis/client': 6.2.0
+      '@redis/json': 6.2.0(@redis/client@6.2.0)
+      '@redis/search': 6.2.0(@redis/client@6.2.0)
+      '@redis/time-series': 6.2.0(@redis/client@6.2.0)
+    transitivePeerDependencies:
+      - '@node-rs/xxhash'
+      - '@opentelemetry/api'
 
   require-from-string@2.0.2: {}
 

@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { Writable } from "node:stream";
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
@@ -5,19 +6,33 @@ import rateLimit from "@fastify/rate-limit";
 import { Server, type DefaultEventsMap } from "socket.io";
 import { z } from "zod";
 import {
+  noOpTelemetryRecorder,
+  safeRenderPrometheus,
+  safeTelemetryRecorder,
+  type TelemetryRecorder,
+  type TelemetrySnapshot,
+} from "@converge/observability";
+import {
+  BoardRecoveryError,
+  BoardRecoveryMaterialRepository,
   BoardRepository,
   RepositoryError,
+  type VerifiedBoardRecoveryMaterial,
   type BoardRepositoryHooks,
   type DatabasePool,
 } from "@converge/database";
 import {
   MAX_SYNC_BATCH_SIZE,
   boardAccessRevokedEventSchema,
+  boardRecoveryMaterialSchema,
+  boardRecoveryRequestQuerySchema,
+  committedOperationSchema,
   createBoardRequestSchema,
   durableCommandSchema,
   httpInternalErrorResponseSchema,
   joinBoardAckSchema,
   joinBoardRequestSchema,
+  membershipRevokedDeliveryEnvelopeSchema,
   operationAckSchema,
   operationRangeQuerySchema,
   operationRangeResponseSchema,
@@ -32,7 +47,24 @@ import {
   type ServerToClientEvents,
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
+import { InstanceApiOperationalState, type ApiOperationalState } from "./api-operational-state.js";
+import { BoardRecoveryService, type BoardRecoveryLoadResult } from "./board-recovery-service.js";
+export { BoardRecoveryService } from "./board-recovery-service.js";
 import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
+import {
+  BoardDeliveryHeadWatchdog,
+  BoardDeliveryHeadWatchdogError,
+  defaultBoardDeliveryHeadWatchdogConfiguration,
+  type BoardDeliveryHeadWatchdogFactory,
+  type BoardDeliveryHeadWatchdogLifecycleEvent,
+  type BoardDeliveryHeadWatchdogOwner,
+} from "./board-delivery-head-watchdog.js";
+import type {
+  DeliveryRuntimeFactory,
+  DeliveryRuntimeLifecycleEvent,
+  DeliveryRuntimeObserver,
+  DeliveryRuntimeOwner,
+} from "./delivery-runtime.js";
 import type { Environment } from "./env.js";
 
 function errorStatus(code: RepositoryError["code"]): number {
@@ -64,6 +96,52 @@ function failedAck(error: unknown): ProtocolError {
     message: "Operation could not be committed",
     retryable: true,
   };
+}
+
+const durableRecoveryFailureCodes = new Set<BoardRecoveryError["code"]>([
+  "MISSING_BOARD_HEAD",
+  "MISSING_REQUIRED_SNAPSHOT",
+  "SNAPSHOT_BELOW_RECOVERY_FLOOR",
+  "SNAPSHOT_TOO_LARGE",
+  "SNAPSHOT_CORRUPT",
+  "UNSUPPORTED_SNAPSHOT_VERSION",
+  "SNAPSHOT_HEAD_BEYOND_BOARD",
+  "TAIL_LIMIT_EXCEEDED",
+  "TAIL_GAP",
+  "TAIL_ORDER_CONFLICT",
+  "WRONG_BOARD_OPERATION",
+  "MALFORMED_OPERATION",
+  "OPERATION_BEYOND_HEAD",
+  "REDUCER_FAILURE",
+  "PROJECTION_MISMATCH",
+  "CANONICAL_HASH_MISMATCH",
+  "NO_COMPLETE_RECOVERY_CHAIN",
+]);
+
+function recoveryBlocked(error: BoardRecoveryError): ProtocolError | null {
+  if (!durableRecoveryFailureCodes.has(error.code)) return null;
+  return protocolErrorSchema.parse({
+    ok: false,
+    code: "RECOVERY_BLOCKED",
+    message: "Authoritative board recovery is unavailable",
+    retryable: false,
+  });
+}
+
+function recoveryResponse(material: VerifiedBoardRecoveryMaterial) {
+  return boardRecoveryMaterialSchema.parse({
+    boardId: material.boardId,
+    snapshotId: material.snapshotId,
+    snapshotSchemaVersion: material.snapshotSchemaVersion,
+    snapshotCanvasSeq: material.snapshotCanvasSeq,
+    snapshotDeliverySeq: material.snapshotDeliverySeq,
+    capturedCanvasSeq: material.capturedCanvasSeq,
+    capturedDeliverySeq: material.capturedDeliverySeq,
+    snapshotState: material.snapshot.projection,
+    snapshotCanonicalHash: material.snapshotHash,
+    operationTail: material.operations,
+    reconstructedCanonicalHash: material.reconstructedHash,
+  });
 }
 
 function fastifyClientError(
@@ -112,13 +190,68 @@ function socketAuthenticationError(error: AuthenticationError): Error {
   });
 }
 
+function socketDeliveryUnavailableError(): Error {
+  return Object.assign(new Error("Realtime delivery is temporarily unavailable"), {
+    data: protocolErrorSchema.parse({
+      ok: false,
+      code: "INTERNAL_ERROR",
+      message: "Realtime delivery is temporarily unavailable",
+      retryable: true,
+    }),
+  });
+}
+
 export interface AppContext {
   app: FastifyInstance;
   io: AppIo;
 }
 
+export interface ApiHealthProbe {
+  check(): Promise<void> | void;
+}
+
+const DEFAULT_API_HEALTH_PROBE_TIMEOUT_MS = 1_000;
+const MAXIMUM_API_HEALTH_PROBE_TIMEOUT_MS = 30_000;
+const MAXIMUM_BEARER_TOKEN_LENGTH = 256;
+const liveResponse = Object.freeze({ ok: true as const, status: "live" as const });
+const readyResponse = Object.freeze({ ok: true as const, status: "ready" as const });
+const unavailableResponse = Object.freeze({ ok: false as const, status: "unavailable" as const });
+const unauthorizedResponse = Object.freeze({ ok: false as const, status: "unauthorized" as const });
+const metricsUnavailableResponse = "Metrics unavailable\n";
+
+function boundedBearerToken(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= MAXIMUM_BEARER_TOKEN_LENGTH &&
+    [...value].every((character) => {
+      const code = character.charCodeAt(0);
+      return code >= 33 && code <= 126;
+    })
+  );
+}
+
+function authorizedMetricsRequest(authorization: string | undefined, expected: string): boolean {
+  if (authorization === undefined || !authorization.startsWith("Bearer ")) return false;
+  const provided = authorization.slice("Bearer ".length);
+  if (!boundedBearerToken(provided) || !boundedBearerToken(expected)) return false;
+  const expectedDigest = createHash("sha256").update(expected, "utf8").digest();
+  const providedDigest = createHash("sha256").update(provided, "utf8").digest();
+  return timingSafeEqual(expectedDigest, providedDigest);
+}
+
+function recorderSnapshot(recorder: TelemetryRecorder): (() => TelemetrySnapshot) | undefined {
+  try {
+    const snapshot = (recorder as TelemetryRecorder & { snapshot?: () => TelemetrySnapshot })
+      .snapshot;
+    return typeof snapshot === "function" ? () => snapshot.call(recorder) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface AuthenticatedSocketData {
   principal: AuthenticatedPrincipal;
+  revokedBoards: Set<string>;
 }
 
 type AppIo = Server<
@@ -192,13 +325,31 @@ export interface DeliveryHooks {
   afterMembershipCommit?: (context: { boardId: string; revokedUserId: string }) => Promise<void>;
 }
 
+export type ApplicationDeliveryMode =
+  | { mode: "local" }
+  | {
+      mode: "distributed";
+      createRuntime: DeliveryRuntimeFactory;
+    };
+
 export interface BuildAppOptions {
   synchronizationBatchSize?: number;
   synchronizationHooks?: SynchronizationHooks;
   deliveryCoordinator?: BoardDeliveryCoordinator;
   deliveryHooks?: DeliveryHooks;
+  deliveryMode?: ApplicationDeliveryMode;
+  createBoardDeliveryHeadWatchdog?: BoardDeliveryHeadWatchdogFactory;
   repositoryHooks?: BoardRepositoryHooks;
+  recoveryMaterialRepository?: Pick<BoardRecoveryMaterialRepository, "load"> & {
+    loadWithOutcome?(boardId: string): Promise<BoardRecoveryLoadResult>;
+  };
   loggerStream?: Writable;
+  telemetry?: TelemetryRecorder;
+  telemetryClock?: { now(): number };
+  telemetrySnapshot?: () => TelemetrySnapshot;
+  operationalState?: ApiOperationalState;
+  healthProbe?: ApiHealthProbe;
+  healthProbeTimeoutMs?: number;
 }
 
 export async function buildApp(
@@ -207,6 +358,67 @@ export async function buildApp(
   auth: AuthAdapter,
   options: BuildAppOptions = {},
 ): Promise<AppContext> {
+  const rawTelemetry = options.telemetry ?? noOpTelemetryRecorder;
+  const telemetry = safeTelemetryRecorder(rawTelemetry);
+  const snapshotTelemetry = options.telemetrySnapshot ?? recorderSnapshot(rawTelemetry);
+  const deliveryMode = options.deliveryMode ?? { mode: "local" as const };
+  const operationalState =
+    options.operationalState ?? new InstanceApiOperationalState(deliveryMode.mode === "local");
+  operationalState.transition("starting");
+  const healthProbeTimeoutMs = z
+    .number()
+    .int()
+    .min(1)
+    .max(MAXIMUM_API_HEALTH_PROBE_TIMEOUT_MS)
+    .parse(options.healthProbeTimeoutMs ?? DEFAULT_API_HEALTH_PROBE_TIMEOUT_MS);
+  const healthProbe = options.healthProbe ?? {
+    check: async () => {
+      await pool.query("SELECT 1");
+    },
+  };
+  const telemetryClock = options.telemetryClock ?? { now: () => performance.now() };
+  const telemetryNow = (): number | undefined => {
+    try {
+      const value = telemetryClock.now();
+      return Number.isFinite(value) ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const telemetryTimestamp = (): string => new Date().toISOString();
+  const emit = (
+    eventName:
+      | "delivery.consumer.lifecycle"
+      | "delivery.cursor_lost"
+      | "delivery.watchdog.divergence"
+      | "socket.readiness.changed"
+      | "recovery.request.result"
+      | "api.lifecycle",
+    component: "delivery_consumer" | "delivery_watchdog" | "socket_readiness" | "recovery" | "api",
+    severity: "info" | "warn" | "error",
+    code: string,
+  ): void =>
+    telemetry.emit({
+      schemaVersion: 1,
+      eventName,
+      component,
+      severity,
+      timestamp: telemetryTimestamp(),
+      code,
+    });
+  let apiLifecycle: "starting" | "ready" | "stopping" | "stopped" | "startup_failed" = "starting";
+  emit("api.lifecycle", "api", "info", "STARTING");
+  const transitionApiLifecycle = (next: typeof apiLifecycle): void => {
+    if (apiLifecycle === next || apiLifecycle === "stopped") return;
+    apiLifecycle = next;
+    operationalState.transition(next);
+    emit(
+      "api.lifecycle",
+      "api",
+      next === "startup_failed" ? "error" : next === "stopping" ? "info" : "info",
+      next.toUpperCase(),
+    );
+  };
   const app = Fastify({
     logger:
       options.loggerStream === undefined
@@ -217,7 +429,13 @@ export async function buildApp(
   await app.register(cors, { origin: environment.WEB_ORIGIN, credentials: true });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   const repository = new BoardRepository(pool, options.repositoryHooks);
+  const boardRecoveryMaterialRepository = new BoardRecoveryMaterialRepository(pool);
+  const recoveryMaterialRepository =
+    options.recoveryMaterialRepository ?? new BoardRecoveryService(boardRecoveryMaterialRepository);
   const deliveryCoordinator = options.deliveryCoordinator ?? new BoardDeliveryCoordinator();
+  telemetry.setGauge("converge_delivery_consumer_ready", {}, 0);
+  telemetry.setGauge("converge_socket_ready", {}, deliveryMode.mode === "local" ? 1 : 0);
+  operationalState.setSocketReady(deliveryMode.mode === "local");
   const synchronizationBatchSize = z
     .number()
     .int()
@@ -273,6 +491,68 @@ export async function buildApp(
   };
 
   app.get("/health", () => ({ ok: true }));
+  app.get("/health/live", { config: { rateLimit: false } }, (_request, reply) =>
+    operationalState.isLive()
+      ? reply.code(200).send(liveResponse)
+      : reply.code(503).send(unavailableResponse),
+  );
+  app.get("/health/ready", { config: { rateLimit: false } }, async (_request, reply) => {
+    if (!operationalState.isHttpReady()) return reply.code(503).send(unavailableResponse);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const probe = Promise.resolve()
+      .then(() => healthProbe.check())
+      .then(
+        () => true,
+        () => false,
+      );
+    const timedOut = new Promise<false>((resolve) => {
+      timeout = setTimeout(() => resolve(false), healthProbeTimeoutMs);
+    });
+    const healthy = await Promise.race([probe, timedOut]);
+    if (timeout !== undefined) clearTimeout(timeout);
+    return healthy && operationalState.isHttpReady()
+      ? reply.code(200).send(readyResponse)
+      : reply.code(503).send(unavailableResponse);
+  });
+  app.get("/health/socket-ready", { config: { rateLimit: false } }, (_request, reply) =>
+    operationalState.isSocketReady()
+      ? reply.code(200).send(readyResponse)
+      : reply.code(503).send(unavailableResponse),
+  );
+  if (environment.API_METRICS_ENABLED)
+    app.get("/metrics", { config: { rateLimit: false } }, (request, reply) => {
+      if (
+        !authorizedMetricsRequest(
+          request.headers.authorization,
+          environment.API_METRICS_BEARER_TOKEN,
+        )
+      )
+        return reply.code(401).send(unauthorizedResponse);
+      if (snapshotTelemetry === undefined)
+        return reply
+          .code(503)
+          .header("content-type", "text/plain; charset=utf-8")
+          .send(metricsUnavailableResponse);
+      let snapshot: TelemetrySnapshot;
+      try {
+        snapshot = snapshotTelemetry();
+      } catch {
+        return reply
+          .code(503)
+          .header("content-type", "text/plain; charset=utf-8")
+          .send(metricsUnavailableResponse);
+      }
+      const rendered = safeRenderPrometheus(snapshot);
+      if (!rendered.ok)
+        return reply
+          .code(503)
+          .header("content-type", "text/plain; charset=utf-8")
+          .send(metricsUnavailableResponse);
+      return reply
+        .code(200)
+        .header("content-type", rendered.value.contentType)
+        .send(rendered.value.body);
+    });
   app.post("/v1/boards", async (request, reply) => {
     const user = await authenticateHttp(request);
     const body = createBoardRequestSchema.parse(request.body);
@@ -297,16 +577,17 @@ export async function buildApp(
       const boardId = z.string().uuid().parse(request.params.boardId);
       const range = operationRangeQuerySchema.parse(request.query);
       try {
+        const result = await repository.getOperationBatch(
+          boardId,
+          user.id,
+          range.after,
+          range.watermark,
+          synchronizationBatchSize,
+        );
+        if ("outcome" in result)
+          throw new RepositoryError("RESYNC_REQUIRED", "Operation range is unavailable");
         return {
-          ...operationRangeResponseSchema.parse(
-            await repository.getOperationBatch(
-              boardId,
-              user.id,
-              range.after,
-              range.watermark,
-              synchronizationBatchSize,
-            ),
-          ),
+          ...operationRangeResponseSchema.parse(result),
         };
       } catch (error) {
         if (error instanceof RepositoryError)
@@ -314,6 +595,63 @@ export async function buildApp(
             .code(errorStatus(error.code))
             .send(protocolErrorSchema.parse(failedAck(error)));
         throw error;
+      }
+    },
+  );
+  app.get<{ Params: { boardId: string }; Querystring: Record<string, unknown> }>(
+    "/v1/boards/:boardId/recovery",
+    async (request, reply) => {
+      const startedAt = telemetryNow();
+      let outcome:
+        | "snapshot_tail"
+        | "refreshed"
+        | "recovery_blocked"
+        | "retryable_failure"
+        | "authorization_failure" = "retryable_failure";
+      try {
+        const user = await authenticateHttp(request);
+        const boardId = z.string().uuid().parse(request.params.boardId);
+        boardRecoveryRequestQuerySchema.parse(request.query);
+        const role = await repository.roleFor(boardId, user.id);
+        if (!role) {
+          outcome = "authorization_failure";
+          throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");
+        }
+        const loaded = recoveryMaterialRepository.loadWithOutcome
+          ? await recoveryMaterialRepository.loadWithOutcome(boardId)
+          : {
+              material: await recoveryMaterialRepository.load(boardId),
+              outcome: "snapshot_tail" as const,
+            };
+        outcome = loaded.outcome;
+        return recoveryResponse(loaded.material);
+      } catch (error) {
+        if (error instanceof AuthenticationError || error instanceof RepositoryError)
+          outcome = "authorization_failure";
+        if (error instanceof BoardRecoveryError) {
+          const response = recoveryBlocked(error);
+          if (response) {
+            outcome = "recovery_blocked";
+            return reply.code(409).send(response);
+          }
+        }
+        throw error;
+      } finally {
+        const finishedAt = telemetryNow();
+        const elapsed =
+          startedAt !== undefined && finishedAt !== undefined ? finishedAt - startedAt : 0;
+        telemetry.increment("converge_recovery_requests_total", { outcome });
+        telemetry.observe(
+          "converge_recovery_duration_seconds",
+          {},
+          Number.isFinite(elapsed) && elapsed >= 0 ? elapsed / 1_000 : 0,
+        );
+        emit(
+          "recovery.request.result",
+          "recovery",
+          outcome === "snapshot_tail" || outcome === "refreshed" ? "info" : "warn",
+          outcome.toUpperCase(),
+        );
       }
     },
   );
@@ -329,6 +667,52 @@ export async function buildApp(
   });
 
   const boardRoom = (boardId: string): string => `board:${boardId}`;
+  const trackedBoards = new Map<string, { references: number; handledDeliverySeq: number }>();
+  const socketBoards = new Map<string, Set<string>>();
+  const socketTracksBoard = (socketId: string, boardId: string): boolean =>
+    socketBoards.get(socketId)?.has(boardId) ?? false;
+  const trackBoardJoin = (socketId: string, boardId: string, baseline?: number): void => {
+    if (socketTracksBoard(socketId, boardId)) return;
+    let board = trackedBoards.get(boardId);
+    if (!board) {
+      if (baseline === undefined || !Number.isSafeInteger(baseline) || baseline < 0)
+        throw new Error(
+          "An authoritative delivery baseline is required for first board activation",
+        );
+      if (trackedBoards.size >= defaultBoardDeliveryHeadWatchdogConfiguration.maximumActiveBoards)
+        throw new BoardDeliveryHeadWatchdogError("ACTIVE_BOARD_CAPACITY_EXCEEDED");
+      board = { references: 0, handledDeliverySeq: baseline };
+      trackedBoards.set(boardId, board);
+    }
+    if (!Number.isSafeInteger(board.references + 1))
+      throw new BoardDeliveryHeadWatchdogError("ACTIVE_BOARD_CAPACITY_EXCEEDED");
+    board.references += 1;
+    const memberships = socketBoards.get(socketId) ?? new Set<string>();
+    memberships.add(boardId);
+    socketBoards.set(socketId, memberships);
+  };
+  const releaseBoardJoin = (socketId: string, boardId: string): void => {
+    const memberships = socketBoards.get(socketId);
+    if (!memberships?.delete(boardId)) return;
+    if (memberships.size === 0) socketBoards.delete(socketId);
+    const board = trackedBoards.get(boardId);
+    if (!board) return;
+    if (board.references <= 1) trackedBoards.delete(boardId);
+    else board.references -= 1;
+  };
+  const releaseSocketBoards = (socketId: string): void => {
+    const memberships = [...(socketBoards.get(socketId) ?? [])];
+    for (const boardId of memberships) releaseBoardJoin(socketId, boardId);
+  };
+  const advanceDeliveryProgress = (boardId: string, deliverySeq: number): void => {
+    const board = trackedBoards.get(boardId);
+    if (!board || !Number.isSafeInteger(deliverySeq) || deliverySeq < 0) return;
+    board.handledDeliverySeq = Math.max(board.handledDeliverySeq, deliverySeq);
+  };
+  const clearTrackedBoards = (): void => {
+    socketBoards.clear();
+    trackedBoards.clear();
+  };
   const evictBoardMember = async (boardId: string, revokedUserId: string): Promise<void> => {
     const event = boardAccessRevokedEventSchema.parse({
       schemaVersion: 1,
@@ -342,10 +726,141 @@ export async function buildApp(
     );
     await Promise.all(
       targets.map(async (target) => {
+        target.data.revokedBoards.add(boardId);
         target.emit("board:access-revoked", event);
         await target.leave(room);
+        releaseBoardJoin(target.id, boardId);
       }),
     );
+  };
+
+  let deliveryRuntime: DeliveryRuntimeOwner | undefined;
+  let deliveryRuntimeStartPromise: Promise<void> | undefined;
+  let deliveryRuntimeStopPromise: Promise<void> | undefined;
+  let boardDeliveryHeadWatchdog: BoardDeliveryHeadWatchdogOwner | undefined;
+  let boardDeliveryHeadWatchdogStartPromise: Promise<void> | undefined;
+  let boardDeliveryHeadWatchdogStopPromise: Promise<void> | undefined;
+  let socketIoClosePromise: Promise<void> | undefined;
+  let distributedSocketReady = deliveryMode.mode === "local";
+  let consumerSocketReady = deliveryMode.mode === "local";
+  let watchdogSocketReady = true;
+  let distributedReadinessTerminal = false;
+  let applicationClosing = false;
+  let acceptsDistributedDeliveries = false;
+  let consumerTelemetryState:
+    | "established"
+    | "unavailable"
+    | "recovering"
+    | "recovered"
+    | "terminal"
+    | undefined;
+  let watchdogTelemetryState: "unavailable" | "recovered" | undefined;
+  let consumerReadyGauge = 0;
+  let socketReadyGauge = deliveryMode.mode === "local" ? 1 : 0;
+  const socketsAreReady = (): boolean =>
+    deliveryMode.mode === "local" ||
+    (!applicationClosing && !distributedReadinessTerminal && distributedSocketReady);
+  const requireSocketReadiness = (): void => {
+    if (!socketsAreReady()) throw socketDeliveryUnavailableError();
+  };
+  const refreshSocketReadiness = (): void => {
+    if (deliveryMode.mode === "local") return;
+    const wasReady = distributedSocketReady;
+    distributedSocketReady =
+      !applicationClosing &&
+      !distributedReadinessTerminal &&
+      consumerSocketReady &&
+      watchdogSocketReady;
+    acceptsDistributedDeliveries = distributedSocketReady;
+    operationalState.setSocketReady(distributedSocketReady);
+    const nextGauge = distributedSocketReady ? 1 : 0;
+    if (nextGauge !== socketReadyGauge) {
+      socketReadyGauge = nextGauge;
+      telemetry.setGauge("converge_socket_ready", {}, nextGauge);
+      telemetry.increment("converge_delivery_state_transitions_total", {
+        source: "socket_readiness",
+        state: nextGauge === 1 ? "established" : "unavailable",
+      });
+      emit(
+        "socket.readiness.changed",
+        "socket_readiness",
+        nextGauge === 1 ? "info" : "warn",
+        nextGauge === 1 ? "READY" : "UNAVAILABLE",
+      );
+    }
+    if (wasReady && !distributedSocketReady) io.local.disconnectSockets(true);
+  };
+  const makeSocketsTerminallyUnready = (): void => {
+    if (deliveryMode.mode === "local") return;
+    distributedReadinessTerminal = true;
+    consumerSocketReady = false;
+    refreshSocketReadiness();
+  };
+  const observeDeliveryLifecycle = (event: DeliveryRuntimeLifecycleEvent): void => {
+    if (deliveryMode.mode === "local" || applicationClosing || distributedReadinessTerminal) return;
+    const transitionState = event.state === "stopped" ? "terminal" : event.state;
+    if (consumerTelemetryState !== transitionState) {
+      consumerTelemetryState = transitionState;
+      telemetry.increment("converge_delivery_state_transitions_total", {
+        source: "consumer",
+        state: transitionState,
+      });
+      emit(
+        event.state === "terminal" && event.source === "cursor"
+          ? "delivery.cursor_lost"
+          : "delivery.consumer.lifecycle",
+        "delivery_consumer",
+        transitionState === "established" || transitionState === "recovered" ? "info" : "warn",
+        event.state === "terminal" ? event.code : event.state.toUpperCase(),
+      );
+    }
+    switch (event.state) {
+      case "established":
+      case "recovered":
+        if (distributedReadinessTerminal) return;
+        consumerSocketReady = true;
+        if (consumerReadyGauge !== 1) {
+          consumerReadyGauge = 1;
+          telemetry.setGauge("converge_delivery_consumer_ready", {}, 1);
+        }
+        refreshSocketReadiness();
+        return;
+      case "unavailable":
+      case "recovering":
+        consumerSocketReady = false;
+        if (consumerReadyGauge !== 0) {
+          consumerReadyGauge = 0;
+          telemetry.setGauge("converge_delivery_consumer_ready", {}, 0);
+        }
+        refreshSocketReadiness();
+        return;
+      case "terminal":
+      case "stopped":
+        if (consumerReadyGauge !== 0) {
+          consumerReadyGauge = 0;
+          telemetry.setGauge("converge_delivery_consumer_ready", {}, 0);
+        }
+        makeSocketsTerminallyUnready();
+        return;
+    }
+  };
+  const deliveryRuntimeObserver: DeliveryRuntimeObserver = {
+    lifecycle: observeDeliveryLifecycle,
+    quarantine: () => Promise.resolve(),
+  };
+  const observeWatchdogLifecycle = (event: BoardDeliveryHeadWatchdogLifecycleEvent): void => {
+    if (deliveryMode.mode === "local" || applicationClosing || distributedReadinessTerminal) return;
+    if (watchdogTelemetryState !== event.state) {
+      watchdogTelemetryState = event.state;
+      telemetry.increment("converge_delivery_state_transitions_total", {
+        source: "watchdog",
+        state: event.state,
+      });
+      if (event.state === "unavailable")
+        emit("delivery.watchdog.divergence", "delivery_watchdog", "warn", event.code);
+    }
+    watchdogSocketReady = event.state === "recovered";
+    refreshSocketReadiness();
   };
 
   app.delete<{
@@ -367,7 +882,7 @@ export async function buildApp(
         } catch (error) {
           app.log.warn({ error, boardId: params.boardId }, "membership delivery hook failed");
         }
-        await evictBoardMember(params.boardId, params.userId);
+        if (deliveryMode.mode === "local") await evictBoardMember(params.boardId, params.userId);
         return removed;
       });
       return reply.send(
@@ -386,46 +901,94 @@ export async function buildApp(
     }
   });
   io.use((socket, next) => {
+    if (!socketsAreReady()) {
+      next(socketDeliveryUnavailableError());
+      return;
+    }
     void (async () => {
       try {
         const principal = await auth.authenticateSocket(socket);
+        requireSocketReadiness();
         if (!principal)
           throw new AuthenticationError("AUTHENTICATION_REQUIRED", "Authentication required");
         socket.data.principal = principal;
+        socket.data.revokedBoards = new Set();
         next();
       } catch (error) {
-        if (error instanceof AuthenticationError) next(socketAuthenticationError(error));
+        if (!socketsAreReady()) next(socketDeliveryUnavailableError());
+        else if (error instanceof AuthenticationError) next(socketAuthenticationError(error));
         else next(new Error("Authentication failed"));
       }
     })();
   });
   io.on("connection", (socket) => {
+    if (!socketsAreReady()) {
+      socket.disconnect(true);
+      return;
+    }
     const user = socket.data.principal;
     let windowStarted = Date.now();
     let commandsInWindow = 0;
+    socket.on("disconnect", () => releaseSocketBoards(socket.id));
     socket.on("board:join", async (raw, acknowledge) => {
+      if (!socketsAreReady()) return;
       if (typeof acknowledge !== "function") {
         app.log.warn({ socketId: socket.id }, "board join requires an acknowledgement callback");
         return;
       }
       try {
+        requireSocketReadiness();
         const request = joinBoardRequestSchema.parse(raw);
-        await deliveryCoordinator.run(request.boardId, async () => {
-          if (!(await repository.roleFor(request.boardId, user.id)))
-            throw new RepositoryError("FORBIDDEN", "Board membership required");
-          await socket.join(boardRoom(request.boardId));
-        });
-        await options.synchronizationHooks?.afterRoomJoin?.({
-          boardId: request.boardId,
-          userId: user.id,
-          socketId: socket.id,
-        });
-        const joinWatermark = await repository.getBoardSequence(request.boardId, user.id);
-        if (request.lastAppliedSeq > joinWatermark)
-          throw new RepositoryError(
-            "RESYNC_REQUIRED",
-            "Client sequence exceeds authoritative board head",
-          );
+        const room = boardRoom(request.boardId);
+        let newlyTracked = false;
+        let newlyJoined = false;
+        let joinWatermark: number;
+        try {
+          await deliveryCoordinator.run(request.boardId, async () => {
+            requireSocketReadiness();
+            if (socket.data.revokedBoards.has(request.boardId))
+              throw new RepositoryError("FORBIDDEN", "Board access was revoked");
+            const role = await repository.roleFor(request.boardId, user.id);
+            requireSocketReadiness();
+            if (!role) throw new RepositoryError("FORBIDDEN", "Board membership required");
+            const alreadyTracked = socketTracksBoard(socket.id, request.boardId);
+            let deliveryBaseline: number | undefined;
+            if (
+              deliveryMode.mode === "distributed" &&
+              !alreadyTracked &&
+              !trackedBoards.has(request.boardId)
+            ) {
+              const [head] = await repository.getBoardDeliveryHeads([request.boardId]);
+              requireSocketReadiness();
+              deliveryBaseline = head?.lastDeliverySeq;
+            }
+            newlyTracked = deliveryMode.mode === "distributed" && !alreadyTracked;
+            newlyJoined = !socket.rooms.has(room);
+            if (newlyTracked) trackBoardJoin(socket.id, request.boardId, deliveryBaseline);
+            await socket.join(room);
+          });
+          await options.synchronizationHooks?.afterRoomJoin?.({
+            boardId: request.boardId,
+            userId: user.id,
+            socketId: socket.id,
+          });
+          requireSocketReadiness();
+          joinWatermark = await deliveryCoordinator.run(request.boardId, async () => {
+            requireSocketReadiness();
+            const watermark = await repository.getBoardSequence(request.boardId, user.id);
+            requireSocketReadiness();
+            if (request.lastAppliedSeq > watermark)
+              throw new RepositoryError(
+                "RESYNC_REQUIRED",
+                "Client sequence exceeds authoritative board head",
+              );
+            return watermark;
+          });
+        } catch (error) {
+          if (newlyJoined) await Promise.resolve(socket.leave(room)).catch(() => undefined);
+          if (newlyTracked) releaseBoardJoin(socket.id, request.boardId);
+          throw error;
+        }
         acknowledge(
           joinBoardAckSchema.parse({
             ok: true,
@@ -434,10 +997,12 @@ export async function buildApp(
           }),
         );
       } catch (error) {
+        if (!socketsAreReady()) return;
         acknowledge(joinBoardAckSchema.parse(failedAck(error)));
       }
     });
     socket.on("operation:submit", async (raw, acknowledge) => {
+      if (!socketsAreReady()) return;
       const reportDeliveryFailure = (stage: OperationDeliveryStage, error: unknown): void =>
         app.log.warn(
           { error, stage, socketId: socket.id, userId: user.id },
@@ -469,6 +1034,7 @@ export async function buildApp(
         return;
       }
       try {
+        requireSocketReadiness();
         if (JSON.stringify(raw).length > 64 * 1024) {
           acknowledgeWithoutThrow(
             acknowledge,
@@ -484,6 +1050,9 @@ export async function buildApp(
         }
         const command = durableCommandSchema.parse(raw);
         const committed = await deliveryCoordinator.run(command.boardId, async () => {
+          requireSocketReadiness();
+          if (socket.data.revokedBoards.has(command.boardId))
+            throw new RepositoryError("FORBIDDEN", "Board access was revoked");
           const result = await repository.commitOperation(user.id, command);
           try {
             await options.deliveryHooks?.afterOperationCommit?.({
@@ -493,22 +1062,141 @@ export async function buildApp(
           } catch (error) {
             app.log.warn({ error, boardId: command.boardId }, "operation delivery hook failed");
           }
-          publishWithoutThrow(
-            () => io.to(boardRoom(command.boardId)).emit("operation:committed", result.operation),
-            reportDeliveryFailure,
-          );
+          if (deliveryMode.mode === "local")
+            publishWithoutThrow(
+              () => io.to(boardRoom(command.boardId)).emit("operation:committed", result.operation),
+              reportDeliveryFailure,
+            );
           return result;
         });
-        acknowledgeWithoutThrow(
-          acknowledge,
-          { ok: true, duplicate: committed.duplicate, operation: committed.operation },
-          reportDeliveryFailure,
-        );
+        if (socketsAreReady() && !socket.data.revokedBoards.has(command.boardId))
+          acknowledgeWithoutThrow(
+            acknowledge,
+            { ok: true, duplicate: committed.duplicate, operation: committed.operation },
+            reportDeliveryFailure,
+          );
       } catch (error) {
         app.log.warn({ error, userId: user.id }, "operation rejected");
+        if (!socketsAreReady()) return;
         acknowledgeWithoutThrow(acknowledge, failedAck(error), reportDeliveryFailure);
       }
     });
   });
+
+  const stopDeliveryRuntimeOnce = (): Promise<void> => {
+    deliveryRuntimeStopPromise ??= deliveryRuntime?.stop() ?? Promise.resolve();
+    return deliveryRuntimeStopPromise;
+  };
+  const stopBoardDeliveryHeadWatchdogOnce = (): Promise<void> => {
+    boardDeliveryHeadWatchdogStopPromise ??= boardDeliveryHeadWatchdog?.stop() ?? Promise.resolve();
+    return boardDeliveryHeadWatchdogStopPromise;
+  };
+  const closeSocketIoOnce = (): Promise<void> => {
+    socketIoClosePromise ??= io.close();
+    return socketIoClosePromise;
+  };
+  app.addHook("onReady", async () => {
+    if (!deliveryRuntime) {
+      transitionApiLifecycle("ready");
+      return;
+    }
+    try {
+      boardDeliveryHeadWatchdogStartPromise ??=
+        boardDeliveryHeadWatchdog?.start() ?? Promise.resolve();
+      await boardDeliveryHeadWatchdogStartPromise;
+      deliveryRuntimeStartPromise ??= deliveryRuntime.start();
+      void deliveryRuntimeStartPromise.catch(async () => {
+        if (applicationClosing) return;
+        makeSocketsTerminallyUnready();
+        await stopDeliveryRuntimeOnce().catch(() => undefined);
+        await stopBoardDeliveryHeadWatchdogOnce().catch(() => undefined);
+      });
+      transitionApiLifecycle("ready");
+    } catch (error) {
+      transitionApiLifecycle("startup_failed");
+      makeSocketsTerminallyUnready();
+      await stopDeliveryRuntimeOnce().catch(() => undefined);
+      await stopBoardDeliveryHeadWatchdogOnce().catch(() => undefined);
+      throw error;
+    }
+  });
+  app.addHook("preClose", async () => {
+    applicationClosing = true;
+    transitionApiLifecycle("stopping");
+    consumerReadyGauge = 0;
+    telemetry.setGauge("converge_delivery_consumer_ready", {}, 0);
+    makeSocketsTerminallyUnready();
+    socketReadyGauge = 0;
+    telemetry.setGauge("converge_socket_ready", {}, 0);
+    await stopDeliveryRuntimeOnce();
+    await stopBoardDeliveryHeadWatchdogOnce();
+    clearTrackedBoards();
+    await closeSocketIoOnce();
+  });
+  app.addHook("onClose", () => {
+    transitionApiLifecycle("stopped");
+  });
+
+  if (deliveryMode.mode === "distributed") {
+    if (typeof deliveryMode.createRuntime !== "function") {
+      transitionApiLifecycle("startup_failed");
+      await app.close();
+      throw new TypeError("Distributed delivery mode requires a runtime factory");
+    }
+    try {
+      const createWatchdog =
+        options.createBoardDeliveryHeadWatchdog ??
+        ((input) =>
+          new BoardDeliveryHeadWatchdog(
+            input.repository,
+            input.activeBoards,
+            input.deliveryProgress,
+            input.observer,
+          ));
+      boardDeliveryHeadWatchdog = createWatchdog({
+        repository,
+        activeBoards: { activeBoardIds: () => trackedBoards.keys() },
+        deliveryProgress: {
+          handledDeliverySequence: (boardId) => trackedBoards.get(boardId)?.handledDeliverySeq ?? 0,
+        },
+        observer: { lifecycle: observeWatchdogLifecycle },
+      });
+      deliveryRuntime = deliveryMode.createRuntime(
+        {
+          operationCommitted: (envelope) => {
+            if (!acceptsDistributedDeliveries) return Promise.resolve();
+            return deliveryCoordinator.run(envelope.boardId, () => {
+              if (!acceptsDistributedDeliveries) return Promise.resolve();
+              const operation = committedOperationSchema.parse(envelope.payload.operation);
+              if (operation.boardId !== envelope.boardId)
+                throw new Error("Committed operation board does not match its delivery envelope");
+              io.local.to(boardRoom(envelope.boardId)).emit("operation:committed", operation);
+              advanceDeliveryProgress(envelope.boardId, envelope.deliverySeq);
+              return Promise.resolve();
+            });
+          },
+          membershipRevoked: (envelope) => {
+            if (!acceptsDistributedDeliveries) return Promise.resolve();
+            return deliveryCoordinator.run(envelope.boardId, () => {
+              if (!acceptsDistributedDeliveries) return Promise.resolve();
+              const revocation = membershipRevokedDeliveryEnvelopeSchema.parse(envelope);
+              return evictBoardMember(revocation.boardId, revocation.payload.revokedUserId).then(
+                () => {
+                  if (acceptsDistributedDeliveries)
+                    advanceDeliveryProgress(revocation.boardId, revocation.deliverySeq);
+                },
+              );
+            });
+          },
+        },
+        deliveryRuntimeObserver,
+        telemetry,
+      );
+    } catch (error) {
+      transitionApiLifecycle("startup_failed");
+      await app.close();
+      throw error;
+    }
+  }
   return { app, io };
 }

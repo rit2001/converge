@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { CommittedOperation } from "@converge/protocol";
 import { deliverCommittedOperation } from "./app.js";
@@ -27,6 +28,17 @@ const operation: CommittedOperation = {
 };
 
 describe("post-commit operation delivery", () => {
+  it("exposes no public HTTP or Socket handler for raw Redis delivery fields", () => {
+    const source = readFileSync(new URL("./app.ts", import.meta.url), "utf8");
+    const registrations = [
+      ...source.matchAll(/(?:app\.(?:get|post|delete)|socket\.on)\([^"']*["']([^"']+)["']/g),
+    ].map(([, name]) => name);
+
+    expect(registrations).not.toContain("delivery:raw");
+    expect(registrations).not.toContain("delivery-stream:write");
+    expect(source).not.toContain("XADD");
+    expect(source).not.toContain("encodeDeliveryStreamFields");
+  });
   it("publishes before acknowledgement and isolates acknowledgement failure", () => {
     const calls: string[] = [];
     const publish = vi.fn(() => calls.push("publish"));

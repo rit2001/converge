@@ -21,3 +21,6 @@ export const noOpTracer: Tracer = {
     end: () => undefined,
   }),
 };
+
+export * from "./prometheus.js";
+export * from "./telemetry.js";

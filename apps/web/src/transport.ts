@@ -1,12 +1,13 @@
 import { io, type Socket } from "socket.io-client";
+import { hashBoardState, reduceCommand, type BoardState } from "@converge/canvas-engine";
 import {
   boardAccessRevokedEventSchema,
-  boardSnapshotSchema,
+  boardRecoveryMaterialSchema,
   committedOperationSchema,
   joinBoardAckSchema,
   operationRangeResponseSchema,
   protocolErrorSchema,
-  type BoardSnapshot,
+  type BoardRecoveryMaterial,
   type ClientToServerEvents,
   type CommittedOperation,
   type DurableCommand,
@@ -39,6 +40,119 @@ const transportScheduler: RetryScheduler = {
   random: () => Math.random(),
 };
 
+const SNAPSHOT_HASH_DOMAIN = "converge.snapshot.v1";
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, item]) => [key, canonicalValue(item)]),
+    );
+  }
+  if (typeof value === "number" && Object.is(value, -0)) return 0;
+  return value;
+}
+
+async function hashRecoverySnapshot(
+  snapshot: BoardRecoveryMaterial["snapshotState"],
+): Promise<string> {
+  const canonical = JSON.stringify(canonicalValue(snapshot));
+  const bytes = new TextEncoder().encode(`${SNAPSHOT_HASH_DOMAIN}\0${canonical}`);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function recoverySnapshotState(material: BoardRecoveryMaterial): BoardState {
+  return {
+    lastSeq: material.snapshotCanvasSeq,
+    objects: Object.fromEntries(
+      material.snapshotState.objects.map((object) => [
+        object.objectId,
+        {
+          value: { ...object.value },
+          fieldSeq: { ...object.fieldSeq },
+          createdSeq: object.createdSeq,
+          updatedSeq: object.updatedSeq,
+          deletedSeq: object.deletedSeq,
+        },
+      ]),
+    ),
+    order: material.snapshotState.objects
+      .filter((object) => object.deletedSeq === null)
+      .map((object) => object.objectId),
+  };
+}
+
+function invalidRecovery(message: string): SynchronizationError {
+  return new SynchronizationError("INVALID_COMMAND", message, false);
+}
+
+async function verifyRecoveryMaterial(
+  material: BoardRecoveryMaterial,
+  activeBoardId: string,
+): Promise<BoardState> {
+  const heads = [
+    material.snapshotCanvasSeq,
+    material.snapshotDeliverySeq,
+    material.capturedCanvasSeq,
+    material.capturedDeliverySeq,
+  ];
+  if (
+    material.boardId !== activeBoardId ||
+    heads.some((head) => !Number.isSafeInteger(head) || head < 0) ||
+    material.snapshotCanvasSeq > material.capturedCanvasSeq ||
+    material.snapshotDeliverySeq > material.capturedDeliverySeq ||
+    material.capturedDeliverySeq < material.capturedCanvasSeq ||
+    material.snapshotState.boardId !== material.boardId ||
+    material.snapshotState.lastSeq !== material.snapshotCanvasSeq ||
+    material.snapshotState.lastDeliverySeq !== material.snapshotDeliverySeq
+  )
+    throw invalidRecovery("Recovery metadata does not match the active board");
+
+  if ((await hashRecoverySnapshot(material.snapshotState)) !== material.snapshotCanonicalHash)
+    throw invalidRecovery("Recovery snapshot hash verification failed");
+
+  let expectedSequence = material.snapshotCanvasSeq + 1;
+  let committed = recoverySnapshotState(material);
+  const snapshotObjectIds = new Set<string>();
+  for (const object of material.snapshotState.objects) {
+    if (snapshotObjectIds.has(object.objectId))
+      throw invalidRecovery("Recovery snapshot contains duplicate object identity");
+    snapshotObjectIds.add(object.objectId);
+  }
+  const operationIds = new Set<string>();
+  for (const operation of material.operationTail) {
+    if (
+      operation.boardId !== activeBoardId ||
+      !Number.isSafeInteger(operation.seq) ||
+      operation.seq !== expectedSequence ||
+      operation.seq > material.capturedCanvasSeq
+    )
+      throw invalidRecovery("Recovery operation tail is not contiguous");
+    if (operationIds.has(operation.opId))
+      throw invalidRecovery("Recovery operation tail contains duplicate identity");
+    operationIds.add(operation.opId);
+    const reduced = reduceCommand(committed, operation, operation.seq);
+    if (!reduced.ok) throw invalidRecovery("Recovery operation replay failed");
+    committed = reduced.state;
+    expectedSequence += 1;
+  }
+  if (
+    committed.lastSeq !== material.capturedCanvasSeq ||
+    expectedSequence - 1 !== material.capturedCanvasSeq ||
+    (material.snapshotCanvasSeq === material.capturedCanvasSeq &&
+      material.operationTail.length !== 0)
+  )
+    throw invalidRecovery("Recovery operation tail does not reach the captured head");
+
+  if ((await hashBoardState(committed)) !== material.reconstructedCanonicalHash)
+    throw invalidRecovery("Reconstructed board hash verification failed");
+  return committed;
+}
+
 interface SynchronizationAttempt {
   id: number;
   connectionGeneration: number;
@@ -70,7 +184,7 @@ export interface BoardTransportOptions {
   apiUrl?: string;
   socketFactory?: (apiUrl: string) => BoardSocket;
   fetcher?: typeof fetch;
-  loadSnapshot?: (boardId: string, signal: AbortSignal) => Promise<unknown>;
+  loadRecovery?: (boardId: string, signal: AbortSignal) => Promise<unknown>;
   synchronization?: Partial<SynchronizationLimits>;
 }
 
@@ -108,7 +222,7 @@ export class BoardTransport {
   private readonly apiUrl: string;
   private readonly socketFactory: (apiUrl: string) => BoardSocket;
   private readonly fetcher: typeof fetch;
-  private readonly loadSnapshot: (boardId: string, signal: AbortSignal) => Promise<unknown>;
+  private readonly loadRecovery: (boardId: string, signal: AbortSignal) => Promise<unknown>;
   private readonly limits: SynchronizationLimits;
 
   constructor(
@@ -122,7 +236,7 @@ export class BoardTransport {
     this.socketFactory =
       options.socketFactory ?? ((url) => io(url, { auth: {}, reconnection: true }));
     this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
-    this.loadSnapshot = options.loadSnapshot ?? ((id, signal) => this.fetchSnapshot(id, signal));
+    this.loadRecovery = options.loadRecovery ?? ((id, signal) => this.fetchRecovery(id, signal));
     this.limits = {
       acknowledgementTimeoutMs: SYNC_ACK_TIMEOUT_MS,
       retryBaseMs: SYNC_RETRY_BASE_MS,
@@ -257,10 +371,10 @@ export class BoardTransport {
     this.assertCurrent(socket, attempt);
     if (!acknowledgement.ok) {
       if (acknowledgement.code === "RESYNC_REQUIRED") {
-        await this.rebaseFromSnapshot(socket, attempt);
+        await this.rebaseFromRecovery(socket, attempt);
         throw new SynchronizationError(
           "RESYNC_REQUIRED",
-          "Authoritative snapshot reloaded; joining again",
+          "Authoritative recovery material applied; joining again",
           true,
         );
       }
@@ -276,7 +390,7 @@ export class BoardTransport {
 
     const localSequence = useBoardStore.getState().committed.lastSeq;
     if (localSequence > acknowledgement.joinWatermark) {
-      await this.rebaseFromSnapshot(socket, attempt);
+      await this.rebaseFromRecovery(socket, attempt);
       throw new SynchronizationError(
         "RESYNC_REQUIRED",
         "Local sequence exceeded the join watermark; joining again",
@@ -316,7 +430,7 @@ export class BoardTransport {
         const failure = protocolErrorSchema.safeParse(raw);
         if (failure.success) {
           if (failure.data.code === "RESYNC_REQUIRED") {
-            await this.rebaseFromSnapshot(socket, attempt);
+            await this.rebaseFromRecovery(socket, attempt);
             throw new SynchronizationError(
               "RESYNC_REQUIRED",
               "Operation range was unavailable; authoritative snapshot reloaded",
@@ -348,11 +462,11 @@ export class BoardTransport {
           throw new SynchronizationError("RESYNC_REQUIRED", "Conflicting operation delivery", true);
       }
       if (useBoardStore.getState().committed.lastSeq <= after) {
-        await this.rebaseFromSnapshot(socket, attempt);
+        await this.rebaseFromRecovery(socket, attempt);
         throw new SynchronizationError("RESYNC_REQUIRED", "Catch-up made no progress", true);
       }
       if (!batch.hasMore && useBoardStore.getState().committed.lastSeq < watermark) {
-        await this.rebaseFromSnapshot(socket, attempt);
+        await this.rebaseFromRecovery(socket, attempt);
         throw new SynchronizationError("RESYNC_REQUIRED", "Catch-up ended before watermark", true);
       }
     }
@@ -476,36 +590,78 @@ export class BoardTransport {
     }
   }
 
-  private async rebaseFromSnapshot(
+  private async rebaseFromRecovery(
     socket: BoardSocket,
     attempt: SynchronizationAttempt,
   ): Promise<void> {
-    let raw: unknown;
+    const controller = new AbortController();
+    let timedOut = false;
+    let rejectInterruption!: (error: SynchronizationError) => void;
+    const interruption = new Promise<never>((_resolve, reject) => {
+      rejectInterruption = reject;
+    });
+    const interrupt = (error: SynchronizationError): void => {
+      controller.abort();
+      rejectInterruption(error);
+    };
+    const cancel = (): void =>
+      interrupt(new SynchronizationError("INTERNAL_ERROR", "Recovery attempt was cancelled", true));
+    attempt.cancelers.add(cancel);
+    const timeout = this.scheduler.setTimeout(() => {
+      timedOut = true;
+      interrupt(new SynchronizationError("INTERNAL_ERROR", "Recovery request timed out", true));
+    }, this.limits.acknowledgementTimeoutMs);
     try {
-      raw = await this.loadSnapshot(this.boardId, attempt.abortController.signal);
-    } catch (error) {
-      if (error instanceof SynchronizationError) throw error;
-      throw new SynchronizationError(
-        "INTERNAL_ERROR",
-        "Authoritative snapshot reload failed",
-        true,
-      );
+      let raw: unknown;
+      try {
+        raw = await Promise.race([
+          this.loadRecovery(this.boardId, controller.signal),
+          interruption,
+        ]);
+      } catch (error) {
+        if (error instanceof SynchronizationError) throw error;
+        if (timedOut)
+          throw new SynchronizationError("INTERNAL_ERROR", "Recovery request timed out", true);
+        if (attempt.cancelled) throw error;
+        throw new SynchronizationError("INTERNAL_ERROR", "Recovery request failed", true);
+      }
+      this.assertCurrent(socket, attempt);
+      const parsed = boardRecoveryMaterialSchema.safeParse(raw);
+      if (!parsed.success)
+        throw new SynchronizationError(
+          "INVALID_COMMAND",
+          "Invalid authoritative recovery material",
+          false,
+        );
+      const committed = await Promise.race([
+        verifyRecoveryMaterial(parsed.data, this.boardId),
+        interruption,
+      ]);
+      this.assertCurrent(socket, attempt);
+      if (
+        !useBoardStore
+          .getState()
+          .rebaseRecoveredSession(
+            this.sessionToken,
+            this.boardId,
+            parsed.data.snapshotState.boardName,
+            committed,
+          )
+      )
+        throw new SynchronizationError("INTERNAL_ERROR", "Recovery session was superseded", true);
+    } finally {
+      this.scheduler.clearTimeout(timeout);
+      attempt.cancelers.delete(cancel);
     }
-    this.assertCurrent(socket, attempt);
-    const parsed = boardSnapshotSchema.safeParse(raw);
-    if (!parsed.success || parsed.data.id !== this.boardId)
-      throw new SynchronizationError("INVALID_COMMAND", "Invalid authoritative snapshot", false);
-    if (!useBoardStore.getState().rebaseSession(this.sessionToken, parsed.data))
-      throw new SynchronizationError("INTERNAL_ERROR", "Snapshot session was superseded", true);
   }
 
-  private async fetchSnapshot(boardId: string, signal: AbortSignal): Promise<BoardSnapshot> {
-    const response = await this.fetcher(`${this.apiUrl}/v1/boards/${boardId}`, { signal });
+  private async fetchRecovery(boardId: string, signal: AbortSignal): Promise<unknown> {
+    const response = await this.fetcher(`${this.apiUrl}/v1/boards/${boardId}/recovery`, { signal });
     let raw: unknown;
     try {
       raw = await response.json();
     } catch {
-      throw new SynchronizationError("INTERNAL_ERROR", "Snapshot response was unreadable", true);
+      throw new SynchronizationError("INTERNAL_ERROR", "Recovery response was unreadable", true);
     }
     if (!response.ok) {
       const failure = protocolErrorSchema.safeParse(raw);
@@ -515,9 +671,9 @@ export class BoardTransport {
           failure.data.message,
           failure.data.retryable,
         );
-      throw new SynchronizationError("INTERNAL_ERROR", "Snapshot reload failed", true);
+      throw new SynchronizationError("INTERNAL_ERROR", "Recovery request failed", true);
     }
-    return boardSnapshotSchema.parse(raw);
+    return raw;
   }
 
   private receiveLive(socket: BoardSocket, raw: unknown): void {

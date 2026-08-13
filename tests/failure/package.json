@@ -2,13 +2,25 @@
   "name": "@converge/failure",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "dependencies": {
+    "@converge/api": "workspace:*",
+    "@converge/canvas-engine": "workspace:*",
+    "@converge/database": "workspace:*",
+    "@converge/observability": "workspace:*",
+    "@converge/protocol": "workspace:*",
+    "@converge/testkit": "workspace:*",
+    "@converge/worker": "workspace:*",
+    "redis": "6.2.0"
+  },
   "devDependencies": {
+    "@types/node": "22.18.0",
     "vitest": "3.2.4"
   }
 }

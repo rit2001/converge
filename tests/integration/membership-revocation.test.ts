@@ -3,12 +3,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { buildApp, type AppContext, type DeliveryHooks } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
 import { BoardDeliveryCoordinator } from "../../apps/api/src/board-delivery-coordinator";
-import type { Environment } from "@converge/api/env";
-import { createPool, type BoardRepositoryHooks } from "@converge/database";
+import { parseEnvironment } from "@converge/api/env";
+import { BoardRepository, createPool, type BoardRepositoryHooks } from "@converge/database";
 import {
   boardAccessRevokedEventSchema,
   boardSnapshotSchema,
-  membershipRevocationOutboxPayloadSchema,
+  membershipRevokedDeliveryEnvelopeSchema,
   removeBoardMemberResponseSchema,
   type BoardAccessRevokedEvent,
   type CommittedOperation,
@@ -41,16 +41,16 @@ const tokens = {
   outsider: "revocation-outsider-token",
 } as const;
 
-const environment: Environment = {
+const environment = parseEnvironment({
   NODE_ENV: "test",
   HOST: "127.0.0.1",
-  API_PORT: 4000,
+  API_PORT: "4000",
   WEB_ORIGIN: "http://127.0.0.1:3000",
   DATABASE_URL: databaseUrl,
   REDIS_URL: "redis://127.0.0.1:6379",
   LOG_LEVEL: "silent",
   DEV_AUTH_USER_NAME: "Unused development identity",
-};
+});
 
 const auth = new TestAuthAdapter(
   new Map<string, AuthenticatedPrincipal>([
@@ -98,7 +98,6 @@ afterEach(() => {
 
 afterAll(async () => {
   for (const socket of sockets) socket.disconnect();
-  await context.io.close();
   await context.app.close();
   await pool.end();
 });
@@ -187,12 +186,38 @@ function roomHas(boardId: string, socket: TestSocket): boolean {
 }
 
 async function revocationOutbox(boardId: string) {
-  return pool.query<{ board_seq: string | null; event_type: string; payload: unknown }>(
-    `SELECT board_seq, event_type, payload FROM outbox_events
+  return pool.query<{
+    delivery_seq: string;
+    canvas_seq: string | null;
+    event_type: string;
+    schema_version: number;
+    payload: unknown;
+  }>(
+    `SELECT delivery_seq, canvas_seq, event_type, schema_version, payload FROM outbox_events
      WHERE board_id = $1 AND event_type = 'board.membership.revoked'
-     ORDER BY created_at`,
+     ORDER BY delivery_seq`,
     [boardId],
   );
+}
+
+async function durableBoardState(boardId: string) {
+  const result = await pool.query<{
+    last_seq: string;
+    last_delivery_seq: string;
+    operation_count: string;
+    projection_count: string;
+    membership_count: string;
+    outbox_count: string;
+  }>(
+    `SELECT b.last_seq, b.last_delivery_seq,
+            (SELECT count(*) FROM board_operations WHERE board_id = b.id) operation_count,
+            (SELECT count(*) FROM board_objects WHERE board_id = b.id) projection_count,
+            (SELECT count(*) FROM board_members WHERE board_id = b.id) membership_count,
+            (SELECT count(*) FROM outbox_events WHERE board_id = b.id) outbox_count
+     FROM boards b WHERE b.id = $1`,
+    [boardId],
+  );
+  return result.rows[0];
 }
 
 async function membershipExists(boardId: string, userId: string): Promise<boolean> {
@@ -230,22 +255,38 @@ describe("supported membership revocation", () => {
     const outbox = await revocationOutbox(boardId);
     expect(outbox.rowCount).toBe(1);
     expect(outbox.rows[0]).toMatchObject({
-      board_seq: null,
+      delivery_seq: "1",
+      canvas_seq: null,
       event_type: "board.membership.revoked",
+      schema_version: 1,
     });
-    expect(membershipRevocationOutboxPayloadSchema.parse(outbox.rows[0]?.payload)).toMatchObject({
+    expect(membershipRevokedDeliveryEnvelopeSchema.parse(outbox.rows[0]?.payload)).toMatchObject({
       eventId: result.eventId,
       boardId,
-      revokedUserId: identities.editor.id,
-      initiatedByUserId: identities.owner.id,
+      deliverySeq: 1,
+      eventType: "board.membership.revoked",
+      payload: {
+        revokedUserId: identities.editor.id,
+        initiatedByUserId: identities.owner.id,
+      },
+    });
+    expect(await durableBoardState(boardId)).toMatchObject({
+      last_seq: "0",
+      last_delivery_seq: "1",
+      operation_count: "0",
+      projection_count: "0",
+      membership_count: "2",
+      outbox_count: "1",
     });
 
+    const beforeDuplicate = await durableBoardState(boardId);
     const duplicate = await removeMember(boardId, identities.editor.id, tokens.owner);
     expect(removeBoardMemberResponseSchema.parse(duplicate.json())).toMatchObject({
       removed: false,
       eventId: null,
     });
     expect((await revocationOutbox(boardId)).rowCount).toBe(1);
+    expect(await durableBoardState(boardId)).toEqual(beforeDuplicate);
   });
 
   it("stops post-revocation delivery while authorized board clients continue", async () => {
@@ -316,6 +357,7 @@ describe("membership removal authorization and rollback", () => {
     const boardId = await createBoard();
     const viewer = await connect(tokens.viewer);
     await join(viewer, boardId);
+    const before = await durableBoardState(boardId);
     for (const token of [tokens.editor, tokens.viewer, tokens.outsider]) {
       const response = await removeMember(boardId, identities.viewer.id, token);
       expect(response.statusCode).toBe(403);
@@ -327,6 +369,7 @@ describe("membership removal authorization and rollback", () => {
     expect(unauthenticated.json()).toMatchObject({ code: "AUTHENTICATION_REQUIRED" });
     expect(await membershipExists(boardId, identities.viewer.id)).toBe(true);
     expect((await revocationOutbox(boardId)).rowCount).toBe(0);
+    expect(await durableBoardState(boardId)).toEqual(before);
 
     const revoked = nextRevocation(viewer);
     const ownerRemoval = await removeMember(boardId, identities.viewer.id, tokens.owner);
@@ -338,6 +381,7 @@ describe("membership removal authorization and rollback", () => {
     const boardId = await createBoard();
     const owner = await connect(tokens.owner);
     await join(owner, boardId);
+    const before = await durableBoardState(boardId);
     const response = await removeMember(boardId, identities.owner.id, tokens.owner);
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual({
@@ -349,22 +393,26 @@ describe("membership removal authorization and rollback", () => {
     expect(await membershipExists(boardId, identities.owner.id)).toBe(true);
     expect(roomHas(boardId, owner)).toBe(true);
     expect((await revocationOutbox(boardId)).rowCount).toBe(0);
+    expect(await durableBoardState(boardId)).toEqual(before);
   });
 
   it("rolls back deletion and outbox insertion before performing eviction", async () => {
     const boardId = await createBoard();
     const editor = await connect(tokens.editor);
     await join(editor, boardId);
+    const before = await durableBoardState(boardId);
     activeMembershipHook = () => Promise.reject(new Error("forced membership rollback"));
     const response = await removeMember(boardId, identities.editor.id, tokens.owner);
     expect(response.statusCode).toBe(500);
     expect(await membershipExists(boardId, identities.editor.id)).toBe(true);
     expect((await revocationOutbox(boardId)).rowCount).toBe(0);
     expect(roomHas(boardId, editor)).toBe(true);
+    expect(await durableBoardState(boardId)).toEqual(before);
   });
 
   it("strictly rejects malformed identifiers, query fields, and request bodies", async () => {
     const boardId = await createBoard();
+    const before = await durableBoardState(boardId);
     const malformed = await removeMember("not-a-uuid", identities.editor.id, tokens.owner);
     expect(malformed.statusCode).toBe(400);
     const query = await removeMember(boardId, identities.editor.id, tokens.owner, {
@@ -377,10 +425,71 @@ describe("membership removal authorization and rollback", () => {
     expect(body.statusCode).toBe(400);
     expect(await membershipExists(boardId, identities.editor.id)).toBe(true);
     expect((await revocationOutbox(boardId)).rowCount).toBe(0);
+    expect(await durableBoardState(boardId)).toEqual(before);
   });
 });
 
 describe("board-local operation and revocation ordering", () => {
+  it("serializes concurrent operation and revocation allocation under the board advisory lock", async () => {
+    const boardId = await createBoard();
+    const operationLocked = deferred();
+    const removalAttemptingLock = deferred();
+    const releaseOperation = deferred();
+    const operationRepository = new BoardRepository(pool, {
+      afterSequenceLock: async () => {
+        operationLocked.resolve();
+        await releaseOperation.promise;
+      },
+    });
+    const membershipRepository = new BoardRepository(pool, {
+      beforeMembershipSequenceLock: () => {
+        removalAttemptingLock.resolve();
+        return Promise.resolve();
+      },
+    });
+
+    const operation = operationRepository.commitOperation(
+      identities.owner.id,
+      createRectangleCommand(boardId),
+    );
+    await operationLocked.promise;
+    const removal = membershipRepository.removeBoardMember(
+      identities.owner.id,
+      boardId,
+      identities.editor.id,
+    );
+    await removalAttemptingLock.promise;
+    releaseOperation.resolve();
+
+    const [committedOperation, committedRemoval] = await Promise.all([operation, removal]);
+    expect(committedOperation.event.deliverySeq).toBe(1);
+    expect(committedRemoval.event?.deliverySeq).toBe(2);
+    const events = await pool.query<{
+      delivery_seq: string;
+      canvas_seq: string | null;
+      event_type: string;
+    }>(
+      `SELECT delivery_seq, canvas_seq, event_type
+       FROM outbox_events WHERE board_id = $1 ORDER BY delivery_seq`,
+      [boardId],
+    );
+    expect(events.rows).toEqual([
+      { delivery_seq: "1", canvas_seq: "1", event_type: "operation.committed" },
+      {
+        delivery_seq: "2",
+        canvas_seq: null,
+        event_type: "board.membership.revoked",
+      },
+    ]);
+    expect(await durableBoardState(boardId)).toMatchObject({
+      last_seq: "1",
+      last_delivery_seq: "2",
+      operation_count: "1",
+      projection_count: "1",
+      outbox_count: "2",
+    });
+  });
+
   it("permits an operation that owns the coordinator before revocation, then blocks later delivery", async () => {
     const boardId = await createBoard();
     const owner = await connect(tokens.owner);
@@ -436,6 +545,23 @@ describe("board-local operation and revocation ordering", () => {
     await expect(ownerLive).resolves.toMatchObject({ seq: 1 });
     expect(roomHas(boardId, editor)).toBe(false);
     expect(removedDeliveries).toBe(0);
+    const deliveryOrder = await pool.query<{
+      delivery_seq: string;
+      canvas_seq: string | null;
+      event_type: string;
+    }>(
+      `SELECT delivery_seq, canvas_seq, event_type
+       FROM outbox_events WHERE board_id = $1 ORDER BY delivery_seq`,
+      [boardId],
+    );
+    expect(deliveryOrder.rows).toEqual([
+      {
+        delivery_seq: "1",
+        canvas_seq: null,
+        event_type: "board.membership.revoked",
+      },
+      { delivery_seq: "2", canvas_seq: "1", event_type: "operation.committed" },
+    ]);
   });
 
   it("cannot leave a concurrent rejoin subscribed after revocation completes", async () => {

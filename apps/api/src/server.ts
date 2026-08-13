@@ -1,18 +1,14 @@
-import { createPool } from "@converge/database";
-import { buildApp } from "./app.js";
-import { DevelopmentAuthAdapter } from "./auth.js";
 import { parseEnvironment } from "./env.js";
+import { createApiServer } from "./server-runtime.js";
 
 const environment = parseEnvironment(process.env);
-const pool = createPool(environment.DATABASE_URL);
-const authentication = new DevelopmentAuthAdapter(environment);
-const { app, io } = await buildApp(environment, pool, authentication);
-
-const shutdown = async (): Promise<void> => {
-  await io.close();
-  await app.close();
-  await pool.end();
+const server = await createApiServer(environment);
+const shutdown = (): void => {
+  void server.close().catch(() => {
+    process.exitCode = 1;
+  });
 };
-process.once("SIGINT", () => void shutdown());
-process.once("SIGTERM", () => void shutdown());
-await app.listen({ host: environment.HOST, port: environment.API_PORT });
+
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
+await server.listen();

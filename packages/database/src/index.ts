@@ -9,11 +9,13 @@ import {
   canvasObjectSchema,
   committedOperationSchema,
   durableCommandSchema,
-  membershipRevocationOutboxPayloadSchema,
+  membershipRevokedDeliveryEnvelopeSchema,
+  operationCommittedDeliveryEnvelopeSchema,
   type BoardSnapshot,
   type CommittedOperation,
   type DurableCommand,
-  type MembershipRevocationOutboxPayload,
+  type MembershipRevokedDeliveryEnvelope,
+  type OperationCommittedDeliveryEnvelope,
   type OperationRangeResponse,
 } from "@converge/protocol";
 
@@ -38,6 +40,23 @@ export class RepositoryError extends Error {
 export interface BoardRepositoryHooks {
   beforeSequenceLock?: (command: DurableCommand) => Promise<void>;
   afterSequenceLock?: (command: DurableCommand) => Promise<void>;
+  afterReceiptInsert?: (command: DurableCommand) => Promise<void>;
+  afterOperationRangeLock?: (context: {
+    boardId: string;
+    userId: string;
+    afterSeq: number;
+    watermark: number;
+  }) => Promise<void>;
+  beforeMembershipSequenceLock?: (context: {
+    boardId: string;
+    actorId: string;
+    targetUserId: string;
+  }) => Promise<void>;
+  afterMembershipSequenceLock?: (context: {
+    boardId: string;
+    actorId: string;
+    targetUserId: string;
+  }) => Promise<void>;
   afterMembershipDelete?: (context: {
     boardId: string;
     actorId: string;
@@ -47,7 +66,43 @@ export interface BoardRepositoryHooks {
 
 export interface RemoveBoardMemberResult {
   removed: boolean;
-  event: MembershipRevocationOutboxPayload | null;
+  event: MembershipRevokedDeliveryEnvelope | null;
+}
+
+export interface CommitOperationResult {
+  duplicate: boolean;
+  operation: CommittedOperation;
+  event: OperationCommittedDeliveryEnvelope;
+}
+
+export interface OperationRangeBelowFloor {
+  outcome: "range_below_floor";
+  boardId: string;
+}
+
+export type OperationBatchResult = OperationRangeResponse | OperationRangeBelowFloor;
+
+export const BOARD_DELIVERY_HEAD_QUERY_MAXIMUM = 100 as const;
+
+export interface BoardDeliveryHead {
+  boardId: string;
+  lastDeliverySeq: number;
+}
+
+export class BoardDeliveryHeadReadError extends Error {
+  constructor(
+    public readonly code: "INVALID_BOARD_BATCH" | "MISSING_BOARD_HEAD" | "INVALID_DELIVERY_HEAD",
+  ) {
+    super(`Board delivery-head read failed: ${code}`);
+  }
+}
+
+function parseDeliveryHead(value: unknown): number {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value))
+    throw new BoardDeliveryHeadReadError("INVALID_DELIVERY_HEAD");
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new BoardDeliveryHeadReadError("INVALID_DELIVERY_HEAD");
+  return parsed;
 }
 
 export function createPool(databaseUrl: string): pg.Pool {
@@ -90,6 +145,38 @@ export class BoardRepository {
       [boardId, userId],
     );
     return result.rows[0]?.role ?? null;
+  }
+
+  async getBoardDeliveryHeads(boardIds: readonly string[]): Promise<readonly BoardDeliveryHead[]> {
+    const expected = new Set(boardIds);
+    if (
+      boardIds.length === 0 ||
+      boardIds.length > BOARD_DELIVERY_HEAD_QUERY_MAXIMUM ||
+      expected.size !== boardIds.length
+    )
+      throw new BoardDeliveryHeadReadError("INVALID_BOARD_BATCH");
+    const result = await this.pool.query<{ id: string; last_delivery_seq: string }>(
+      `SELECT id, last_delivery_seq
+       FROM boards
+       WHERE id = ANY($1::uuid[])
+       ORDER BY id`,
+      [boardIds],
+    );
+    const heads = new Map<string, BoardDeliveryHead>();
+    for (const row of result.rows) {
+      if (!expected.has(row.id) || heads.has(row.id))
+        throw new BoardDeliveryHeadReadError("INVALID_DELIVERY_HEAD");
+      heads.set(row.id, {
+        boardId: row.id,
+        lastDeliverySeq: parseDeliveryHead(row.last_delivery_seq),
+      });
+    }
+    if (heads.size !== expected.size) throw new BoardDeliveryHeadReadError("MISSING_BOARD_HEAD");
+    return boardIds.map((boardId) => {
+      const head = heads.get(boardId);
+      if (!head) throw new BoardDeliveryHeadReadError("MISSING_BOARD_HEAD");
+      return head;
+    });
   }
 
   async getBoardSequence(boardId: string, userId: string): Promise<number> {
@@ -160,44 +247,108 @@ export class BoardRepository {
     afterSeq: number,
     watermark: number,
     batchSize: number,
-  ): Promise<OperationRangeResponse> {
-    if (watermark < afterSeq)
+  ): Promise<OperationBatchResult> {
+    if (
+      !Number.isSafeInteger(afterSeq) ||
+      afterSeq < 0 ||
+      !Number.isSafeInteger(watermark) ||
+      watermark < 0 ||
+      watermark < afterSeq
+    )
       throw new RepositoryError("RESYNC_REQUIRED", "Invalid synchronization cursor");
-    const head = await this.getBoardSequence(boardId, userId);
-    if (watermark > head)
-      throw new RepositoryError("RESYNC_REQUIRED", "Synchronization watermark exceeds board head");
-    const result = await this.pool.query<{ command: unknown; seq: string; committed_at: Date }>(
-      `SELECT command, seq, committed_at
-       FROM board_operations
-       WHERE board_id = $1 AND seq > $2 AND seq <= $3
-       ORDER BY seq
-       LIMIT $4`,
-      [boardId, afterSeq, watermark, batchSize],
-    );
-    const operations = result.rows.map((row) =>
-      committedOperationSchema.parse({
-        ...durableCommandSchema.parse(row.command),
-        seq: Number(row.seq),
-        committedAt: row.committed_at.toISOString(),
-      }),
-    );
-    let expected = afterSeq + 1;
-    for (const operation of operations) {
-      if (operation.seq !== expected)
-        throw new RepositoryError("RESYNC_REQUIRED", "Operation log is not contiguous");
-      expected += 1;
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0)
+      throw new Error("Invalid operation-range batch size");
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
+      await this.hooks.afterOperationRangeLock?.({ boardId, userId, afterSeq, watermark });
+      const boundary = await client.query<{
+        last_seq: unknown;
+        last_delivery_seq: unknown;
+        operation_recovery_floor: unknown;
+        delivery_recovery_floor: unknown;
+      }>(
+        `SELECT b.last_seq, b.last_delivery_seq,
+                b.operation_recovery_floor, b.delivery_recovery_floor
+         FROM boards b
+         JOIN board_members m ON m.board_id = b.id AND m.user_id = $2
+         WHERE b.id = $1
+         FOR UPDATE OF b`,
+        [boardId, userId],
+      );
+      const row = boundary.rows[0];
+      if (!row) throw new RepositoryError("FORBIDDEN", "Board membership required");
+      const parseBoundary = (value: unknown): number => {
+        const parsed =
+          typeof value === "number"
+            ? value
+            : typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)
+              ? Number(value)
+              : Number.NaN;
+        if (!Number.isSafeInteger(parsed) || parsed < 0)
+          throw new Error("Invalid board recovery boundary");
+        return parsed;
+      };
+      const canvasHead = parseBoundary(row.last_seq);
+      const deliveryHead = parseBoundary(row.last_delivery_seq);
+      const operationFloor = parseBoundary(row.operation_recovery_floor);
+      const deliveryFloor = parseBoundary(row.delivery_recovery_floor);
+      if (deliveryHead < canvasHead || operationFloor > canvasHead || deliveryFloor > deliveryHead)
+        throw new Error("Invalid board recovery boundary");
+      if (watermark > canvasHead)
+        throw new RepositoryError(
+          "RESYNC_REQUIRED",
+          "Synchronization watermark exceeds board head",
+        );
+      if (afterSeq < operationFloor) {
+        await client.query("COMMIT");
+        return { outcome: "range_below_floor", boardId };
+      }
+      const result = await client.query<{
+        command: unknown;
+        seq: string;
+        committed_at: Date;
+      }>(
+        `SELECT command, seq, committed_at
+         FROM board_operations
+         WHERE board_id = $1 AND seq > $2 AND seq <= $3
+         ORDER BY seq
+         LIMIT $4`,
+        [boardId, afterSeq, watermark, batchSize],
+      );
+      const operations = result.rows.map((operationRow) =>
+        committedOperationSchema.parse({
+          ...durableCommandSchema.parse(operationRow.command),
+          seq: Number(operationRow.seq),
+          committedAt: operationRow.committed_at.toISOString(),
+        }),
+      );
+      let expected = afterSeq + 1;
+      for (const operation of operations) {
+        if (operation.seq !== expected)
+          throw new RepositoryError("RESYNC_REQUIRED", "Operation log is not contiguous");
+        expected += 1;
+      }
+      const nextSeq = operations.at(-1)?.seq ?? afterSeq;
+      if (nextSeq < watermark && operations.length === 0)
+        throw new RepositoryError("RESYNC_REQUIRED", "Operation range is unavailable");
+      const response: OperationRangeResponse = {
+        boardId,
+        afterSeq,
+        watermark,
+        operations,
+        nextSeq,
+        hasMore: nextSeq < watermark,
+      };
+      await client.query("COMMIT");
+      return response;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
-    const nextSeq = operations.at(-1)?.seq ?? afterSeq;
-    if (nextSeq < watermark && operations.length === 0)
-      throw new RepositoryError("RESYNC_REQUIRED", "Operation range is unavailable");
-    return {
-      boardId,
-      afterSeq,
-      watermark,
-      operations,
-      nextSeq,
-      hasMore: nextSeq < watermark,
-    };
   }
 
   async removeBoardMember(
@@ -208,9 +359,16 @@ export class BoardRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      const hookContext = { boardId, actorId, targetUserId };
+      await this.hooks.beforeMembershipSequenceLock?.(hookContext);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [boardId]);
-      const board = await client.query<{ created_by: string; actor_role: string | null }>(
-        `SELECT b.created_by, m.role AS actor_role
+      await this.hooks.afterMembershipSequenceLock?.(hookContext);
+      const board = await client.query<{
+        created_by: string;
+        actor_role: string | null;
+        last_delivery_seq: string;
+      }>(
+        `SELECT b.created_by, b.last_delivery_seq, m.role AS actor_role
          FROM boards b
          LEFT JOIN board_members m ON m.board_id = b.id AND m.user_id = $2
          WHERE b.id = $1
@@ -236,22 +394,31 @@ export class BoardRepository {
         boardId,
         targetUserId,
       ]);
-      await this.hooks.afterMembershipDelete?.({ boardId, actorId, targetUserId });
+      await this.hooks.afterMembershipDelete?.(hookContext);
       const eventId = crypto.randomUUID();
+      const deliverySeq = Number(boardRow.last_delivery_seq) + 1;
       const committedAt = new Date().toISOString();
-      const event = membershipRevocationOutboxPayloadSchema.parse({
+      const event = membershipRevokedDeliveryEnvelopeSchema.parse({
         schemaVersion: 1,
         eventId,
-        kind: "board.membership.revoked",
         boardId,
-        revokedUserId: targetUserId,
-        initiatedByUserId: actorId,
-        committedAt,
+        deliverySeq,
+        eventType: "board.membership.revoked",
+        occurredAt: committedAt,
+        payload: {
+          revokedUserId: targetUserId,
+          initiatedByUserId: actorId,
+        },
       });
       await client.query(
-        `INSERT INTO outbox_events(id, board_id, board_seq, event_type, payload, created_at)
-         VALUES ($1, $2, NULL, 'board.membership.revoked', $3, $4)`,
-        [eventId, boardId, event, committedAt],
+        "UPDATE boards SET last_delivery_seq = $2, updated_at = now() WHERE id = $1",
+        [boardId, deliverySeq],
+      );
+      await client.query(
+        `INSERT INTO outbox_events(
+           id, board_id, delivery_seq, canvas_seq, event_type, schema_version, payload, created_at
+         ) VALUES ($1, $2, $3, NULL, 'board.membership.revoked', 1, $4, $5)`,
+        [eventId, boardId, deliverySeq, event, committedAt],
       );
       await client.query("COMMIT");
       return { removed: true, event };
@@ -263,10 +430,7 @@ export class BoardRepository {
     }
   }
 
-  async commitOperation(
-    userId: string,
-    input: DurableCommand,
-  ): Promise<{ duplicate: boolean; operation: CommittedOperation }> {
+  async commitOperation(userId: string, input: DurableCommand): Promise<CommitOperationResult> {
     const command = durableCommandSchema.parse(input);
     const client = await this.pool.connect();
     try {
@@ -282,38 +446,38 @@ export class BoardRepository {
       );
       if (!role.rowCount || role.rows[0]?.role === "viewer")
         throw new RepositoryError("FORBIDDEN", "Board edit permission required");
-      const board = await client.query<{ last_seq: string }>(
-        "SELECT last_seq FROM boards WHERE id = $1 FOR UPDATE",
+      const board = await client.query<{ last_seq: string; last_delivery_seq: string }>(
+        "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1 FOR UPDATE",
         [command.boardId],
       );
       if (!board.rowCount) throw new RepositoryError("BOARD_NOT_FOUND", "Board not found");
       const authoritativeLastSeq = Number(board.rows[0]?.last_seq ?? 0);
+      const authoritativeLastDeliverySeq = Number(board.rows[0]?.last_delivery_seq ?? 0);
       const duplicate = await client.query<{
+        actor_id: string;
         command: unknown;
-        seq: string;
-        committed_at: Date;
-        user_id: string;
+        result: unknown;
         same_command: boolean;
       }>(
-        `SELECT command, seq, committed_at, user_id, command = $3::jsonb AS same_command
-         FROM board_operations WHERE board_id = $1 AND op_id = $2`,
+        `SELECT actor_id, command, result,
+                command = $3::jsonb AS same_command
+         FROM board_operation_receipts WHERE board_id = $1 AND operation_id = $2`,
         [command.boardId, command.opId, command],
       );
       const prior = duplicate.rows[0];
       if (prior) {
-        if (prior.user_id !== userId || !prior.same_command)
+        if (prior.actor_id !== userId || !prior.same_command)
           throw new RepositoryError(
             "IDEMPOTENCY_CONFLICT",
             "Operation id was already used for a different command",
           );
+        const event = operationCommittedDeliveryEnvelopeSchema.parse(prior.result);
+        const operation = event.payload.operation;
         await client.query("COMMIT");
         return {
           duplicate: true,
-          operation: committedOperationSchema.parse({
-            ...durableCommandSchema.parse(prior.command),
-            seq: Number(prior.seq),
-            committedAt: prior.committed_at.toISOString(),
-          }),
+          operation,
+          event,
         };
       }
       if (command.baseSeq > authoritativeLastSeq)
@@ -350,6 +514,7 @@ export class BoardRepository {
         if (projected.deletedSeq === null) state.order.push(row.object_id);
       }
       const seq = state.lastSeq + 1;
+      const deliverySeq = authoritativeLastDeliverySeq + 1;
       const reduced = reduceCommand(state, command, seq);
       if (!reduced.ok) throw new RepositoryError(reduced.code, reduced.message);
       const projected = reduced.state.objects[command.targetId];
@@ -357,15 +522,29 @@ export class BoardRepository {
       const stackOrder = stackOrderByObjectId.get(command.targetId) ?? seq;
       const committedAt = new Date().toISOString();
       const operation = committedOperationSchema.parse({ ...command, seq, committedAt });
+      const eventId = crypto.randomUUID();
+      const event = operationCommittedDeliveryEnvelopeSchema.parse({
+        schemaVersion: 1,
+        eventId,
+        boardId: command.boardId,
+        deliverySeq,
+        eventType: "operation.committed",
+        occurredAt: committedAt,
+        payload: { operation },
+      });
       await client.query(
-        `INSERT INTO board_operations(board_id, seq, op_id, client_id, user_id, base_seq, type, target_id, command, committed_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        `INSERT INTO board_operations(
+           board_id, seq, op_id, client_id, user_id, event_id, delivery_seq, base_seq, type,
+           target_id, command, committed_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [
           command.boardId,
           seq,
           command.opId,
           command.clientId,
           userId,
+          eventId,
+          deliverySeq,
           command.baseSeq,
           command.type,
           command.targetId,
@@ -390,16 +569,45 @@ export class BoardRepository {
           projected.deletedSeq,
         ],
       );
-      await client.query("UPDATE boards SET last_seq = $2, updated_at = now() WHERE id = $1", [
-        command.boardId,
-        seq,
-      ]);
       await client.query(
-        "INSERT INTO outbox_events(id, board_id, board_seq, event_type, payload) VALUES ($1,$2,$3,'operation.committed',$4)",
-        [crypto.randomUUID(), command.boardId, seq, operation],
+        `UPDATE boards
+         SET last_seq = $2, last_delivery_seq = $3, updated_at = now()
+         WHERE id = $1`,
+        [command.boardId, seq, deliverySeq],
       );
+      await client.query(
+        `INSERT INTO outbox_events(
+           id, board_id, delivery_seq, canvas_seq, event_type, schema_version, payload
+         ) VALUES ($1,$2,$3,$4,'operation.committed',1,$5)`,
+        [eventId, command.boardId, deliverySeq, seq, event],
+      );
+      await client.query(
+        `INSERT INTO board_operation_receipts(
+           board_id, operation_id, actor_id, command, command_hash, hash_schema_version,
+           canvas_seq, delivery_seq, event_id, committed_at, result
+         ) VALUES (
+           $1,$2,$3,$4,
+           encode(
+             sha256(convert_to('converge.operation-command.v1:' || $4::jsonb::text, 'UTF8')),
+             'hex'
+           ),
+           1,$5,$6,$7,$8,$9
+         )`,
+        [
+          command.boardId,
+          command.opId,
+          userId,
+          command,
+          seq,
+          deliverySeq,
+          eventId,
+          committedAt,
+          event,
+        ],
+      );
+      await this.hooks.afterReceiptInsert?.(command);
       await client.query("COMMIT");
-      return { duplicate: false, operation };
+      return { duplicate: false, operation, event };
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -410,3 +618,10 @@ export class BoardRepository {
 }
 
 export type DatabasePool = pg.Pool;
+
+export * from "./board-compaction-candidate-repository.js";
+export * from "./board-compaction-repository.js";
+export * from "./board-recovery-material-repository.js";
+export * from "./board-snapshot-candidate-repository.js";
+export * from "./board-snapshot-repository.js";
+export * from "./outbox-repository.js";

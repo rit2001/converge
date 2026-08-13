@@ -79,6 +79,12 @@ export interface BoardStore {
     pending: DurableCommand[],
   ): boolean;
   rebaseSession(token: BoardSessionToken, snapshot: BoardSnapshot): boolean;
+  rebaseRecoveredSession(
+    token: BoardSessionToken,
+    boardId: string,
+    boardName: string,
+    committed: BoardState,
+  ): boolean;
   revokeSession(token: BoardSessionToken, boardId: string, message: string): boolean;
   failSession(token: BoardSessionToken, message: string): void;
   endSession(token: BoardSessionToken): void;
@@ -122,6 +128,23 @@ function stateFromSnapshot(snapshot: BoardSnapshot): BoardState {
 
 function derive(committed: BoardState, pending: DurableCommand[]): CanvasObject[] {
   return visibleObjects(optimisticState(committed, pending));
+}
+
+function cloneBoardState(state: BoardState): BoardState {
+  return {
+    lastSeq: state.lastSeq,
+    order: [...state.order],
+    objects: Object.fromEntries(
+      Object.entries(state.objects).map(([id, projected]) => [
+        id,
+        {
+          ...projected,
+          value: { ...projected.value },
+          fieldSeq: { ...projected.fieldSeq },
+        },
+      ]),
+    ),
+  };
 }
 
 const idleHash = (): AuthoritativeHash => ({
@@ -283,6 +306,29 @@ export function createBoardStore(
           error: null,
         });
         scheduleHash(sessionToken, snapshot.id, committed);
+        return true;
+      },
+      rebaseRecoveredSession(sessionToken, recoveredBoardId, boardName, recovered) {
+        if (!isCurrent(sessionToken, recoveredBoardId)) return false;
+        const current = get();
+        const committed = cloneBoardState(recovered);
+        set({
+          name: boardName,
+          committed,
+          objects: derive(committed, current.pending),
+          buffered: {},
+          appliedOpIds: {},
+          appliedSeqOpIds: {},
+          authoritativeHash: {
+            status: "pending",
+            boardId: recoveredBoardId,
+            sessionGeneration: sessionToken.generation,
+            seq: committed.lastSeq,
+            value: null,
+          },
+          error: null,
+        });
+        scheduleHash(sessionToken, recoveredBoardId, committed);
         return true;
       },
       revokeSession(sessionToken, revokedBoardId, error) {

@@ -1,0 +1,196 @@
+groups:
+  - name: converge-m2-operational-alerts
+    rules:
+      - alert: ConvergeDeliveryQuarantineDetected
+        expr: |-
+          sum(increase(converge_delivery_events_total{outcome="quarantined"}[5m])) > 0
+        for: 0m
+        labels:
+          service: converge
+          severity: critical
+          subsystem: delivery
+        annotations:
+          summary: Quarantined delivery outcome detected.
+          description: A quarantined distributed delivery outcome occurred during the last five minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#quarantined-delivery-or-cursor-loss
+
+      - alert: ConvergeDeliveryFailuresElevated
+        expr: |-
+          (
+            sum(increase(converge_delivery_events_total{outcome="failed"}[10m]))
+            /
+            sum(increase(converge_delivery_events_total{outcome=~"handled|failed"}[10m]))
+          ) > 0.01
+          and
+          sum(increase(converge_delivery_events_total{outcome=~"handled|failed"}[10m])) >= 20
+        for: 0m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: delivery
+        annotations:
+          summary: Distributed delivery failures are elevated.
+          description: Failed delivery outcomes exceed one percent of handled and failed outcomes at sufficient volume.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#socket-consumerwatchdog-outage
+
+      - alert: ConvergeOutboxBlockedDetected
+        expr: |-
+          sum(increase(converge_outbox_publications_total{outcome="blocked"}[5m])) > 0
+        for: 0m
+        labels:
+          service: converge
+          severity: critical
+          subsystem: outbox
+        annotations:
+          summary: Blocked outbox publication detected.
+          description: A durable outbox publication attempt became blocked during the last five minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#blocked-outbox-event
+
+      - alert: ConvergeOutboxRetriesElevated
+        expr: |-
+          (
+            sum(increase(converge_outbox_publications_total{outcome="retry"}[10m]))
+            /
+            sum(increase(converge_outbox_publications_total{outcome=~"published|retry"}[10m]))
+          ) > 0.05
+          and
+          sum(increase(converge_outbox_publications_total{outcome=~"published|retry"}[10m])) >= 20
+        for: 0m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: outbox
+        annotations:
+          summary: Outbox publication retries are elevated.
+          description: Retry outcomes exceed five percent of published and retry outcomes at sufficient volume.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#redisoutbox-publication-outage
+
+      - alert: ConvergeRecoveryBlockedDetected
+        expr: |-
+          sum(increase(converge_recovery_requests_total{outcome="recovery_blocked"}[5m])) > 0
+        for: 0m
+        labels:
+          service: converge
+          severity: critical
+          subsystem: recovery
+        annotations:
+          summary: Blocked recovery detected.
+          description: A trustworthy recovery request became blocked during the last five minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#recovery-blocked-or-corrupt-snapshot-chain
+
+      - alert: ConvergeRecoveryFailuresElevated
+        expr: |-
+          (
+            sum(increase(converge_recovery_requests_total{outcome="retryable_failure"}[10m]))
+            /
+            sum(increase(converge_recovery_requests_total{outcome=~"snapshot_tail|refreshed|retryable_failure"}[10m]))
+          ) > 0.01
+          and
+          sum(increase(converge_recovery_requests_total{outcome=~"snapshot_tail|refreshed|retryable_failure"}[10m])) >= 20
+        for: 0m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: recovery
+        annotations:
+          summary: Retryable recovery failures are elevated.
+          description: Retryable recovery failures exceed one percent of successful and retryable outcomes at sufficient volume.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#high-recovery-or-publication-latency
+
+      - alert: ConvergeSnapshotFailuresElevated
+        expr: |-
+          sum(increase(converge_snapshot_runs_total{outcome=~"deterministic_failure|transient_failure"}[15m])) > 0
+        for: 0m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: snapshot
+        annotations:
+          summary: Snapshot capture failures detected.
+          description: A deterministic or transient snapshot capture failure occurred during the last fifteen minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#snapshot-failure
+
+      - alert: ConvergeCompactionBlockedDetected
+        expr: |-
+          sum(increase(converge_compaction_runs_total{outcome="blocked"}[15m])) > 0
+        for: 0m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: compaction
+        annotations:
+          summary: Blocked compaction detected.
+          description: An authoritative compaction attempt became blocked during the last fifteen minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#compaction-blocked-or-failed
+
+      - alert: ConvergeOutboxPublicationLatencyHigh
+        expr: |-
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(converge_outbox_publication_duration_seconds_bucket[15m]))
+          ) > 5
+          and
+          sum(increase(converge_outbox_publication_duration_seconds_count[15m])) >= 20
+        for: 15m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: outbox
+        annotations:
+          summary: Outbox publication latency is high.
+          description: Publication p99 exceeds five seconds with sufficient observations for fifteen minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#high-recovery-or-publication-latency
+
+      - alert: ConvergeSnapshotLatencyHigh
+        expr: |-
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(converge_snapshot_duration_seconds_bucket[15m]))
+          ) > 60
+          and
+          sum(increase(converge_snapshot_duration_seconds_count[15m])) >= 5
+        for: 15m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: snapshot
+        annotations:
+          summary: Snapshot capture latency is high.
+          description: Snapshot capture p99 exceeds sixty seconds with sufficient observations for fifteen minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#snapshot-failure
+
+      - alert: ConvergeCompactionLatencyHigh
+        expr: |-
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(converge_compaction_duration_seconds_bucket[15m]))
+          ) > 60
+          and
+          sum(increase(converge_compaction_duration_seconds_count[15m])) >= 5
+        for: 15m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: compaction
+        annotations:
+          summary: Compaction latency is high.
+          description: Compaction p99 exceeds sixty seconds with sufficient observations for fifteen minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#compaction-blocked-or-failed
+
+      - alert: ConvergeRecoveryLatencyHigh
+        expr: |-
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(converge_recovery_duration_seconds_bucket[15m]))
+          ) > 10
+          and
+          sum(increase(converge_recovery_duration_seconds_count[15m])) >= 20
+        for: 15m
+        labels:
+          service: converge
+          severity: warning
+          subsystem: recovery
+        annotations:
+          summary: Recovery request latency is high.
+          description: Recovery p99 exceeds ten seconds with sufficient observations for fifteen minutes.
+          runbook: docs/observability/runbooks/m2-8-incidents.md#high-recovery-or-publication-latency

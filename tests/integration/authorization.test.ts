@@ -2,7 +2,7 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp, type AppContext } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
-import type { Environment } from "@converge/api/env";
+import { parseEnvironment } from "@converge/api/env";
 import { createPool } from "@converge/database";
 import {
   boardSnapshotSchema,
@@ -47,16 +47,16 @@ const tokens = {
   outsider: "opaque-outsider-token",
 } as const;
 
-const environment: Environment = {
+const environment = parseEnvironment({
   NODE_ENV: "test",
   HOST: "127.0.0.1",
-  API_PORT: 4000,
+  API_PORT: "4000",
   WEB_ORIGIN: "http://127.0.0.1:3000",
   DATABASE_URL: databaseUrl,
   REDIS_URL: "redis://127.0.0.1:6379",
   LOG_LEVEL: "silent",
   DEV_AUTH_USER_NAME: "Unused development identity",
-};
+});
 
 const auth = new TestAuthAdapter(
   new Map<string, AuthenticatedPrincipal>([
@@ -82,7 +82,6 @@ beforeAll(async () => {
 
 afterAll(async () => {
   for (const socket of sockets) socket.disconnect();
-  await context.io.close();
   await context.app.close();
   await pool.end();
 });

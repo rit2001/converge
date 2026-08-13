@@ -2,10 +2,11 @@
   "name": "@converge/k6",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "build": "echo 'k6 scripts require the external k6 runtime'",
-    "lint": "eslint smoke.js",
-    "test": "echo 'k6 deferred until benchmark milestone'",
+    "lint": "eslint *.js *.mjs",
+    "test": "node --test protocol.test.mjs iteration-lifecycle.test.mjs scale-session.test.mjs",
     "typecheck": "echo 'no TypeScript sources'"
   }
 }

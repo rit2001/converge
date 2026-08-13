@@ -4,7 +4,7 @@ import { RepositoryError, type DatabasePool } from "@converge/database";
 import { httpInternalErrorResponseSchema, protocolErrorSchema } from "@converge/protocol";
 import { buildApp } from "./app.js";
 import type { AuthAdapter, AuthenticatedPrincipal } from "./auth.js";
-import type { Environment } from "./env.js";
+import { parseEnvironment, type Environment } from "./env.js";
 
 const principal: AuthenticatedPrincipal = {
   id: "00000000-0000-4000-8000-000000000091",
@@ -25,16 +25,16 @@ function environment(
   nodeEnvironment: Environment["NODE_ENV"],
   logLevel: Environment["LOG_LEVEL"] = "silent",
 ): Environment {
-  return {
+  return parseEnvironment({
     NODE_ENV: nodeEnvironment,
     HOST: "127.0.0.1",
-    API_PORT: 4000,
+    API_PORT: "4000",
     WEB_ORIGIN: "http://127.0.0.1:3000",
     DATABASE_URL: "postgresql://localhost/converge",
     REDIS_URL: "redis://localhost:6379",
     LOG_LEVEL: logLevel,
     DEV_AUTH_USER_NAME: "Unused",
-  };
+  });
 }
 
 function failingPool(error: Error): DatabasePool {
@@ -93,7 +93,6 @@ describe("HTTP error sanitization", () => {
       expect(health.statusCode).toBe(200);
       expect(health.json()).toEqual({ ok: true });
     } finally {
-      await context.io.close();
       await context.app.close();
     }
   });
@@ -118,7 +117,6 @@ describe("HTTP error sanitization", () => {
       for (const forbidden of ["FST_ERR", "RangeError", oversizedMarker, "/Users/", "node_modules"])
         expect(oversized.body).not.toContain(forbidden);
     } finally {
-      await context.io.close();
       await context.app.close();
     }
   });
@@ -159,7 +157,6 @@ describe("HTTP error sanitization", () => {
       expect(response.body).not.toContain(forged.message);
       expect(response.body).not.toContain(forged.code);
     } finally {
-      await Promise.all([rateLimitContext.io.close(), forgedContext.io.close()]);
       await Promise.all([rateLimitContext.app.close(), forgedContext.app.close()]);
     }
   });
@@ -213,7 +210,6 @@ describe("HTTP error sanitization", () => {
         expect(allLogs).not.toContain("caller-secret");
         expect(allLogs).not.toContain("sensitive-request-body");
       } finally {
-        await context.io.close();
         await context.app.close();
       }
     },
@@ -279,11 +275,6 @@ describe("HTTP error sanitization", () => {
         retryable: false,
       });
     } finally {
-      await Promise.all([
-        authenticationContext.io.close(),
-        validationContext.io.close(),
-        domainContext.io.close(),
-      ]);
       await Promise.all([
         authenticationContext.app.close(),
         validationContext.app.close(),

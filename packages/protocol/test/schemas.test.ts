@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+  DELIVERY_ENVELOPE_MAX_BYTES,
+  DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES,
+  DELIVERY_STREAM_ENTRY_MAX_BYTES,
+  DELIVERY_STREAM_METADATA_MAX_BYTES,
+  REDIS_STREAM_ENTRY_ID_MAX_BYTES,
   boardAccessRevokedEventSchema,
+  boardRecoveryMaterialSchema,
+  boardRecoveryRequestQuerySchema,
   boardSnapshotSchema,
   createBoardRequestSchema,
+  decodeDeliveryStreamFieldPairs,
+  decodeDeliveryStreamFields,
+  deliveryEnvelopeSchema,
+  deliveryStreamFieldsSchema,
   durableCommandSchema,
+  encodeDeliveryStreamFields,
   ephemeralEventTypeSchema,
   httpInternalErrorResponseSchema,
   joinBoardAckSchema,
@@ -11,11 +23,12 @@ import {
   operationRangeQuerySchema,
   operationRangeResponseSchema,
   protocolErrorSchema,
-  membershipRevocationOutboxPayloadSchema,
   removeBoardMemberParamsSchema,
   removeBoardMemberRequestSchema,
   removeBoardMemberResponseSchema,
+  redisStreamEntryIdSchema,
   SCHEMA_VERSION,
+  validateDeliveryStreamEntrySize,
 } from "../src/index.js";
 
 const command = {
@@ -47,6 +60,15 @@ const rectangle = {
 };
 
 describe("protocol schemas", () => {
+  it("keeps the complete delivery-stream producer byte contract calculable", () => {
+    expect(DELIVERY_STREAM_METADATA_MAX_BYTES).toBe(165);
+    expect(DELIVERY_STREAM_ENTRY_MAX_BYTES).toBe(
+      DELIVERY_ENVELOPE_MAX_BYTES + DELIVERY_STREAM_METADATA_MAX_BYTES,
+    );
+    expect(DELIVERY_STREAM_DECODED_ENTRY_MAX_BYTES).toBe(
+      DELIVERY_STREAM_ENTRY_MAX_BYTES + REDIS_STREAM_ENTRY_ID_MAX_BYTES,
+    );
+  });
   it("accepts a bounded versioned durable command", () => {
     expect(durableCommandSchema.parse(command)).toEqual(command);
   });
@@ -152,20 +174,148 @@ describe("protocol schemas", () => {
     );
   });
 
-  it("validates the typed membership-revocation outbox payload", () => {
-    const payload = {
-      schemaVersion: SCHEMA_VERSION,
-      eventId: command.opId,
-      kind: "board.membership.revoked",
-      boardId: command.boardId,
-      revokedUserId: command.clientId,
-      initiatedByUserId: command.targetId,
+  it("validates strict current delivery-envelope variants", () => {
+    const operation = {
+      ...command,
+      seq: 1,
       committedAt: "2026-08-07T12:00:01.000Z",
     };
-    expect(membershipRevocationOutboxPayloadSchema.parse(payload)).toEqual(payload);
+    const operationEnvelope = {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.opId,
+      boardId: command.boardId,
+      deliverySeq: 1,
+      eventType: "operation.committed",
+      occurredAt: operation.committedAt,
+      payload: { operation },
+    };
+    expect(deliveryEnvelopeSchema.parse(operationEnvelope)).toEqual(operationEnvelope);
+
+    const revocationEnvelope = {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.clientId,
+      boardId: command.boardId,
+      deliverySeq: 2,
+      eventType: "board.membership.revoked",
+      occurredAt: "2026-08-07T12:00:02.000Z",
+      payload: {
+        revokedUserId: command.clientId,
+        initiatedByUserId: command.targetId,
+      },
+    };
+    expect(deliveryEnvelopeSchema.parse(revocationEnvelope)).toEqual(revocationEnvelope);
     expect(
-      membershipRevocationOutboxPayloadSchema.safeParse({ ...payload, boardContent: {} }).success,
+      deliveryEnvelopeSchema.safeParse({ ...revocationEnvelope, boardContent: {} }).success,
     ).toBe(false);
+    expect(
+      deliveryEnvelopeSchema.safeParse({
+        ...revocationEnvelope,
+        payload: { ...revocationEnvelope.payload, boardContent: {} },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects malformed, mismatched, and reserved delivery envelopes", () => {
+    const operation = {
+      ...command,
+      seq: 1,
+      committedAt: "2026-08-07T12:00:01.000Z",
+    };
+    const envelope = {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.opId,
+      boardId: command.boardId,
+      deliverySeq: 1,
+      eventType: "operation.committed",
+      occurredAt: operation.committedAt,
+      payload: { operation },
+    };
+    expect(deliveryEnvelopeSchema.safeParse({ ...envelope, deliverySeq: 0 }).success).toBe(false);
+    expect(
+      deliveryEnvelopeSchema.safeParse({
+        ...envelope,
+        payload: {
+          operation: {
+            ...operation,
+            boardId: "50000000-0000-4000-8000-000000000001",
+          },
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      deliveryEnvelopeSchema.safeParse({
+        ...envelope,
+        eventType: "version.restored",
+        payload: { sourceVersionId: command.targetId, newCanvasSeq: 2 },
+      }).success,
+    ).toBe(false);
+    expect(deliveryEnvelopeSchema.safeParse({ ...envelope, schemaVersion: 2 }).success).toBe(false);
+  });
+
+  it("round-trips strict explicit Redis stream fields without trusting redundant metadata", () => {
+    const operation = {
+      ...command,
+      seq: 1,
+      committedAt: "2026-08-07T12:00:01.000Z",
+    };
+    const envelope = deliveryEnvelopeSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      eventId: command.opId,
+      boardId: command.boardId,
+      deliverySeq: 1,
+      eventType: "operation.committed",
+      occurredAt: operation.committedAt,
+      payload: { operation },
+    });
+    const fields = encodeDeliveryStreamFields(envelope);
+    const reorderedEnvelope = {
+      payload: envelope.payload,
+      occurredAt: envelope.occurredAt,
+      eventType: envelope.eventType,
+      deliverySeq: envelope.deliverySeq,
+      boardId: envelope.boardId,
+      eventId: envelope.eventId,
+      schemaVersion: envelope.schemaVersion,
+    };
+    expect(deliveryStreamFieldsSchema.parse(fields)).toEqual(fields);
+    expect(validateDeliveryStreamEntrySize(fields)).toMatchObject({ valid: true });
+    expect(decodeDeliveryStreamFields(fields)).toEqual(envelope);
+    expect(encodeDeliveryStreamFields(deliveryEnvelopeSchema.parse(reorderedEnvelope)).event).toBe(
+      fields.event,
+    );
+    expect(
+      deliveryStreamFieldsSchema.safeParse({ ...fields, boardId: command.targetId }).success,
+    ).toBe(false);
+    expect(deliveryStreamFieldsSchema.safeParse({ ...fields, surprise: true }).success).toBe(false);
+    expect(redisStreamEntryIdSchema.safeParse("1730000000000-7").success).toBe(true);
+    expect(redisStreamEntryIdSchema.safeParse("0-0").success).toBe(false);
+    expect(redisStreamEntryIdSchema.safeParse("not-an-id").success).toBe(false);
+    expect(redisStreamEntryIdSchema.safeParse("18446744073709551616-0").success).toBe(false);
+
+    const pairs = Object.entries(fields);
+    expect(decodeDeliveryStreamFieldPairs(pairs, 128 * 1024)).toEqual(envelope);
+    expect(() => decodeDeliveryStreamFieldPairs([...pairs, pairs[0]!], 128 * 1024)).toThrow(
+      /field count|duplicate/i,
+    );
+    expect(() =>
+      decodeDeliveryStreamFieldPairs(
+        pairs.map(([name, value]) => [name === "eventType" ? "surprise" : name, value]),
+        128 * 1024,
+      ),
+    ).toThrow(/unknown/i);
+    expect(() => decodeDeliveryStreamFieldPairs(pairs, 1)).toThrow(/byte limit/i);
+  });
+
+  it("prevents callers from supplying server-owned delivery metadata", () => {
+    for (const metadata of [
+      { deliverySeq: 1 },
+      { eventId: "50000000-0000-4000-8000-000000000001" },
+      { committedAt: "2026-08-07T12:00:01.000Z" },
+      { occurredAt: "2026-08-07T12:00:01.000Z" },
+      { eventType: "operation.committed" },
+    ]) {
+      expect(durableCommandSchema.safeParse({ ...command, ...metadata }).success).toBe(false);
+    }
   });
 
   it("validates strict join acknowledgements and synchronization errors", () => {
@@ -201,6 +351,73 @@ describe("protocol schemas", () => {
         retryable: false,
       }),
     ).toMatchObject({ code: "IDEMPOTENCY_CONFLICT", retryable: false });
+  });
+
+  it("validates strict verified board recovery material", () => {
+    const response = {
+      boardId: command.boardId,
+      snapshotId: "50000000-0000-4000-8000-000000000001",
+      snapshotSchemaVersion: 1,
+      snapshotCanvasSeq: 1,
+      snapshotDeliverySeq: 1,
+      capturedCanvasSeq: 1,
+      capturedDeliverySeq: 1,
+      snapshotState: {
+        schemaVersion: 1,
+        boardId: command.boardId,
+        boardName: "Recovery board",
+        lastSeq: 1,
+        lastDeliverySeq: 1,
+        objects: [
+          {
+            objectId: rectangle.targetId,
+            stackOrder: 1,
+            value: rectangle.payload,
+            fieldSeq: {
+              id: 1,
+              kind: 1,
+              x: 1,
+              y: 1,
+              width: 1,
+              height: 1,
+              rotation: 1,
+              fill: 1,
+              text: 1,
+            },
+            createdSeq: 1,
+            updatedSeq: 1,
+            deletedSeq: null,
+          },
+        ],
+      },
+      snapshotCanonicalHash: "a".repeat(64),
+      operationTail: [],
+      reconstructedCanonicalHash: "b".repeat(64),
+    };
+    expect(boardRecoveryMaterialSchema.parse(response)).toEqual(response);
+    expect(boardRecoveryMaterialSchema.safeParse({ ...response, unknown: true }).success).toBe(
+      false,
+    );
+    expect(boardRecoveryRequestQuerySchema.parse({})).toEqual({});
+    expect(boardRecoveryRequestQuerySchema.safeParse({ after: 0 }).success).toBe(false);
+  });
+
+  it("enforces the exact non-retryable recovery-blocked envelope", () => {
+    const error = {
+      ok: false,
+      code: "RECOVERY_BLOCKED",
+      message: "Authoritative board recovery is unavailable",
+      retryable: false,
+    } as const;
+    expect(protocolErrorSchema.parse(error)).toEqual(error);
+    expect(protocolErrorSchema.safeParse({ ...error, retryable: true }).success).toBe(false);
+    expect(protocolErrorSchema.safeParse({ ...error, message: "private details" }).success).toBe(
+      false,
+    );
+    expect(protocolErrorSchema.safeParse({ ...error, extra: true }).success).toBe(false);
+    expect(protocolErrorSchema.safeParse({ ...error, code: "UNKNOWN_RECOVERY" }).success).toBe(
+      false,
+    );
   });
 
   it("validates the strict generic HTTP internal-error envelope", () => {

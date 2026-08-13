@@ -255,3 +255,88 @@ describe("sequence-specific authoritative hashing", () => {
     });
   });
 });
+
+describe("atomic verified recovery rebasing", () => {
+  it("replaces committed state once, preserves pending work, and clones recovery material", () => {
+    const store = createBoardStore(() => Promise.resolve("recovered-hash"));
+    const session = nextToken();
+    const pendingObjectId = "30000000-0000-4000-8000-000000000099";
+    const pending: DurableCommand = {
+      schemaVersion: 1,
+      opId: "40000000-0000-4000-8000-000000000099",
+      boardId,
+      clientId,
+      baseSeq: 1,
+      targetId: pendingObjectId,
+      clientTimestamp: "2026-08-06T12:02:00.000Z",
+      type: "object.create",
+      payload: { ...created.payload, id: pendingObjectId },
+    };
+    const recovered = {
+      lastSeq: 1,
+      objects: {
+        [objectId]: {
+          value: { ...created.payload, rotation: 25 },
+          createdSeq: 1,
+          updatedSeq: 1,
+          deletedSeq: null,
+          fieldSeq: Object.fromEntries(Object.keys(created.payload).map((field) => [field, 1])),
+        },
+      },
+      order: [objectId],
+    };
+    store.getState().beginSession(session, boardId);
+    store
+      .getState()
+      .initializeSession(session, { id: boardId, name: "Before", lastSeq: 0, objects: [] }, [
+        pending,
+      ]);
+    let prior = store.getState().committed;
+    const committedSequences: number[] = [];
+    const unsubscribe = store.subscribe((state) => {
+      if (state.committed === prior) return;
+      prior = state.committed;
+      committedSequences.push(state.committed.lastSeq);
+    });
+
+    expect(store.getState().rebaseRecoveredSession(session, boardId, "Recovered", recovered)).toBe(
+      true,
+    );
+
+    expect(committedSequences).toEqual([1]);
+    expect(store.getState()).toMatchObject({
+      name: "Recovered",
+      committed: { lastSeq: 1, order: [objectId] },
+      pending: [{ opId: pending.opId }],
+      objects: [{ id: objectId, rotation: 25 }, { id: pendingObjectId }],
+    });
+    recovered.order.length = 0;
+    recovered.objects[objectId].value.rotation = 90;
+    expect(store.getState().committed).toMatchObject({
+      order: [objectId],
+      objects: { [objectId]: { value: { rotation: 25 } } },
+    });
+    unsubscribe();
+  });
+
+  it("rejects recovery material owned by a stale board-session token", () => {
+    const store = createBoardStore(() => Promise.resolve("hash"));
+    const stale = nextToken();
+    const current = nextToken();
+    store.getState().beginSession(stale, boardId);
+    store.getState().beginSession(current, boardId);
+
+    expect(
+      store.getState().rebaseRecoveredSession(stale, boardId, "Stale", {
+        lastSeq: 1,
+        objects: {},
+        order: [],
+      }),
+    ).toBe(false);
+    expect(store.getState()).toMatchObject({
+      sessionToken: current,
+      name: "Untitled board",
+      committed: { lastSeq: 0 },
+    });
+  });
+});
