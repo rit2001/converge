@@ -1,4 +1,5 @@
 import { createPool, type DatabasePool } from "@converge/database";
+import { InMemoryTelemetryRecorder } from "@converge/observability";
 import { buildApp, type AppContext, type BuildAppOptions } from "./app.js";
 import { DevelopmentAuthAdapter, type AuthAdapter } from "./auth.js";
 import { configuredDeliveryBuildOptions } from "./distributed-delivery-stack.js";
@@ -31,6 +32,7 @@ export class ApiServerStartupError extends Error {
 
 export interface ApiServerOwner {
   readonly app: AppContext["app"];
+  readonly telemetry: InMemoryTelemetryRecorder;
   listen(): Promise<void>;
   close(): Promise<void>;
 }
@@ -39,10 +41,11 @@ export async function createApiServer(
   environment: Environment,
   dependencies: ApiServerDependencies = productionApiServerDependencies,
 ): Promise<ApiServerOwner> {
+  const telemetry = new InMemoryTelemetryRecorder(1_000);
   const pool = dependencies.createDatabasePool(environment.DATABASE_URL);
   let context: AppContext;
   try {
-    const options = dependencies.createDeliveryOptions(environment);
+    const options = { ...dependencies.createDeliveryOptions(environment), telemetry };
     context = await dependencies.buildApplication(
       environment,
       pool,
@@ -74,6 +77,7 @@ export async function createApiServer(
 
   return {
     app: context.app,
+    telemetry,
     close,
     listen: async () => {
       try {

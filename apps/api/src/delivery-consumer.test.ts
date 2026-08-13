@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { InMemoryTelemetryRecorder, type TelemetryRecorder } from "@converge/observability";
 import {
   encodeDeliveryStreamFields,
   membershipRevokedDeliveryEnvelopeSchema,
@@ -302,6 +303,7 @@ function harness(
   configuration = defaultDeliveryConsumerConfiguration,
   scheduler?: DeliveryConsumerScheduler,
   hooks: DeliveryConsumerHooks = {},
+  telemetry?: TelemetryRecorder,
 ): Harness {
   const delivered: DeliveryEnvelope[] = [];
   const quarantined: { boardId: string; reason: string; overflowed: boolean }[] = [];
@@ -327,6 +329,7 @@ function harness(
       { ...configuration },
       scheduler,
       hooks,
+      telemetry,
     ),
     delivered,
     quarantined,
@@ -1442,6 +1445,114 @@ describe("RedisDeliveryConsumer", () => {
     expect(test.delivered).toEqual([duplicate]);
     expect(test.quarantined).toEqual([]);
     expect(test.consumer.activeBoardStateCount).toBe(1);
+    await test.consumer.stop();
+  });
+
+  it("records each final delivery outcome once with fixed labels", async () => {
+    const telemetry = new InMemoryTelemetryRecorder();
+    const transport = new FakeTransport(emptyMetadata());
+    const test = harness(
+      transport,
+      {
+        deliver: ({ envelope: value }) => {
+          if (value.boardId === ids.boardB)
+            return Promise.reject(new Error("injected handler failure with private payload"));
+          test.delivered.push(value);
+          return Promise.resolve();
+        },
+      },
+      defaultDeliveryConsumerConfiguration,
+      undefined,
+      {},
+      telemetry,
+    );
+    await test.consumer.start();
+    const first = envelope(1);
+    transport.resolveRead([
+      entry("1-0", first),
+      entry("2-0", first),
+      entry("3-0", envelope(3, ids.boardA)),
+      entry("4-0", envelope(1, ids.boardB)),
+    ]);
+
+    await eventually(() =>
+      expect(test.lifecycle.at(-1)).toMatchObject({
+        state: "error",
+        code: "DELIVERY_CALLBACK_FAILED",
+      }),
+    );
+
+    const outcomes = telemetry
+      .snapshot()
+      .counters.filter(({ name }) => name === "converge_delivery_events_total")
+      .map(({ labels, value }) => ({ ...labels, value }));
+    expect(outcomes).toEqual([
+      { event_type: "membership_revoked", outcome: "duplicate", value: 1 },
+      { event_type: "membership_revoked", outcome: "failed", value: 1 },
+      { event_type: "membership_revoked", outcome: "handled", value: 1 },
+      { event_type: "membership_revoked", outcome: "quarantined", value: 1 },
+    ]);
+    expect(test.consumer.lastHandledCursor).toBe("3-0");
+    expect(JSON.stringify(telemetry.snapshot())).not.toContain(ids.boardA);
+    expect(JSON.stringify(telemetry.snapshot())).not.toContain(ids.boardB);
+    expect(JSON.stringify(telemetry.snapshot())).not.toContain("private payload");
+    await test.consumer.stop();
+  });
+
+  it("does not record handled for a stale cursor commit", async () => {
+    const beforeAdvance = deferred<void>();
+    const allowCompletion = deferred<void>();
+    const telemetry = new InMemoryTelemetryRecorder();
+    const transport = new FakeTransport(emptyMetadata());
+    const test = harness(
+      transport,
+      {},
+      defaultDeliveryConsumerConfiguration,
+      undefined,
+      {
+        beforeCursorAdvance: async () => {
+          beforeAdvance.resolve();
+          await allowCompletion.promise;
+        },
+      },
+      telemetry,
+    );
+    await test.consumer.start();
+    transport.resolveRead([entry("1-0", envelope(1))]);
+    await beforeAdvance.promise;
+
+    const stopping = test.consumer.stop();
+    allowCompletion.resolve();
+    await stopping;
+
+    expect(test.consumer.lastHandledCursor).toBe("0-1");
+    expect(
+      telemetry.snapshot().counters.filter(({ name }) => name === "converge_delivery_events_total"),
+    ).toEqual([]);
+  });
+
+  it("preserves successful delivery when the recorder rejects", async () => {
+    const reject = () => Promise.reject(new Error("telemetry sink rejected"));
+    const failingTelemetry = {
+      increment: reject,
+      observe: reject,
+      setGauge: reject,
+      emit: reject,
+    } as unknown as TelemetryRecorder;
+    const transport = new FakeTransport(emptyMetadata());
+    const test = harness(
+      transport,
+      {},
+      defaultDeliveryConsumerConfiguration,
+      undefined,
+      {},
+      failingTelemetry,
+    );
+    await test.consumer.start();
+    transport.resolveRead([entry("1-0", envelope(1))]);
+    await eventually(() => expect(test.consumer.lastHandledCursor).toBe("1-0"));
+
+    expect(test.delivered).toHaveLength(1);
     await test.consumer.stop();
   });
 

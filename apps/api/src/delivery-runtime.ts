@@ -3,6 +3,7 @@ import {
   type MembershipRevokedDeliveryEnvelope,
   type OperationCommittedDeliveryEnvelope,
 } from "@converge/protocol";
+import type { TelemetryRecorder } from "@converge/observability";
 import type {
   BoardQuarantineEvent,
   CursorLossReason,
@@ -58,6 +59,7 @@ export interface DeliveryRuntimeOwner {
 export type DeliveryRuntimeFactory = (
   handlers: DeliveryRuntimeEventHandlers,
   observer: DeliveryRuntimeObserver,
+  telemetry: TelemetryRecorder,
 ) => DeliveryRuntimeOwner;
 
 export interface ApiDeliveryRuntimeOptions {

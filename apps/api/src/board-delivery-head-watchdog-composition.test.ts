@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { InMemoryTelemetryRecorder } from "@converge/observability";
 import type { AuthAdapter } from "./auth.js";
 import { buildApp, type AppContext } from "./app.js";
 import {
@@ -443,9 +444,11 @@ describe("board-head watchdog application composition", () => {
     const database = databaseHarness();
     const runtime = runtimeHarness();
     const watchdog = watchdogHarness();
+    const telemetry = new InMemoryTelemetryRecorder();
     const context = await buildApp(environment, database.pool, auth, {
       deliveryMode: { mode: "distributed", createRuntime: runtime.createRuntime },
       createBoardDeliveryHeadWatchdog: watchdog.createWatchdog,
+      telemetry,
     });
     try {
       await context.app.ready();
@@ -454,6 +457,12 @@ describe("board-head watchdog application composition", () => {
         code: "DELIVERY_HEAD_DIVERGED",
         boardIds: [ids.board],
       });
+      await watchdog.lifecycle({
+        state: "unavailable",
+        code: "DELIVERY_HEAD_DIVERGED",
+        boardIds: [ids.board],
+      });
+      await runtime.lifecycle({ state: "unavailable", code: "REDIS_UNAVAILABLE" });
       await runtime.lifecycle({ state: "unavailable", code: "REDIS_UNAVAILABLE" });
       await watchdog.lifecycle({ state: "recovered" });
       expect(await runSocketMiddlewares(context)).toBeInstanceOf(Error);
@@ -470,6 +479,23 @@ describe("board-head watchdog application composition", () => {
       expect(await runSocketMiddlewares(context)).toBeInstanceOf(Error);
       await watchdog.lifecycle({ state: "recovered" });
       expect(await runSocketMiddlewares(context)).toBeUndefined();
+
+      const transition = (source: "consumer" | "watchdog" | "socket_readiness", state: string) =>
+        telemetry
+          .snapshot()
+          .counters.find(
+            (entry) =>
+              entry.name === "converge_delivery_state_transitions_total" &&
+              entry.labels.source === source &&
+              entry.labels.state === state,
+          )?.value ?? 0;
+      expect(transition("consumer", "established")).toBe(1);
+      expect(transition("consumer", "unavailable")).toBe(2);
+      expect(transition("consumer", "recovered")).toBe(2);
+      expect(transition("watchdog", "unavailable")).toBe(2);
+      expect(transition("watchdog", "recovered")).toBe(2);
+      expect(transition("socket_readiness", "established")).toBe(3);
+      expect(transition("socket_readiness", "unavailable")).toBe(2);
     } finally {
       await context.app.close();
     }

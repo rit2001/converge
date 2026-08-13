@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { InMemoryTelemetryRecorder, type TelemetryRecorder } from "@converge/observability";
 import {
   BoardRecoveryError,
   type DatabasePool,
@@ -199,6 +200,128 @@ describe("verified recovery HTTP route", () => {
         retryable: true,
       });
       expect(response.body).not.toContain(privateFailure.message);
+    } finally {
+      await context.app.close();
+    }
+  });
+
+  it("classifies every recovery result once and observes complete monotonic duration", async () => {
+    const secretFailure = "connection password at SELECT private_snapshot";
+    const cases = [
+      {
+        outcome: "snapshot_tail",
+        auth: authenticated,
+        database: pool(),
+        repository: { load: () => Promise.resolve(material) },
+        status: 200,
+      },
+      {
+        outcome: "refreshed",
+        auth: authenticated,
+        database: pool(),
+        repository: {
+          load: () => Promise.resolve(material),
+          loadWithOutcome: () => Promise.resolve({ material, outcome: "refreshed" as const }),
+        },
+        status: 200,
+      },
+      {
+        outcome: "recovery_blocked",
+        auth: authenticated,
+        database: pool(),
+        repository: {
+          load: () => Promise.reject(new BoardRecoveryError("SNAPSHOT_CORRUPT")),
+        },
+        status: 409,
+      },
+      {
+        outcome: "retryable_failure",
+        auth: authenticated,
+        database: pool(),
+        repository: { load: () => Promise.reject(new Error(secretFailure)) },
+        status: 500,
+      },
+      {
+        outcome: "authorization_failure",
+        auth: unauthenticated,
+        database: pool(),
+        repository: { load: () => Promise.resolve(material) },
+        status: 401,
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const telemetry = new InMemoryTelemetryRecorder();
+      const times = [1_000, 1_250];
+      const context = await buildApp(environment, testCase.database, testCase.auth, {
+        recoveryMaterialRepository: testCase.repository,
+        telemetry,
+        telemetryClock: { now: () => times.shift() ?? 1_250 },
+      });
+      const response = await context.app.inject({
+        method: "GET",
+        url: `/v1/boards/${boardId}/recovery`,
+      });
+      expect(response.statusCode).toBe(testCase.status);
+      await context.app.close();
+
+      const snapshot = telemetry.snapshot();
+      expect(
+        snapshot.counters.filter(({ name }) => name === "converge_recovery_requests_total"),
+      ).toEqual([
+        {
+          name: "converge_recovery_requests_total",
+          labels: { outcome: testCase.outcome },
+          value: 1,
+        },
+      ]);
+      expect(
+        snapshot.histograms.find(({ name }) => name === "converge_recovery_duration_seconds"),
+      ).toMatchObject({ count: 1, sum: 0.25, labels: {} });
+      expect(
+        snapshot.events.filter(({ eventName }) => eventName === "recovery.request.result"),
+      ).toMatchObject([{ code: testCase.outcome.toUpperCase(), component: "recovery" }]);
+      const exported = JSON.stringify(snapshot);
+      for (const forbidden of [
+        boardId,
+        material.snapshotId,
+        material.snapshotHash,
+        material.reconstructedHash,
+        secretFailure,
+      ])
+        expect(exported).not.toContain(forbidden);
+    }
+  });
+
+  it("keeps the recovery response unchanged when telemetry dependencies throw or reject", async () => {
+    const reject = () => Promise.reject(new Error("private telemetry failure"));
+    const failingTelemetry = {
+      increment: () => {
+        throw new Error("private counter failure");
+      },
+      observe: reject,
+      setGauge: () => {
+        throw new Error("private gauge failure");
+      },
+      emit: reject,
+    } as unknown as TelemetryRecorder;
+    const context = await buildApp(environment, pool(), authenticated, {
+      recoveryMaterialRepository: { load: () => Promise.resolve(material) },
+      telemetry: failingTelemetry,
+      telemetryClock: {
+        now: () => {
+          throw new Error("private clock failure");
+        },
+      },
+    });
+    try {
+      const response = await context.app.inject({
+        method: "GET",
+        url: `/v1/boards/${boardId}/recovery`,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(boardRecoveryMaterialSchema.parse(response.json()).boardId).toBe(boardId);
+      await Promise.resolve();
     } finally {
       await context.app.close();
     }

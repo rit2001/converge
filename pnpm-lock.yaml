@@ -41,6 +41,9 @@ importers:
       '@converge/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@converge/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
       '@converge/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol

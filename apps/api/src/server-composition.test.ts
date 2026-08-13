@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { DatabasePool } from "@converge/database";
+import { InMemoryTelemetryRecorder } from "@converge/observability";
 import type { AuthAdapter } from "./auth.js";
 import { buildApp, type AppContext, type BuildAppOptions } from "./app.js";
 import type { BoardDeliveryHeadWatchdogOwner } from "./board-delivery-head-watchdog.js";
@@ -191,7 +192,27 @@ describe("API server resource ownership", () => {
     const pool = {
       end: endPool,
     } as unknown as DatabasePool;
-    const server = await createApiServer(localEnvironment, serverDependencies({ app, pool }));
+    const dependencies = serverDependencies({ app, pool });
+    const buildApplication = vi.spyOn(dependencies, "buildApplication");
+    const server = await createApiServer(localEnvironment, dependencies);
+
+    expect(server.telemetry).toBeInstanceOf(InMemoryTelemetryRecorder);
+    expect(buildApplication).toHaveBeenCalledWith(
+      localEnvironment,
+      pool,
+      authentication,
+      expect.objectContaining({ telemetry: server.telemetry }),
+    );
+    for (let index = 0; index < 1_001; index += 1)
+      server.telemetry.emit({
+        schemaVersion: 1,
+        eventName: "api.lifecycle",
+        severity: "info",
+        component: "api",
+        timestamp: "2026-08-13T00:00:00.000Z",
+        code: "READY",
+      });
+    expect(server.telemetry.snapshot().events).toHaveLength(1_000);
 
     await server.close();
     await server.close();

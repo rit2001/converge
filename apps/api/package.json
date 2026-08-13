@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@converge/database": "workspace:*",
+    "@converge/observability": "workspace:*",
     "@converge/protocol": "workspace:*",
     "@fastify/cors": "10.1.0",
     "@fastify/rate-limit": "10.3.0",

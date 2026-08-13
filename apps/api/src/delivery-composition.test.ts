@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
+import { InMemoryTelemetryRecorder } from "@converge/observability";
 import type { AuthAdapter, AuthenticatedPrincipal } from "./auth.js";
 import { buildApp, type BuildAppOptions } from "./app.js";
 import type {
@@ -199,6 +200,20 @@ function healthyHttpPool(): DatabasePool {
       query: vi.fn((sql: string) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("pg_advisory_xact_lock"))
           return Promise.resolve({ rows: [], rowCount: 0 });
+        if (sql.includes("SELECT b.last_seq, b.last_delivery_seq"))
+          return Promise.resolve({
+            rows: [
+              {
+                last_seq: "0",
+                last_delivery_seq: "0",
+                operation_recovery_floor: "0",
+                delivery_recovery_floor: "0",
+              },
+            ],
+            rowCount: 1,
+          });
+        if (sql.includes("FROM board_operations"))
+          return Promise.resolve({ rows: [], rowCount: 0 });
         if (sql.includes("SELECT b.created_by"))
           return Promise.resolve({
             rows: [{ created_by: ids.actor, actor_role: "owner", last_delivery_seq: "0" }],
@@ -235,6 +250,81 @@ describe("distributed-delivery application composition", () => {
       expect(startupError?.message).not.toMatch(/auth|board|redis|cursor/i);
       expect(authorizedSocketAuthentication).not.toHaveBeenCalled();
       await state.lifecycle({ state: "established" });
+      await expect(runSocketMiddlewares(context)).resolves.toBeUndefined();
+    } finally {
+      await context.app.close();
+    }
+  });
+
+  it("records real readiness and API lifecycle transitions once and fences shutdown", async () => {
+    const telemetry = new InMemoryTelemetryRecorder();
+    const state = runtimeHarness({ establishOnStart: false });
+    const context = await buildApp(environment, pool, authorizedAuth, {
+      deliveryMode: { mode: "distributed", createRuntime: state.createRuntime },
+      telemetry,
+    });
+
+    const gauge = (name: "converge_delivery_consumer_ready" | "converge_socket_ready") =>
+      telemetry.snapshot().gauges.find((entry) => entry.name === name)?.value;
+    const transitionCount = (source: "consumer" | "socket_readiness", stateName: string) =>
+      telemetry
+        .snapshot()
+        .counters.find(
+          (entry) =>
+            entry.name === "converge_delivery_state_transitions_total" &&
+            entry.labels.source === source &&
+            entry.labels.state === stateName,
+        )?.value ?? 0;
+
+    expect(gauge("converge_delivery_consumer_ready")).toBe(0);
+    expect(gauge("converge_socket_ready")).toBe(0);
+    await context.app.ready();
+
+    await state.lifecycle({ state: "established" });
+    await state.lifecycle({ state: "established" });
+    expect(gauge("converge_delivery_consumer_ready")).toBe(1);
+    expect(gauge("converge_socket_ready")).toBe(1);
+    expect(transitionCount("consumer", "established")).toBe(1);
+    expect(transitionCount("socket_readiness", "established")).toBe(1);
+
+    await state.lifecycle({ state: "unavailable", code: "REDIS_UNAVAILABLE" });
+    await state.lifecycle({ state: "unavailable", code: "REDIS_UNAVAILABLE" });
+    expect(gauge("converge_delivery_consumer_ready")).toBe(0);
+    expect(gauge("converge_socket_ready")).toBe(0);
+    expect(transitionCount("consumer", "unavailable")).toBe(1);
+    expect(transitionCount("socket_readiness", "unavailable")).toBe(1);
+
+    await state.lifecycle({ state: "recovered" });
+    await state.lifecycle({ state: "recovered" });
+    expect(gauge("converge_socket_ready")).toBe(1);
+    expect(transitionCount("consumer", "recovered")).toBe(1);
+    expect(transitionCount("socket_readiness", "established")).toBe(2);
+
+    await context.app.close();
+    await context.app.close();
+    const closed = telemetry.snapshot();
+    expect(gauge("converge_delivery_consumer_ready")).toBe(0);
+    expect(gauge("converge_socket_ready")).toBe(0);
+    expect(transitionCount("socket_readiness", "unavailable")).toBe(2);
+    expect(
+      closed.events
+        .filter(({ eventName }) => eventName === "api.lifecycle")
+        .map(({ code }) => code),
+    ).toEqual(["STARTING", "READY", "STOPPING", "STOPPED"]);
+
+    await state.lifecycle({ state: "unavailable", code: "REDIS_UNAVAILABLE" });
+    await state.lifecycle({ state: "recovered" });
+    expect(telemetry.snapshot()).toEqual(closed);
+  });
+
+  it("keeps local readiness immediately usable while exposing its current gauge", async () => {
+    const telemetry = new InMemoryTelemetryRecorder();
+    const context = await buildApp(environment, pool, authorizedAuth, { telemetry });
+    try {
+      expect(
+        telemetry.snapshot().gauges.find(({ name }) => name === "converge_socket_ready")?.value,
+      ).toBe(1);
+      await context.app.ready();
       await expect(runSocketMiddlewares(context)).resolves.toBeUndefined();
     } finally {
       await context.app.close();
@@ -409,6 +499,7 @@ describe("distributed-delivery application composition", () => {
 
   it("stops a failed startup once before Socket.IO closes", async () => {
     const calls: string[] = [];
+    const telemetry = new InMemoryTelemetryRecorder();
     const state = runtimeHarness({ startError: new Error("runtime startup failed") });
     state.startRuntime.mockImplementation(() => {
       calls.push("runtime:start");
@@ -423,6 +514,7 @@ describe("distributed-delivery application composition", () => {
         mode: "distributed",
         createRuntime: state.createRuntime,
       },
+      telemetry,
     });
     vi.spyOn(context.io, "close").mockImplementation(() => {
       calls.push("socket:close");
@@ -434,6 +526,12 @@ describe("distributed-delivery application composition", () => {
     expect(state.startRuntime).toHaveBeenCalledOnce();
     expect(state.stopRuntime).toHaveBeenCalledOnce();
     expect(calls).toEqual(["runtime:start", "runtime:stop", "socket:close"]);
+    expect(
+      telemetry
+        .snapshot()
+        .events.filter(({ eventName }) => eventName === "api.lifecycle")
+        .map(({ code }) => code),
+    ).toEqual(["STARTING", "STARTUP_FAILED", "STOPPING", "STOPPED"]);
   });
 
   it("routes a consumed operation only through the matching API-local board room", async () => {

@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  noOpTelemetryRecorder,
+  safeTelemetryRecorder,
+  type TelemetryRecorder,
+} from "@converge/observability";
+import {
   DELIVERY_ENVELOPE_MAX_BYTES,
   DELIVERY_STREAM_METADATA_MAX_BYTES,
   REDIS_STREAM_ENTRY_ID_MAX_BYTES,
@@ -416,6 +421,7 @@ export class RedisDeliveryConsumer {
   private boardStateEvictionCount = 0;
   private boardStateCapacityFailureCount = 0;
   private availabilityState: "unknown" | "available" | "unavailable" = "unknown";
+  private readonly telemetry: TelemetryRecorder;
 
   constructor(
     private readonly transport: DeliveryConsumerTransport,
@@ -425,7 +431,10 @@ export class RedisDeliveryConsumer {
     },
     private readonly scheduler: DeliveryConsumerScheduler = systemDeliveryConsumerScheduler,
     private readonly hooks: DeliveryConsumerHooks = {},
-  ) {}
+    telemetry: TelemetryRecorder = noOpTelemetryRecorder,
+  ) {
+    this.telemetry = safeTelemetryRecorder(telemetry);
+  }
 
   get lastHandledCursor(): string {
     return this.cursor;
@@ -916,8 +925,19 @@ export class RedisDeliveryConsumer {
       } catch {
         throw new FatalConsumerError("INVALID_STREAM_ENTRY", entry.id);
       }
-      const board = await this.handleBoardEntry(entry, envelope, generation);
-      this.assertGeneration(generation);
+      let handled: {
+        board: BoardState;
+        outcome: "handled" | "duplicate" | "quarantined";
+        code?: string;
+      };
+      try {
+        handled = await this.handleBoardEntry(entry, envelope, generation);
+        this.assertGeneration(generation);
+      } catch (error) {
+        if (!(error instanceof StaleGenerationError))
+          this.recordDeliveryOutcome(envelope, "failed");
+        throw error;
+      }
       await this.hooks.beforeCursorAdvance?.(entry.id);
       this.assertGeneration(generation);
       this.cursor = entry.id;
@@ -929,7 +949,8 @@ export class RedisDeliveryConsumer {
         )
           this.witness.emptyBoundary = undefined;
       }
-      this.commitBoardState(envelope.boardId, board, entry.id, generation);
+      this.commitBoardState(envelope.boardId, handled.board, entry.id, generation);
+      this.recordDeliveryOutcome(envelope, handled.outcome, handled.code);
       await this.hooks.afterCursorAdvance?.(entry.id);
       if (stopAt !== undefined && compareRedisStreamIds(this.cursor, stopAt) >= 0) return;
     }
@@ -939,7 +960,11 @@ export class RedisDeliveryConsumer {
     entry: RawDeliveryStreamEntry,
     envelope: DeliveryEnvelope,
     generation: number,
-  ): Promise<BoardState> {
+  ): Promise<{
+    board: BoardState;
+    outcome: "handled" | "duplicate" | "quarantined";
+    code?: BoardQuarantineReason;
+  }> {
     let board = this.boards.get(envelope.boardId);
     if (!board) {
       this.ensureBoardStateCapacity(generation, entry.id);
@@ -966,13 +991,13 @@ export class RedisDeliveryConsumer {
       }
       this.remember(board, entry, envelope);
       this.markBoardPending(envelope.boardId, board, entry.id, generation);
-      return board;
+      return { board, outcome: "handled" };
     }
 
     if (board.quarantined) {
       await this.quarantine(board, entry, envelope, "BOARD_ALREADY_QUARANTINED");
       this.markBoardPending(envelope.boardId, board, entry.id, generation);
-      return board;
+      return { board, outcome: "quarantined", code: "BOARD_ALREADY_QUARANTINED" };
     }
 
     const raw = rawEnvelope(entry);
@@ -982,7 +1007,7 @@ export class RedisDeliveryConsumer {
     if (byEvent && byEvent.deliverySeq !== envelope.deliverySeq) {
       await this.quarantine(board, entry, envelope, "EVENT_ID_REUSED");
       this.markBoardPending(envelope.boardId, board, entry.id, generation);
-      return board;
+      return { board, outcome: "quarantined", code: "EVENT_ID_REUSED" };
     }
     if (envelope.deliverySeq <= board.cursor) {
       if (
@@ -991,18 +1016,20 @@ export class RedisDeliveryConsumer {
       ) {
         await this.quarantine(board, entry, envelope, "CONFLICTING_DELIVERY_SEQUENCE");
         this.markBoardPending(envelope.boardId, board, entry.id, generation);
-        return board;
+        return { board, outcome: "quarantined", code: "CONFLICTING_DELIVERY_SEQUENCE" };
       }
       if (byEvent && byEvent.envelopeDigest !== digest) {
         await this.quarantine(board, entry, envelope, "CONFLICTING_DELIVERY_SEQUENCE");
+        this.markBoardPending(envelope.boardId, board, entry.id, generation);
+        return { board, outcome: "quarantined", code: "CONFLICTING_DELIVERY_SEQUENCE" };
       }
       this.markBoardPending(envelope.boardId, board, entry.id, generation);
-      return board;
+      return { board, outcome: "duplicate" };
     }
     if (envelope.deliverySeq !== board.cursor + 1) {
       await this.quarantine(board, entry, envelope, "DELIVERY_SEQUENCE_GAP");
       this.markBoardPending(envelope.boardId, board, entry.id, generation);
-      return board;
+      return { board, outcome: "quarantined", code: "DELIVERY_SEQUENCE_GAP" };
     }
 
     try {
@@ -1015,7 +1042,27 @@ export class RedisDeliveryConsumer {
     board.cursor = envelope.deliverySeq;
     this.remember(board, entry, envelope);
     this.markBoardPending(envelope.boardId, board, entry.id, generation);
-    return board;
+    return { board, outcome: "handled" };
+  }
+
+  private recordDeliveryOutcome(
+    envelope: DeliveryEnvelope,
+    outcome: "handled" | "duplicate" | "quarantined" | "failed",
+    code?: string,
+  ): void {
+    this.telemetry.increment("converge_delivery_events_total", {
+      event_type: envelope.eventType === "operation.committed" ? "operation" : "membership_revoked",
+      outcome,
+    });
+    if (outcome === "quarantined")
+      this.telemetry.emit({
+        schemaVersion: 1,
+        eventName: "delivery.board_quarantined",
+        severity: "warn",
+        component: "delivery_consumer",
+        timestamp: new Date().toISOString(),
+        code: code ?? "QUARANTINED",
+      });
   }
 
   private ensureBoardStateCapacity(generation: number, entryId: string): void {

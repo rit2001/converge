@@ -10,6 +10,26 @@ const boardId = "20000000-0000-4000-8000-000000000081";
 const material = { boardId } as VerifiedBoardRecoveryMaterial;
 
 describe("board recovery refresh service", () => {
+  it("reports whether material was loaded directly or refreshed", async () => {
+    const direct = new BoardRecoveryService({
+      load: () => Promise.resolve(material),
+      refresh: () => Promise.resolve(material),
+    });
+    const refreshed = new BoardRecoveryService({
+      load: () => Promise.reject(new BoardRecoveryError("MISSING_REQUIRED_SNAPSHOT")),
+      refresh: () => Promise.resolve(material),
+    });
+
+    await expect(direct.loadWithOutcome(boardId)).resolves.toEqual({
+      material,
+      outcome: "snapshot_tail",
+    });
+    await expect(refreshed.loadWithOutcome(boardId)).resolves.toEqual({
+      material,
+      outcome: "refreshed",
+    });
+  });
+
   it("returns normal material without creating a snapshot", async () => {
     const load = vi.fn(() => Promise.resolve(material));
     const refresh = vi.fn(() => Promise.resolve(material));

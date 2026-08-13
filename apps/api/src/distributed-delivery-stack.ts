@@ -1,4 +1,5 @@
 import type { BuildAppOptions } from "./app.js";
+import type { TelemetryRecorder } from "@converge/observability";
 import {
   BoardDeliveryHeadWatchdog,
   type BoardDeliveryHeadWatchdogConfiguration,
@@ -27,6 +28,7 @@ export interface DistributedDeliveryStackFactories {
     transport: DeliveryConsumerTransport,
     callbacks: DeliveryConsumerCallbacks,
     configuration: DeliveryConsumerConfiguration,
+    telemetry: TelemetryRecorder,
   ): DeliveryConsumerInstance;
   createRuntime(options: ApiDeliveryRuntimeOptions): DeliveryRuntimeOwner;
   createWatchdog(
@@ -37,8 +39,8 @@ export interface DistributedDeliveryStackFactories {
 
 export const productionDistributedDeliveryStackFactories: DistributedDeliveryStackFactories = {
   createTransport: (redisUrl, streamKey) => new RedisDeliveryConsumerTransport(redisUrl, streamKey),
-  createConsumer: (transport, callbacks, configuration) =>
-    new RedisDeliveryConsumer(transport, callbacks, configuration),
+  createConsumer: (transport, callbacks, configuration, telemetry) =>
+    new RedisDeliveryConsumer(transport, callbacks, configuration, undefined, undefined, telemetry),
   createRuntime: (options) => new ApiDeliveryRuntime(options),
   createWatchdog: (input, configuration) =>
     new BoardDeliveryHeadWatchdog(
@@ -61,6 +63,7 @@ class ConfiguredDeliveryConsumer implements DeliveryConsumerInstance {
     private readonly callbacks: DeliveryConsumerCallbacks,
     private readonly configuration: DeliveryConsumerConfiguration,
     private readonly factories: DistributedDeliveryStackFactories,
+    private readonly telemetry: TelemetryRecorder,
   ) {}
 
   start(): Promise<void> {
@@ -81,7 +84,12 @@ class ConfiguredDeliveryConsumer implements DeliveryConsumerInstance {
     );
     this.transport = transport;
     try {
-      const consumer = this.factories.createConsumer(transport, this.callbacks, this.configuration);
+      const consumer = this.factories.createConsumer(
+        transport,
+        this.callbacks,
+        this.configuration,
+        this.telemetry,
+      );
       this.consumer = consumer;
       await consumer.start();
     } catch (error) {
@@ -134,7 +142,7 @@ export function configuredDeliveryBuildOptions(
   return {
     deliveryMode: {
       mode: "distributed",
-      createRuntime: (handlers, observer) =>
+      createRuntime: (handlers, observer, telemetry) =>
         factories.createRuntime({
           handlers,
           observer,
@@ -144,6 +152,7 @@ export function configuredDeliveryBuildOptions(
               callbacks,
               deliveryConsumerConfiguration,
               factories,
+              telemetry,
             ),
         }),
     },
