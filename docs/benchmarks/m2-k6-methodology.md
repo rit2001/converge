@@ -31,6 +31,16 @@ The workload retains only a bounded 256-operation deduplication window and curre
 not the board projection. Publication and delivery remain at least once: duplicate detection is a
 correctness check, not an exactly-once claim.
 
+A transport duplicate is valid at-least-once evidence observed through catch-up/live overlap,
+snapshot-covered delayed delivery, or redelivery when stable identity and canonical logical content
+agree. `converge_duplicate_events` counts these observations after they are suppressed; a nonzero
+value is informational and is not itself a capacity or reliability failure. A logical reapplication
+is different: applying one logical operation twice, completing one command twice, accepting
+conflicting duplicate evidence, or creating extra durable operation/outbox state is a correctness
+failure. Smoke acceptance requires zero logical reapplications, proven by bounded lifecycle
+accounting and equality of distinct commands, durable operation rows, outbox events, projection and
+delivery heads, publications, and API consumer progress—not by requiring zero duplicate arrivals.
+
 ## Safe profiles
 
 These are configuration presets, not measured claims:

@@ -8,7 +8,12 @@
     "pnpm": ">=10.15.0 <11"
   },
   "scripts": {
-    "benchmark:k6:check": "pnpm --filter @converge/k6 test && pnpm --filter @converge/k6 lint",
+    "benchmark:k6:check": "pnpm --filter @converge/k6 test && node --test scripts/k6-smoke-harness.test.mjs && pnpm --filter @converge/k6 lint",
+    "benchmark:k6:acceptance": "node scripts/run-isolated-k6-smoke.mjs",
+    "benchmark:k6:debug": "CONVERGE_K6_ACCEPTANCE_MODE=debug node scripts/run-isolated-k6-smoke.mjs",
+    "benchmark:k6:concurrent": "CONVERGE_K6_ACCEPTANCE_MODE=concurrent node scripts/run-isolated-k6-smoke.mjs",
+    "benchmark:k6:repeat": "CONVERGE_K6_ACCEPTANCE_MODE=repeat node scripts/run-isolated-k6-smoke.mjs",
+    "benchmark:k6:sequential": "CONVERGE_K6_ACCEPTANCE_MODE=sequential node scripts/run-isolated-k6-smoke.mjs",
     "benchmark:k6:smoke": "node scripts/run-k6-smoke.mjs",
     "build": "turbo build",
     "check:prometheus": "node scripts/check-prometheus.mjs",

@@ -27,6 +27,21 @@ export class ProtocolFailure extends Error {
   }
 }
 
+export const OVERLAP_CLASSIFICATIONS = Object.freeze([
+  "covered_by_snapshot",
+  "exact_event_duplicate",
+  "exact_operation_duplicate",
+  "catchup_live_overlap",
+  "next_contiguous_operation",
+  "future_operation_buffered",
+  "canvas_gap",
+  "canvas_sequence_conflict",
+  "event_identity_conflict",
+  "operation_identity_conflict",
+  "delivery_sequence_regression",
+  "reconciliation_unknown",
+]);
+
 function failure(code) {
   throw new ProtocolFailure(code);
 }
@@ -74,6 +89,17 @@ function json(source, code) {
   } catch {
     return failure(code);
   }
+}
+
+export function parseHttpJsonBody(source, maximumBytes, code = "HTTP_JSON_INVALID") {
+  if (
+    typeof source !== "string" ||
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    utf8Length(source) > maximumBytes
+  )
+    failure(code);
+  return json(source, code);
 }
 
 export function parseOpenPacket(packet, maximumBytes) {
@@ -182,6 +208,24 @@ export function parseJoinAcknowledgement(value, expectedBoardId) {
     failure("JOIN_ACK_IDENTITY");
   sequence(parsed.joinWatermark, false, "JOIN_WATERMARK");
   return Object.freeze({ kind: "success", value: parsed });
+}
+
+export function parseBoardSnapshot(value, expectedBoardId, maximumObjects = 1_024) {
+  const parsed = object(value, ["id", "name", "lastSeq", "objects"], "SNAPSHOT_SHAPE");
+  if (uuid(parsed.id, "SNAPSHOT_BOARD") !== expectedBoardId) failure("SNAPSHOT_IDENTITY");
+  if (typeof parsed.name !== "string" || parsed.name.length < 1 || parsed.name.length > 120)
+    failure("SNAPSHOT_NAME");
+  sequence(parsed.lastSeq, false, "SNAPSHOT_SEQUENCE");
+  if (!Array.isArray(parsed.objects) || parsed.objects.length > maximumObjects)
+    failure("SNAPSHOT_OBJECTS");
+  const identities = new Set();
+  const objects = parsed.objects.map((entry) => {
+    const validated = parseCanvasPayload("object.create", entry);
+    if (identities.has(validated.id)) failure("SNAPSHOT_DUPLICATE_OBJECT");
+    identities.add(validated.id);
+    return Object.freeze(validated);
+  });
+  return Object.freeze({ ...parsed, objects: Object.freeze(objects) });
 }
 
 function parseCanvasPayload(type, value) {
@@ -324,30 +368,122 @@ export function createDeliveryTracker(initialSequence, maximumEntries) {
   sequence(initialSequence, false, "TRACKER_SEQUENCE");
   if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 1 || maximumEntries > 1_024)
     failure("TRACKER_LIMIT");
+  const snapshotSequence = initialSequence;
   let lastSequence = initialSequence;
   const operationSequences = new Map();
+  const sequenceOperations = new Map();
+  const future = new Map();
   const order = [];
+  const newlyApplied = [];
+
+  const canonical = (value) => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === "object")
+      return Object.fromEntries(
+        Object.keys(value)
+          .sort()
+          .map((key) => [key, canonical(value[key])]),
+      );
+    return typeof value === "number" && Object.is(value, -0) ? 0 : value;
+  };
+  const evidenceFor = (operation) => JSON.stringify(canonical(operation));
+  const conflict = (code, evidence = {}) => {
+    const error = new ProtocolFailure(code);
+    error.reconciliationEvidence = Object.freeze({
+      snapshotCanvasSequence: snapshotSequence,
+      currentCanvasSequence: lastSequence,
+      bufferedCanvasSequence: Number.isSafeInteger(evidence.bufferedCanvasSequence)
+        ? evidence.bufferedCanvasSequence
+        : 0,
+      sameOperationIdentity: evidence.sameOperationIdentity === true,
+      sameCanonicalContent: evidence.sameCanonicalContent === true,
+    });
+    throw error;
+  };
+  const retain = (parsed, evidence) => {
+    operationSequences.set(parsed.opId, { seq: parsed.seq, evidence });
+    sequenceOperations.set(parsed.seq, { opId: parsed.opId, evidence });
+    order.push(parsed.opId);
+    if (order.length > maximumEntries) {
+      const expired = order.shift();
+      const record = operationSequences.get(expired);
+      operationSequences.delete(expired);
+      if (record) sequenceOperations.delete(record.seq);
+    }
+  };
+
   return Object.freeze({
     observe(operation) {
       const parsed = parseCommittedOperation(operation);
+      const evidence = evidenceFor(parsed);
       const known = operationSequences.get(parsed.opId);
       if (known !== undefined) {
-        if (known !== parsed.seq) failure("DUPLICATE_CONFLICT");
-        return "duplicate";
+        if (known.seq !== parsed.seq || known.evidence !== evidence)
+          conflict("OPERATION_IDENTITY_CONFLICT", {
+            bufferedCanvasSequence: parsed.seq,
+            sameOperationIdentity: true,
+            sameCanonicalContent: known.evidence === evidence,
+          });
+        return "catchup_live_overlap";
       }
-      if (parsed.seq !== lastSequence + 1)
-        failure(parsed.seq <= lastSequence ? "SEQUENCE_REGRESSION" : "SEQUENCE_GAP");
+      const bySequence = sequenceOperations.get(parsed.seq);
+      if (bySequence !== undefined) {
+        if (bySequence.opId !== parsed.opId || bySequence.evidence !== evidence)
+          conflict("CANVAS_SEQUENCE_CONFLICT", {
+            bufferedCanvasSequence: parsed.seq,
+            sameOperationIdentity: bySequence.opId === parsed.opId,
+            sameCanonicalContent: bySequence.evidence === evidence,
+          });
+        return "exact_operation_duplicate";
+      }
+      if (parsed.seq <= snapshotSequence) return "covered_by_snapshot";
+      if (parsed.seq <= lastSequence)
+        conflict("CANVAS_SEQUENCE_CONFLICT", { bufferedCanvasSequence: parsed.seq });
+
+      const buffered = future.get(parsed.seq);
+      if (buffered !== undefined) {
+        if (buffered.opId !== parsed.opId)
+          conflict("CANVAS_SEQUENCE_CONFLICT", {
+            bufferedCanvasSequence: parsed.seq,
+            sameCanonicalContent: buffered.evidence === evidence,
+          });
+        if (buffered.evidence !== evidence)
+          conflict("OPERATION_IDENTITY_CONFLICT", {
+            bufferedCanvasSequence: parsed.seq,
+            sameOperationIdentity: true,
+          });
+        return "exact_operation_duplicate";
+      }
+      if (parsed.seq > lastSequence + 1) {
+        if (future.size >= maximumEntries) conflict("FUTURE_OPERATION_BUFFER_OVERFLOW");
+        future.set(parsed.seq, { parsed, opId: parsed.opId, evidence });
+        return "future_operation_buffered";
+      }
+
       lastSequence = parsed.seq;
-      operationSequences.set(parsed.opId, parsed.seq);
-      order.push(parsed.opId);
-      if (order.length > maximumEntries) operationSequences.delete(order.shift());
-      return "applied";
+      retain(parsed, evidence);
+      newlyApplied.push(parsed);
+      while (future.has(lastSequence + 1)) {
+        const next = future.get(lastSequence + 1);
+        future.delete(lastSequence + 1);
+        lastSequence = next.parsed.seq;
+        retain(next.parsed, next.evidence);
+        newlyApplied.push(next.parsed);
+      }
+      return "next_contiguous_operation";
+    },
+    drainApplied() {
+      return newlyApplied.splice(0, newlyApplied.length);
     },
     has(operationId) {
       return operationSequences.has(operationId);
     },
     snapshot() {
-      return Object.freeze({ lastSequence, retainedOperations: operationSequences.size });
+      return Object.freeze({
+        lastSequence,
+        retainedOperations: operationSequences.size,
+        bufferedOperations: future.size,
+      });
     },
   });
 }

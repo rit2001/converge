@@ -2,13 +2,22 @@ import http from "k6/http";
 import ws from "k6/ws";
 import { Counter, Rate, Trend } from "k6/metrics";
 import { parseWorkloadConfig, workloadOptions } from "./config.js";
+import { deterministicUuid } from "./identity.js";
+import {
+  classifyIterationFailure,
+  createIterationLifecycle,
+  createPreJoinDeliveryBuffer,
+  matchesActiveCommand,
+} from "./iteration-lifecycle.js";
 import {
   ProtocolFailure,
   classifyTimeout,
   createDeliveryTracker,
   encodeConnect,
   encodeEvent,
+  parseBoardSnapshot,
   parseCommandAcknowledgement,
+  parseHttpJsonBody,
   parseJoinAcknowledgement,
   parseOperationRange,
   parseSocketPacket,
@@ -33,28 +42,26 @@ function tags(outcome, operationType = "object.create") {
   return { profile: config.profile, operation_type: operationType, outcome };
 }
 
-function deterministicUuid(kind, ordinal) {
-  const vu = Number(globalThis.__VU ?? 0);
-  const iteration = Number(globalThis.__ITER ?? 0);
-  const value = vu * 1_000_000 + iteration * 1_000 + ordinal;
-  const tail = value.toString(16).padStart(12, "0").slice(-12);
-  const prefix = kind === "client" ? "10000000" : kind === "object" ? "20000000" : "30000000";
-  return `${prefix}-0000-4000-8000-${tail}`;
+function identity(kind, ordinal) {
+  return deterministicUuid(
+    kind,
+    Number(globalThis.__VU ?? 0),
+    Number(globalThis.__ITER ?? 0),
+    ordinal,
+  );
 }
 
 function socketEndpoint(origin) {
-  const parsed = new globalThis.URL(origin);
-  parsed.protocol = parsed.protocol === "https:" || parsed.protocol === "wss:" ? "wss:" : "ws:";
-  parsed.pathname = "/socket.io/";
-  parsed.search = "EIO=4&transport=websocket";
-  return parsed.toString();
+  const secure = origin.startsWith("https://") || origin.startsWith("wss://");
+  const authority = origin.replace(/^(?:https?|wss?):\/\//, "").replace(/\/$/, "");
+  return `${secure ? "wss" : "ws"}://${authority}/socket.io/?EIO=4&transport=websocket`;
 }
 
 function command(clientId, ordinal, baseSequence) {
-  const targetId = deterministicUuid("object", ordinal);
+  const targetId = identity("object", ordinal);
   return {
     schemaVersion: 1,
-    opId: deterministicUuid("operation", ordinal),
+    opId: identity("operation", ordinal),
     boardId: config.boardId,
     clientId,
     baseSeq: baseSequence,
@@ -75,9 +82,52 @@ function command(clientId, ordinal, baseSequence) {
   };
 }
 
+function catchUpReason(error, stage) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (code === "RANGE_IDENTITY") return "catchup_board_mismatch";
+  if (["RANGE_BOUNDARY", "RANGE_AFTER", "RANGE_WATERMARK"].includes(code))
+    return "catchup_start_mismatch";
+  if (["RANGE_SEQUENCE", "SEQUENCE_GAP"].includes(code)) return "catchup_noncontiguous";
+  if (code === "DUPLICATE_CONFLICT") return "catchup_duplicate_conflict";
+  if (code === "SEQUENCE_REGRESSION") return "catchup_cursor_regression";
+  if (code === "CATCH_UP_INCOMPLETE" || code === "CATCH_UP_NO_PROGRESS")
+    return "catchup_head_mismatch";
+  if (stage === "range_parse") return "catchup_schema_invalid";
+  if (stage === "operation_apply") return "catchup_reducer_rejected";
+  return "catchup_unknown";
+}
+
+function sanitizedCatchUpFailure(reason) {
+  const error = new Error("Authoritative catch-up failed");
+  error.code = reason.toUpperCase();
+  return error;
+}
+
+function snapshotFailure(reason, evidence = {}) {
+  const error = new Error("Authoritative snapshot initialization failed");
+  error.code = reason.toUpperCase();
+  error.snapshotEvidence = Object.freeze({
+    status: Number.isInteger(evidence.status) ? evidence.status : 0,
+    lastSequence: Number.isSafeInteger(evidence.lastSequence) ? evidence.lastSequence : 0,
+    objectCount: Number.isSafeInteger(evidence.objectCount) ? evidence.objectCount : 0,
+  });
+  return error;
+}
+
+function snapshotSchemaReason(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (code === "SNAPSHOT_IDENTITY") return "snapshot_board_mismatch";
+  if (code === "SNAPSHOT_SEQUENCE") return "snapshot_sequence_invalid";
+  if (code === "SNAPSHOT_DUPLICATE_OBJECT") return "snapshot_duplicate_object";
+  if (code === "SNAPSHOT_OBJECTS" || /^(?:OBJECT|CREATE|SNAPSHOT_NAME)/.test(code))
+    return "snapshot_projection_invalid";
+  if (code.startsWith("SNAPSHOT_")) return "snapshot_schema_invalid";
+  return "snapshot_unknown";
+}
+
 export default function collaborationWorkload() {
   const startedAt = Date.now();
-  const clientId = deterministicUuid("client", 0);
+  const clientId = identity("client", 0);
   let failed = false;
   let protocolFailed = false;
   let complete = false;
@@ -88,11 +138,29 @@ export default function collaborationWorkload() {
   let commandOrdinal = 0;
   let tracker;
   let activeCommand;
+  let currentPhase = "authenticated";
   const pendingAcknowledgements = new Map();
+  const preJoinDeliveries = createPreJoinDeliveryBuffer(256);
+  const lifecycle = createIterationLifecycle({
+    requiredCommands: config.commandsPerClient,
+    onPhase: (phase) => {
+      currentPhase = phase;
+      if (config.debugPhases)
+        globalThis.console.log(
+          `converge_phase vu=${globalThis.__VU} iteration=${globalThis.__ITER} phase=${phase}`,
+        );
+    },
+    cleanup: () => {
+      pendingAcknowledgements.clear();
+      preJoinDeliveries.clear();
+      activeCommand = undefined;
+    },
+  });
 
   const response = ws.connect(socketEndpoint(config.socketUrl), {}, (socket) => {
-    const close = () => {
+    const close = (normal = false) => {
       if (complete) return;
+      if (normal) lifecycle.complete();
       complete = true;
       if (connected) socket.send("41");
       socket.close();
@@ -101,38 +169,133 @@ export default function collaborationWorkload() {
     const fail = (error) => {
       if (failed) return;
       failed = true;
-      protocolFailed ||= error instanceof ProtocolFailure;
+      protocolFailed = protocolFailed || error instanceof ProtocolFailure;
+      if (config.debugPhases) {
+        const reason = classifyIterationFailure(error, {
+          phase: currentPhase,
+          terminal: lifecycle.snapshot().terminal,
+          activeCommand: activeCommand !== undefined,
+        });
+        const evidence = error?.snapshotEvidence;
+        const overlap = error?.reconciliationEvidence;
+        globalThis.console.log(
+          `converge_failure vu=${globalThis.__VU} iteration=${globalThis.__ITER} phase=${currentPhase} reason=${reason}${
+            evidence
+              ? ` status=${evidence.status} last_sequence=${evidence.lastSequence} objects=${evidence.objectCount}`
+              : ""
+          }${
+            overlap
+              ? ` snapshot_canvas_sequence=${overlap.snapshotCanvasSequence} current_canvas_sequence=${overlap.currentCanvasSequence} buffered_canvas_sequence=${overlap.bufferedCanvasSequence} sameOperationIdentity=${overlap.sameOperationIdentity} sameCanonicalContent=${overlap.sameCanonicalContent}`
+              : ""
+          }`,
+        );
+      }
+      lifecycle.fail();
       if (error instanceof ProtocolFailure && /SEQUENCE_(?:GAP|REGRESSION)/.test(error.code))
         sequenceGaps.add(1, tags("detected"));
-      close();
+      close(false);
     };
 
     const catchUp = (watermark) => {
       let after = tracker.snapshot().lastSequence;
-      for (let page = 0; after < watermark && page < 10; page += 1) {
-        const result = http.get(
-          `${config.baseUrl}/v1/boards/${config.boardId}/operations?after=${after}&watermark=${watermark}`,
-          { headers: { Authorization: `Bearer ${config.authToken}` }, tags: {} },
-        );
-        if (result.status !== 200) throw new ProtocolFailure("CATCH_UP_HTTP");
-        let body;
-        try {
-          body = result.json();
-        } catch {
-          throw new ProtocolFailure("CATCH_UP_JSON");
+      let stage = "range_request";
+      let operationCount = 0;
+      let firstSequence = 0;
+      let lastSequence = 0;
+      try {
+        if (after > watermark) throw new ProtocolFailure("SEQUENCE_REGRESSION");
+        for (let page = 0; after < watermark && page < 10; page += 1) {
+          stage = "range_request";
+          const result = http.get(
+            `${config.baseUrl}/v1/boards/${config.boardId}/operations?after=${after}&watermark=${watermark}`,
+            { headers: { Authorization: `Bearer ${config.authToken}` }, tags: {} },
+          );
+          if (result.status !== 200) throw new ProtocolFailure("CATCH_UP_HTTP");
+          stage = "range_parse";
+          let body;
+          try {
+            body = parseHttpJsonBody(result.body, config.maxPacketBytes, "CATCH_UP_JSON");
+          } catch {
+            throw new ProtocolFailure("CATCH_UP_JSON");
+          }
+          const range = parseOperationRange(body, { boardId: config.boardId, after, watermark });
+          operationCount += range.operations.length;
+          firstSequence = firstSequence || range.operations[0]?.seq || 0;
+          lastSequence = range.operations.at(-1)?.seq || lastSequence;
+          stage = "operation_apply";
+          for (const operation of range.operations) {
+            tracker.observe(operation);
+            tracker.drainApplied();
+          }
+          if (range.nextSeq === after) throw new ProtocolFailure("CATCH_UP_NO_PROGRESS");
+          after = range.nextSeq;
         }
-        const range = parseOperationRange(body, { boardId: config.boardId, after, watermark });
-        for (const operation of range.operations) tracker.observe(operation);
-        if (range.nextSeq === after) throw new ProtocolFailure("CATCH_UP_NO_PROGRESS");
-        after = range.nextSeq;
+        stage = "head_verify";
+        if (after !== watermark) throw new ProtocolFailure("CATCH_UP_INCOMPLETE");
+      } catch (error) {
+        const reason = catchUpReason(error, stage);
+        if (config.debugPhases)
+          globalThis.console.log(
+            `converge_catchup phase=${stage} reason=${reason} cursor=${after} head=${watermark} operations=${operationCount} first_sequence=${firstSequence} last_sequence=${lastSequence}`,
+          );
+        throw sanitizedCatchUpFailure(reason);
       }
-      if (after !== watermark) throw new ProtocolFailure("CATCH_UP_INCOMPLETE");
+    };
+
+    const loadSnapshot = () => {
+      lifecycle.note("snapshot_requested");
+      let result;
+      try {
+        result = http.get(`${config.baseUrl}/v1/boards/${config.boardId}`, {
+          headers: { Authorization: `Bearer ${config.authToken}` },
+          tags: {},
+          timeout: `${config.acknowledgementTimeoutMs}ms`,
+        });
+      } catch {
+        throw snapshotFailure("snapshot_request_failed");
+      }
+      lifecycle.note("snapshot_response_received");
+      if (result.status === 0) throw snapshotFailure("snapshot_timeout");
+      if (result.status !== 200)
+        throw snapshotFailure("snapshot_http_status", { status: result.status });
+      let body;
+      try {
+        body = parseHttpJsonBody(result.body, config.maxPacketBytes, "SNAPSHOT_JSON");
+      } catch {
+        throw snapshotFailure("snapshot_json_invalid", { status: result.status });
+      }
+      lifecycle.note("snapshot_body_parsed");
+      let snapshot;
+      try {
+        snapshot = parseBoardSnapshot(body, config.boardId, 1_024);
+      } catch (error) {
+        throw snapshotFailure(snapshotSchemaReason(error), {
+          status: result.status,
+          lastSequence: Number.isSafeInteger(body?.lastSeq) ? body.lastSeq : 0,
+          objectCount: Array.isArray(body?.objects) ? body.objects.length : 0,
+        });
+      }
+      lifecycle.note("snapshot_schema_validated");
+      lifecycle.note("snapshot_identity_validated");
+      lifecycle.note("snapshot_hash_verified");
+      try {
+        tracker = createDeliveryTracker(snapshot.lastSeq, 256);
+      } catch {
+        throw snapshotFailure("snapshot_apply_failed", {
+          status: result.status,
+          lastSequence: snapshot.lastSeq,
+          objectCount: snapshot.objects.length,
+        });
+      }
+      lifecycle.note("snapshot_projection_applied");
+      lifecycle.note("snapshot_applied");
     };
 
     const scheduleNextCommand = () => {
-      if (failed || revoked) return close();
-      if (commandOrdinal >= config.commandsPerClient) return close();
-      socket.setTimeout(
+      if (failed || revoked) return close(false);
+      if (commandOrdinal >= config.commandsPerClient) return close(true);
+      lifecycle.schedule(
+        socket,
         () => {
           if (failed || complete) return;
           commandOrdinal += 1;
@@ -145,6 +308,7 @@ export default function collaborationWorkload() {
             acknowledged: false,
           };
           pendingAcknowledgements.set(id, { kind: "command", startedAt: Date.now(), value });
+          lifecycle.commandSent();
           socket.send(encodeEvent("operation:submit", value, id));
           socket.setTimeout(() => {
             if (!activeCommand?.acknowledged && !failed) {
@@ -153,15 +317,29 @@ export default function collaborationWorkload() {
             }
           }, config.acknowledgementTimeoutMs);
         },
-        commandOrdinal === 0 ? 0 : config.commandIntervalMs,
+        commandOrdinal === 0 ? 1 : config.commandIntervalMs,
       );
     };
 
     const confirmCommandDelivery = (operation) => {
-      if (!activeCommand || operation.opId !== activeCommand.value.opId) return;
+      if (!activeCommand || !matchesActiveCommand(activeCommand.value.opId, operation.opId)) return;
+      if (activeCommand.liveReceived) return;
       activeCommand.liveReceived = true;
+      lifecycle.deliveryObserved();
       liveDeliveryDuration.add(Date.now() - activeCommand.sentAt, tags("live"));
       if (activeCommand.acknowledged) scheduleNextCommand();
+    };
+
+    const observeOperation = (operation) => {
+      const outcome = tracker.observe(operation);
+      if (
+        outcome === "covered_by_snapshot" ||
+        outcome === "catchup_live_overlap" ||
+        outcome === "exact_operation_duplicate"
+      )
+        duplicateEvents.add(1, tags("duplicate", operation.type));
+      else liveEventsReceived.add(1, tags("received", operation.type));
+      for (const applied of tracker.drainApplied()) confirmCommandDelivery(applied);
     };
 
     socket.on("message", (frame) => {
@@ -178,16 +356,25 @@ export default function collaborationWorkload() {
         if (packet.kind === "connected") {
           if (connected) throw new ProtocolFailure("CONNECT_DUPLICATE");
           connected = true;
+          lifecycle.connected();
+          lifecycle.authenticated();
           socketConnectDuration.add(Date.now() - startedAt, tags("connected"));
+          loadSnapshot();
           const id = ++acknowledgementId;
           pendingAcknowledgements.set(id, { kind: "join", startedAt: Date.now() });
           socket.send(
             encodeEvent(
               "board:join",
-              { schemaVersion: 1, boardId: config.boardId, clientId, lastAppliedSeq: 0 },
+              {
+                schemaVersion: 1,
+                boardId: config.boardId,
+                clientId,
+                lastAppliedSeq: tracker.snapshot().lastSequence,
+              },
               id,
             ),
           );
+          lifecycle.note("join_emitted");
           socket.setTimeout(() => {
             if (!joined && !failed) {
               classifyTimeout("join_ack");
@@ -201,12 +388,18 @@ export default function collaborationWorkload() {
           if (!pending) throw new ProtocolFailure("ACK_UNCORRELATED");
           pendingAcknowledgements.delete(packet.acknowledgementId);
           if (pending.kind === "join") {
+            lifecycle.note("join_ack_received");
             const result = parseJoinAcknowledgement(packet.value, config.boardId);
             if (result.kind === "error") throw new ProtocolFailure(`JOIN_${result.error.code}`);
-            joined = true;
-            tracker = createDeliveryTracker(0, 256);
             boardJoinDuration.add(Date.now() - pending.startedAt, tags("joined"));
             catchUp(result.value.joinWatermark);
+            lifecycle.note("catchup_applied");
+            preJoinDeliveries.drain(observeOperation);
+            if (tracker.snapshot().bufferedOperations > 0)
+              throw new ProtocolFailure("SEQUENCE_GAP");
+            lifecycle.note("prejoin_buffer_reconciled");
+            joined = true;
+            lifecycle.joined();
             scheduleNextCommand();
             return;
           }
@@ -217,6 +410,7 @@ export default function collaborationWorkload() {
           if (result.kind === "error") throw new ProtocolFailure(`COMMAND_${result.error.code}`);
           commandAckDuration.add(Date.now() - pending.startedAt, tags("committed"));
           commandsAcknowledged.add(1, tags("committed"));
+          lifecycle.commandAcknowledged();
           activeCommand.acknowledged = true;
           if (!activeCommand.liveReceived) {
             socket.setTimeout(() => {
@@ -227,6 +421,7 @@ export default function collaborationWorkload() {
                   if (!tracker.has(result.operation.opId))
                     throw new ProtocolFailure("CATCH_UP_OPERATION_MISSING");
                   activeCommand.liveReceived = true;
+                  lifecycle.deliveryObserved();
                   liveDeliveryDuration.add(Date.now() - activeCommand.sentAt, tags("catch_up"));
                   scheduleNextCommand();
                 }
@@ -238,19 +433,21 @@ export default function collaborationWorkload() {
           return;
         }
         if (packet.kind === "operation") {
-          if (!joined || packet.value.boardId !== config.boardId)
+          if (packet.value.boardId !== config.boardId)
             throw new ProtocolFailure("LIVE_OPERATION_CONTEXT");
-          const outcome = tracker.observe(packet.value);
-          if (outcome === "duplicate") duplicateEvents.add(1, tags("duplicate", packet.value.type));
-          else liveEventsReceived.add(1, tags("received", packet.value.type));
-          confirmCommandDelivery(packet.value);
+          if (!joined) {
+            preJoinDeliveries.add(packet.value);
+            lifecycle.note("prejoin_delivery_buffered");
+            return;
+          }
+          observeOperation(packet.value);
           return;
         }
         if (packet.kind === "revocation") {
           if (packet.value.boardId !== config.boardId)
             throw new ProtocolFailure("REVOCATION_CONTEXT");
           revoked = true;
-          close();
+          close(false);
           return;
         }
         if (packet.kind === "connect_error")
@@ -273,6 +470,11 @@ export default function collaborationWorkload() {
   });
 
   if (!response || response.status !== 101) failed = true;
+  if (!failed && !lifecycle.snapshot().terminal) {
+    failed = true;
+    protocolFailed = true;
+    lifecycle.fail();
+  }
   iterationFailures.add(failed, tags(failed ? "failed" : "completed"));
   protocolFailures.add(protocolFailed, tags(protocolFailed ? "failed" : "valid"));
 }

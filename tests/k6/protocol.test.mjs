@@ -12,6 +12,8 @@ import {
   encodeConnect,
   encodeEvent,
   parseCommandAcknowledgement,
+  parseBoardSnapshot,
+  parseHttpJsonBody,
   parseJoinAcknowledgement,
   parseOpenPacket,
   parseOperationRange,
@@ -119,6 +121,65 @@ test("strictly validates join and command acknowledgements", () => {
   );
 });
 
+test("establishes a strict authoritative snapshot boundary before catch-up replay", () => {
+  const snapshot = parseBoardSnapshot(
+    {
+      id: ids.board,
+      name: "Benchmark board",
+      lastSeq: 1,
+      objects: [operation(1).payload],
+    },
+    ids.board,
+  );
+  const tracker = createDeliveryTracker(snapshot.lastSeq, 256);
+  const range = parseOperationRange(
+    {
+      boardId: ids.board,
+      afterSeq: 1,
+      watermark: 2,
+      operations: [operation(2, ids.operation2)],
+      nextSeq: 2,
+      hasMore: false,
+    },
+    { boardId: ids.board, after: tracker.snapshot().lastSequence, watermark: 2 },
+  );
+  assert.equal(tracker.observe(range.operations[0]), "next_contiguous_operation");
+  assert.equal(tracker.snapshot().lastSequence, 2);
+  assert.throws(
+    () =>
+      parseBoardSnapshot(
+        { id: ids.client, name: "Wrong board", lastSeq: 1, objects: [operation(1).payload] },
+        ids.board,
+      ),
+    { code: "SNAPSHOT_IDENTITY" },
+  );
+});
+
+test("parses the direct API snapshot body into fresh iteration-owned state", () => {
+  const source = JSON.stringify({
+    id: ids.board,
+    name: "Benchmark board",
+    lastSeq: 1,
+    objects: [operation(1).payload],
+  });
+  const first = parseBoardSnapshot(parseHttpJsonBody(source, 8_192, "SNAPSHOT_JSON"), ids.board);
+  const second = parseBoardSnapshot(parseHttpJsonBody(source, 8_192, "SNAPSHOT_JSON"), ids.board);
+  assert.notEqual(first, second);
+  assert.notEqual(first.objects, second.objects);
+  assert.equal(first.lastSeq, 1);
+  assert.throws(() => parseHttpJsonBody("{", 8_192, "SNAPSHOT_JSON"), {
+    code: "SNAPSHOT_JSON",
+  });
+  assert.throws(
+    () =>
+      parseBoardSnapshot(
+        parseHttpJsonBody(JSON.stringify({ snapshot: JSON.parse(source) }), 8_192),
+        ids.board,
+      ),
+    { code: "SNAPSHOT_SHAPE" },
+  );
+});
+
 test("parses live operations and detects duplicates without double application", () => {
   const parsed = parseSocketPacket(
     `42${JSON.stringify(["operation:committed", operation(1)])}`,
@@ -126,9 +187,17 @@ test("parses live operations and detects duplicates without double application",
   );
   assert.equal(parsed.kind, "operation");
   const tracker = createDeliveryTracker(0, 2);
-  assert.equal(tracker.observe(parsed.value), "applied");
-  assert.equal(tracker.observe(parsed.value), "duplicate");
-  assert.deepEqual(tracker.snapshot(), { lastSequence: 1, retainedOperations: 1 });
+  assert.equal(tracker.observe(parsed.value), "next_contiguous_operation");
+  assert.equal(tracker.observe(parsed.value), "catchup_live_overlap");
+  assert.throws(
+    () => tracker.observe({ ...parsed.value, committedAt: "2026-08-13T10:00:00.002Z" }),
+    { code: "OPERATION_IDENTITY_CONFLICT" },
+  );
+  assert.deepEqual(tracker.snapshot(), {
+    lastSequence: 1,
+    retainedOperations: 1,
+    bufferedOperations: 0,
+  });
 });
 
 test("strictly validates bounded contiguous authoritative catch-up evidence", () => {
@@ -161,6 +230,15 @@ test("strictly validates bounded contiguous authoritative catch-up evidence", ()
   );
 });
 
+test("reconciles catch-up and buffered-live overlap without replaying snapshot-covered history", () => {
+  const tracker = createDeliveryTracker(1, 256);
+  const overlapping = operation(2, ids.operation2);
+  assert.equal(tracker.observe(overlapping), "next_contiguous_operation");
+  assert.equal(tracker.observe({ ...overlapping }), "catchup_live_overlap");
+  assert.equal(tracker.observe(operation(1, ids.operation1)), "covered_by_snapshot");
+  assert.equal(tracker.snapshot().lastSequence, 2);
+});
+
 test("strictly parses revocation and requires the caller to terminate participation", () => {
   const parsed = parseSocketPacket(
     `42${JSON.stringify([
@@ -180,21 +258,23 @@ test("rejects malformed oversized unknown and out-of-order evidence", () => {
     name: "ProtocolFailure",
   });
   const tracker = createDeliveryTracker(0, 4);
-  assert.throws(
-    () => tracker.observe(operation(2, ids.operation2)),
-    (error) => {
-      assert.equal(error.code, "SEQUENCE_GAP");
-      return true;
-    },
+  assert.equal(tracker.observe(operation(2, ids.operation2)), "future_operation_buffered");
+  assert.equal(tracker.snapshot().lastSequence, 0);
+  assert.equal(tracker.observe(operation(1)), "next_contiguous_operation");
+  assert.deepEqual(
+    tracker.drainApplied().map(({ seq }) => seq),
+    [1, 2],
   );
-  tracker.observe(operation(1));
   assert.throws(
     () => tracker.observe(operation(1, ids.operation2)),
     (error) => {
-      assert.equal(error.code, "SEQUENCE_REGRESSION");
+      assert.equal(error.code, "OPERATION_IDENTITY_CONFLICT");
       return true;
     },
   );
+  assert.throws(() => tracker.observe(operation(1, ids.operation3)), {
+    code: "CANVAS_SEQUENCE_CONFLICT",
+  });
 });
 
 test("bounds retained dedupe state", () => {
@@ -202,7 +282,11 @@ test("bounds retained dedupe state", () => {
   tracker.observe(operation(1, ids.operation1));
   tracker.observe(operation(2, ids.operation2));
   tracker.observe(operation(3, ids.operation3));
-  assert.deepEqual(tracker.snapshot(), { lastSequence: 3, retainedOperations: 2 });
+  assert.deepEqual(tracker.snapshot(), {
+    lastSequence: 3,
+    retainedOperations: 2,
+    bufferedOperations: 0,
+  });
   assert.equal(tracker.has(ids.operation1), false);
   assert.equal(tracker.has(ids.operation3), true);
 });
@@ -237,6 +321,66 @@ test("validates safe profiles explicit stateful configuration and remote opt-in"
   assert.equal(smoke.duration, "30s");
   assert.equal(smoke.commandsPerClient, 2);
   assert.deepEqual(workloadOptions(smoke).systemTags, []);
+  assert.deepEqual(
+    workloadOptions(parseWorkloadConfig({ ...base, CONVERGE_DEBUG_PHASES: "true" })),
+    {
+      vus: 1,
+      iterations: 1,
+      systemTags: [],
+      thresholds: workloadOptions(smoke).thresholds,
+    },
+  );
+  assert.deepEqual(
+    workloadOptions(
+      parseWorkloadConfig({
+        ...base,
+        CONVERGE_DEBUG_PHASES: "true",
+        CONVERGE_DEBUG_CONCURRENT: "true",
+      }),
+    ).scenarios,
+    {
+      debug_concurrent: {
+        executor: "per-vu-iterations",
+        vus: 2,
+        iterations: 1,
+        maxDuration: "15s",
+      },
+    },
+  );
+  assert.deepEqual(
+    workloadOptions(
+      parseWorkloadConfig({
+        ...base,
+        CONVERGE_DEBUG_PHASES: "true",
+        CONVERGE_DEBUG_SEQUENTIAL: "true",
+      }),
+    ).scenarios,
+    {
+      debug_sequential: {
+        executor: "per-vu-iterations",
+        vus: 1,
+        iterations: 2,
+        maxDuration: "15s",
+      },
+    },
+  );
+  assert.deepEqual(
+    workloadOptions(
+      parseWorkloadConfig({
+        ...base,
+        CONVERGE_DEBUG_PHASES: "true",
+        CONVERGE_DEBUG_REPEAT: "true",
+      }),
+    ).scenarios,
+    {
+      debug_repeat: {
+        executor: "per-vu-iterations",
+        vus: 2,
+        iterations: 4,
+        maxDuration: "30s",
+      },
+    },
+  );
   assert.deepEqual(workloadOptions(smoke).thresholds, {
     converge_iteration_failures: ["rate<0.01"],
     converge_protocol_failures: ["rate==0"],

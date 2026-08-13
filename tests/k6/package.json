@@ -6,7 +6,7 @@
   "scripts": {
     "build": "echo 'k6 scripts require the external k6 runtime'",
     "lint": "eslint *.js *.mjs",
-    "test": "node --test protocol.test.mjs",
+    "test": "node --test protocol.test.mjs iteration-lifecycle.test.mjs",
     "typecheck": "echo 'no TypeScript sources'"
   }
 }

@@ -62,18 +62,20 @@ function duration(env, name, fallback) {
 function target(env, name, protocols) {
   const raw = env[name];
   if (!raw) fail(`${name}_REQUIRED`);
-  let parsed;
-  try {
-    parsed = new globalThis.URL(raw);
-  } catch {
-    fail(`${name}_INVALID`);
-  }
-  if (!protocols.includes(parsed.protocol)) fail(`${name}_PROTOCOL`);
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) fail(`${name}_UNSAFE`);
-  if (parsed.pathname !== "/" && parsed.pathname !== "") fail(`${name}_PATH`);
-  const hostname = parsed.hostname.toLowerCase();
+  const match = /^(https?|wss?):\/\/(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(?::([0-9]{1,5}))?\/?$/.exec(
+    raw,
+  );
+  if (!match) fail(`${name}_INVALID`);
+  const protocol = `${match[1]}:`;
+  if (!protocols.includes(protocol)) fail(`${name}_PROTOCOL`);
+  const port = match[3] === undefined ? undefined : Number(match[3]);
+  if (port !== undefined && (port < 1 || port > 65_535)) fail(`${name}_INVALID`);
+  const hostname = match[2].replace(/^\[|\]$/g, "").toLowerCase();
   const loopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-  return { value: parsed.origin, loopback };
+  return {
+    value: `${match[1]}://${match[2]}${port === undefined ? "" : `:${port}`}`,
+    loopback,
+  };
 }
 
 export function parseWorkloadConfig(env, { requireStateful = true } = {}) {
@@ -121,14 +123,52 @@ export function parseWorkloadConfig(env, { requireStateful = true } = {}) {
     maxPacketBytes: integer(env, "CONVERGE_MAX_PACKET_BYTES", 131_072, 1_024, 1_048_576),
     connectTimeoutMs: integer(env, "CONVERGE_CONNECT_TIMEOUT_MS", 10_000, 100, 60_000),
     acknowledgementTimeoutMs: integer(env, "CONVERGE_ACK_TIMEOUT_MS", 10_000, 100, 60_000),
+    debugPhases: env.CONVERGE_DEBUG_PHASES === "true",
+    debugRepeat: env.CONVERGE_DEBUG_REPEAT === "true",
+    debugConcurrent: env.CONVERGE_DEBUG_CONCURRENT === "true",
+    debugSequential: env.CONVERGE_DEBUG_SEQUENTIAL === "true",
   });
 }
 
 export function workloadOptions(config) {
-  const execution =
-    config.profile === "scale-step"
-      ? { stages: config.stages }
-      : { vus: config.vus, duration: config.duration };
+  const execution = config.debugSequential
+    ? {
+        scenarios: {
+          debug_sequential: {
+            executor: "per-vu-iterations",
+            vus: 1,
+            iterations: 2,
+            maxDuration: "15s",
+          },
+        },
+      }
+    : config.debugConcurrent
+      ? {
+          scenarios: {
+            debug_concurrent: {
+              executor: "per-vu-iterations",
+              vus: 2,
+              iterations: 1,
+              maxDuration: "15s",
+            },
+          },
+        }
+      : config.debugRepeat
+        ? {
+            scenarios: {
+              debug_repeat: {
+                executor: "per-vu-iterations",
+                vus: 2,
+                iterations: 4,
+                maxDuration: "30s",
+              },
+            },
+          }
+        : config.debugPhases
+          ? { vus: 1, iterations: 1 }
+          : config.profile === "scale-step"
+            ? { stages: config.stages }
+            : { vus: config.vus, duration: config.duration };
   const thresholds = {
     converge_iteration_failures: ["rate<0.01"],
     converge_protocol_failures: ["rate==0"],
@@ -137,9 +177,9 @@ export function workloadOptions(config) {
     converge_board_join_ack_duration: ["p(99)<5000"],
   };
   if (config.profile !== "scale-step") thresholds.converge_command_ack_duration = ["p(99)<2000"];
-  return Object.freeze({
+  return {
     ...execution,
     systemTags: [],
     thresholds,
-  });
+  };
 }
