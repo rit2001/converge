@@ -1105,7 +1105,12 @@ export async function buildApp(
         boardDeliveryHeadWatchdog?.start() ?? Promise.resolve();
       await boardDeliveryHeadWatchdogStartPromise;
       deliveryRuntimeStartPromise ??= deliveryRuntime.start();
-      await deliveryRuntimeStartPromise;
+      void deliveryRuntimeStartPromise.catch(async () => {
+        if (applicationClosing) return;
+        makeSocketsTerminallyUnready();
+        await stopDeliveryRuntimeOnce().catch(() => undefined);
+        await stopBoardDeliveryHeadWatchdogOnce().catch(() => undefined);
+      });
       transitionApiLifecycle("ready");
     } catch (error) {
       transitionApiLifecycle("startup_failed");

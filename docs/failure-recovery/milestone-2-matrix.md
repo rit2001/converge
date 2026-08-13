@@ -152,6 +152,39 @@ retry recovers and drains the preserved command. A post-verification/pre-apply b
 session results cannot mutate a replacement session. This evidence does not cover operation deletion,
 recovery floors, compaction, Redis durability, deployment, or performance.
 
+## M2.8 API observability acceptance evidence
+
+The isolated M2.8 API suite migrates a uniquely named PostgreSQL database through 0009, uses unique
+`converge:test:m28-api:*` Redis streams, the real outbox publisher, production-composed distributed
+APIs on dynamic ports, authenticated Socket.IO/HTTP clients, protected production metrics, and the
+existing deterministic consumer and watchdog barriers. It accepts the API-observability portions of
+F09, F10, F18, F27, F28, F30, and F42-F44 without making a worker-observability claim.
+
+Before the first blocking read is issued, `/health/live` and PostgreSQL-backed `/health/ready` return
+200 while `/health/socket-ready` returns 503 and both readiness gauges are zero. Consumer
+establishment changes the consumer and composite socket gauges to one. A real committed operation is
+pending before worker `XADD`, is handled once by each API, and increments only the fixed `operation` /
+`handled` series. A second valid Redis entry carrying the same envelope advances the transport cursor,
+increments `duplicate` once, and neither reapplies nor re-emits the operation.
+
+At 4,999 ms of deterministic publication divergence both readiness endpoints remain healthy. At the
+5,000 ms watchdog boundary, HTTP readiness stays 200 while socket readiness returns 503, its gauge is
+zero, connected sockets are fenced, and the watchdog/socket transition series increment once.
+Publication plus parity restores socket readiness for the current generation without double-counting.
+Destroying only one real blocking-read connection likewise leaves HTTP readiness at 200 while its
+consumer/socket gauges fall to zero; continuity-valid reconnect handles the intervening event once and
+restores those gauges.
+
+Real HTTP recovery requests record exactly one each of `snapshot_tail`, `refreshed`,
+`recovery_blocked`, `retryable_failure`, and `authorization_failure`, with five total duration
+observations and unchanged response classifications. Missing and incorrect metrics credentials are
+indistinguishable, authorized unchanged scrapes are byte-identical with the Prometheus content type,
+and a controlled snapshot/render boundary failure returns only the fixed 503 response without changing
+recorder state. Catalog validation and direct bounded-event inspection exclude board, operation,
+event, socket, Redis-entry, principal, snapshot/hash, token, URL, SQL, payload, and raw-error evidence.
+Shutdown records one stopping/stopped lifecycle, zeros both gauges before cleanup, fences late recovery,
+and leaves no API listener, Redis reader, watchdog task, client, worker stream, or database pool open.
+
 ## Acceptance rules
 
 - Tests assert at-least-once publication and idempotent effects; they must not assert or describe

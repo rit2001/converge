@@ -1,6 +1,6 @@
 # Project status
 
-Last reviewed: 2026-08-11
+Last reviewed: 2026-08-13
 
 ## Milestone 1 implemented invariants
 
@@ -75,7 +75,9 @@ outbox/snapshot/compaction instrumentation is complete. Deterministic Prometheus
 complete. API liveness, PostgreSQL-backed HTTP readiness, composite socket-readiness, and opt-in
 Bearer-protected metrics endpoints are complete. The opt-in worker operational listener now exposes
 separate lifecycle, PostgreSQL-backed core, and Redis/outbox delivery health plus protected metrics.
-Deployment probe selection, alerts, dashboards, and benchmarks remain pending.
+Real distributed API observability acceptance is complete against isolated PostgreSQL and Redis
+failure boundaries. Worker observability acceptance, deployment probe selection, alerts, dashboards,
+and benchmarks remain pending.
 
 ## Deferred by design
 

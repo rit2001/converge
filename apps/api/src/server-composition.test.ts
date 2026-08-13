@@ -133,16 +133,21 @@ describe("configured API delivery composition", () => {
     expect(stack.closeTransport).toHaveBeenCalledOnce();
   });
 
-  it("cleans up transport, runtime, and watchdog after partial startup failure", async () => {
+  it("keeps HTTP ready and cleans delivery resources after partial startup failure", async () => {
     const stack = stackHarness({ consumerFactoryError: new Error("consumer construction failed") });
-    const context = await buildApp(
-      distributedEnvironment,
-      unusedPool,
-      authentication,
-      configuredDeliveryBuildOptions(distributedEnvironment, stack.factories),
-    );
+    const context = await buildApp(distributedEnvironment, unusedPool, authentication, {
+      ...configuredDeliveryBuildOptions(distributedEnvironment, stack.factories),
+      healthProbe: { check: () => Promise.resolve() },
+    });
 
-    await expect(context.app.ready()).rejects.toThrow("consumer construction failed");
+    await context.app.ready();
+    expect((await context.app.inject({ method: "GET", url: "/health/ready" })).statusCode).toBe(
+      200,
+    );
+    expect(
+      (await context.app.inject({ method: "GET", url: "/health/socket-ready" })).statusCode,
+    ).toBe(503);
+    await vi.waitFor(() => expect(stack.closeTransport).toHaveBeenCalledOnce());
     await context.app.close();
     await context.app.close();
 

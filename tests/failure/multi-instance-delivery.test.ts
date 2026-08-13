@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { buildApp, type AppContext } from "@converge/api";
+import { BoardRecoveryService, buildApp, type AppContext } from "@converge/api";
 import type { AuthenticatedPrincipal } from "@converge/api/auth";
 import {
   BoardDeliveryHeadWatchdog,
@@ -48,11 +48,18 @@ import {
 } from "@converge/canvas-engine";
 import {
   BoardRepository,
+  BoardRecoveryError,
+  BoardRecoveryMaterialRepository,
   OutboxRepository,
   createPool,
   type DatabasePool,
 } from "@converge/database";
-import type { StructuredLogger } from "@converge/observability";
+import {
+  METRIC_CATALOG,
+  PROMETHEUS_CONTENT_TYPE,
+  InMemoryTelemetryRecorder,
+  type StructuredLogger,
+} from "@converge/observability";
 import {
   boardAccessRevokedEventSchema,
   boardSnapshotSchema,
@@ -94,6 +101,7 @@ const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 const repositoryRoot = new URL("../..", import.meta.url);
 const runFile = promisify(execFile);
 const deadlineMs = 10_000;
+const metricsBearerToken = "m28-api-observability-acceptance-token";
 
 const identities = {
   owner: { id: "00000000-0000-4000-8000-000000000091", displayName: "M24B Owner" },
@@ -200,8 +208,14 @@ class AuditedRedisTransport implements DeliveryConsumerTransport {
   cancelCalls = 0;
   closeCalls = 0;
   private reconnectGate: ReturnType<typeof deferred<void>> | undefined;
+  private initialReadGate: ReturnType<typeof deferred<void>> | undefined;
 
-  constructor(readonly delegate: RedisDeliveryConsumerTransport) {}
+  constructor(
+    readonly delegate: RedisDeliveryConsumerTransport,
+    pauseInitialRead = false,
+  ) {
+    if (pauseInitialRead) this.initialReadGate = deferred<void>();
+  }
 
   async connect(): Promise<void> {
     this.connectCalls += 1;
@@ -233,6 +247,11 @@ class AuditedRedisTransport implements DeliveryConsumerTransport {
   }
 
   async readAfter(input: Parameters<DeliveryConsumerTransport["readAfter"]>[0]) {
+    if (this.initialReadGate) {
+      const gate = this.initialReadGate;
+      await gate.promise;
+      if (this.initialReadGate === gate) this.initialReadGate = undefined;
+    }
     this.readCursors.push(input.cursor);
     const entries = await this.delegate.readAfter(input);
     for (const entry of entries) this.receivedEntryIds.push(entry.id);
@@ -257,6 +276,10 @@ class AuditedRedisTransport implements DeliveryConsumerTransport {
 
   releaseReconnect(): void {
     this.reconnectGate?.resolve();
+  }
+
+  releaseInitialRead(): void {
+    this.initialReadGate?.resolve();
   }
 
   interruptReader(): void {
@@ -285,6 +308,8 @@ interface ApiEvidence {
   watchdogScheduler: ControlledWatchdogScheduler | undefined;
   environment: Environment | undefined;
   rejectedBeforeEstablished: boolean;
+  failMetricsSnapshot: boolean;
+  recoveryFailures: Map<string, "blocked" | "retryable">;
 }
 
 interface ApiInstance {
@@ -426,7 +451,7 @@ function requireDatabaseUrl(): string {
   return isolatedDatabaseUrl;
 }
 
-type TestNamespace = "m24b" | "m25" | "m25-final";
+type TestNamespace = "m24b" | "m25" | "m25-final" | "m28-api";
 
 function uniqueStreamKey(namespace: TestNamespace): string {
   const key = `converge:test:${namespace}:${crypto.randomUUID()}`;
@@ -478,6 +503,8 @@ function activatedEnvironment(streamKey: string, port: number): Environment {
     DELIVERY_WATCHDOG_QUERY_TIMEOUT_MS: "5000",
     DELIVERY_WATCHDOG_BATCH_SIZE: "100",
     DELIVERY_WATCHDOG_JITTER_RATIO: "0",
+    API_METRICS_ENABLED: "true",
+    API_METRICS_BEARER_TOKEN: metricsBearerToken,
     LOG_LEVEL: "silent",
     DEV_AUTH_USER_NAME: "Unused development identity",
   });
@@ -539,6 +566,83 @@ async function expectSocketReadinessRejected(api: ApiInstance, token: string): P
   }
 }
 
+interface OperationalResponse {
+  status: number;
+  contentType: string;
+  body: string;
+}
+
+async function operationalRequest(
+  api: ApiInstance,
+  path: string,
+  authorization?: string,
+): Promise<OperationalResponse> {
+  const response = await fetch(
+    `${api.url}${path}`,
+    authorization === undefined ? undefined : { headers: { authorization } },
+  );
+  return {
+    status: response.status,
+    contentType: response.headers.get("content-type") ?? "",
+    body: await response.text(),
+  };
+}
+
+function metricValue(body: string, series: string): number {
+  const line = body.split("\n").find((candidate) => candidate.startsWith(`${series} `));
+  if (line === undefined) return 0;
+  const value = Number(line.slice(series.length + 1));
+  if (!Number.isFinite(value)) throw new Error(`Invalid metric value for ${series}`);
+  return value;
+}
+
+async function scrapeMetrics(api: ApiInstance): Promise<OperationalResponse> {
+  return operationalRequest(api, "/metrics", `Bearer ${metricsBearerToken}`);
+}
+
+async function waitForMetricValue(
+  api: ApiInstance,
+  series: string,
+  expected: number,
+): Promise<OperationalResponse> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const scrape = await scrapeMetrics(api);
+    if (metricValue(scrape.body, series) === expected) return scrape;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  const finalScrape = await scrapeMetrics(api);
+  throw new Error(
+    `Metric ${series} did not reach ${expected}; observed ${metricValue(finalScrape.body, series)}`,
+  );
+}
+
+function expectFixedMetricCatalog(body: string): void {
+  const knownNames = new Set(Object.keys(METRIC_CATALOG));
+  for (const line of body.split("\n")) {
+    if (line === "" || line.startsWith("#")) continue;
+    const metricToken = line.split(" ", 1)[0] ?? "";
+    const brace = metricToken.indexOf("{");
+    const renderedName = brace === -1 ? metricToken : metricToken.slice(0, brace);
+    const catalogName = renderedName.replace(/_(?:bucket|sum|count)$/, "");
+    expect(knownNames.has(catalogName)).toBe(true);
+    if (brace === -1) continue;
+    const labels = metricToken.slice(brace + 1, -1);
+    for (const label of labels.matchAll(/(?:^|,)([a-z_]+)="((?:\\.|[^"\\])*)"/g)) {
+      const [, key, escapedValue] = label;
+      if (key === "le") {
+        expect(renderedName.endsWith("_bucket")).toBe(true);
+        continue;
+      }
+      const definition = METRIC_CATALOG[catalogName as keyof typeof METRIC_CATALOG];
+      expect(Object.hasOwn(definition.labels, key!)).toBe(true);
+      const values = definition.labels[key! as keyof typeof definition.labels] as
+        | readonly string[]
+        | undefined;
+      expect(values).toContain(escapedValue);
+    }
+  }
+}
+
 function apiDiagnostics(evidence: ApiEvidence): unknown {
   return {
     label: evidence.label,
@@ -575,6 +679,8 @@ async function createApiInstance(label: string, streamKey: string): Promise<ApiI
     watchdogScheduler: undefined,
     environment: undefined,
     rejectedBeforeEstablished: false,
+    failMetricsSnapshot: false,
+    recoveryFailures: new Map(),
   };
   const createRuntime: DeliveryRuntimeFactory = (handlers, applicationObserver) => {
     evidence.runtimeObserver = applicationObserver;
@@ -685,14 +791,19 @@ async function createActivatedApiInstance(label: string, streamKey: string): Pro
     watchdogScheduler: scheduler,
     environment: apiEnvironment,
     rejectedBeforeEstablished: false,
+    failMetricsSnapshot: false,
+    recoveryFailures: new Map(),
   };
   const factories = {
     createTransport: (url: string, key: string) => {
-      const transport = new AuditedRedisTransport(new RedisDeliveryConsumerTransport(url, key));
+      const transport = new AuditedRedisTransport(
+        new RedisDeliveryConsumerTransport(url, key),
+        true,
+      );
       evidence.transport = transport;
       return transport;
     },
-    createConsumer: (transport, callbacks, configuration) => {
+    createConsumer: (transport, callbacks, configuration, telemetry) => {
       const consumer = new RedisDeliveryConsumer(
         transport,
         {
@@ -714,6 +825,7 @@ async function createActivatedApiInstance(label: string, streamKey: string): Pro
             return Promise.resolve();
           },
         },
+        telemetry,
       );
       evidence.consumer = consumer;
       return consumer;
@@ -757,7 +869,30 @@ async function createActivatedApiInstance(label: string, streamKey: string): Pro
     createAuthentication: () => auth,
     createDeliveryOptions: (parsed) => configuredDeliveryBuildOptions(parsed, factories),
     buildApplication: async (parsed, database, authentication, options) => {
-      context = await buildApp(parsed, database, authentication, options);
+      const recorder = options.telemetry;
+      if (!(recorder instanceof InMemoryTelemetryRecorder))
+        throw new TypeError("Activated API did not receive its owned telemetry recorder");
+      context = await buildApp(parsed, database, authentication, {
+        ...options,
+        recoveryMaterialRepository: {
+          load: (boardId) =>
+            new BoardRecoveryService(new BoardRecoveryMaterialRepository(database)).load(boardId),
+          loadWithOutcome: (boardId) => {
+            const failure = evidence.recoveryFailures.get(boardId);
+            if (failure === "blocked")
+              return Promise.reject(new BoardRecoveryError("SNAPSHOT_CORRUPT"));
+            if (failure === "retryable")
+              return Promise.reject(new Error("controlled retryable recovery failure"));
+            return new BoardRecoveryService(
+              new BoardRecoveryMaterialRepository(database),
+            ).loadWithOutcome(boardId);
+          },
+        },
+        telemetrySnapshot: () => {
+          if (evidence.failMetricsSnapshot) throw new Error("controlled snapshot failure");
+          return recorder.snapshot();
+        },
+      });
       return context;
     },
   };
@@ -769,11 +904,6 @@ async function createActivatedApiInstance(label: string, streamKey: string): Pro
     evidence.rejectedBeforeEstablished = true;
     await withDeadline(server.listen(), `${label} activated API startup`, () =>
       apiDiagnostics(evidence),
-    );
-    await withDeadline(
-      evidence.lifecycle.waitFor(({ state }) => state === "established"),
-      `${label} activated consumer establishment`,
-      () => apiDiagnostics(evidence),
     );
     if (!context) throw new Error(`${label} activated API context was not constructed`);
     let closePromise: Promise<void> | undefined;
@@ -859,7 +989,7 @@ class TestTopology {
   }
 
   static createActivated(): Promise<TestTopology> {
-    return TestTopology.create({}, "m25-final", true);
+    return TestTopology.create({}, "m28-api", true);
   }
 
   diagnostics(): unknown {
@@ -1251,6 +1381,9 @@ beforeAll(async () => {
     "0004_durable_board_delivery_ordering.sql",
     "0005_complete_outbox_envelope_constraints.sql",
     "0006_leased_outbox_state_machine.sql",
+    "0007_verified_board_snapshots.sql",
+    "0008_snapshot_invalidation_diagnostics.sql",
+    "0009_board_replay_receipts_and_recovery_floors.sql",
   ]);
 
   redis = createClient({ url: redisUrl });
@@ -1905,8 +2038,8 @@ describe.sequential("M2.5 distributed membership revocation across API replicas"
   });
 });
 
-describe.sequential("M2.5 activated distributed readiness and failure recovery", () => {
-  it("fails closed and recovers across watchdog, Redis, and revocation boundaries", async () => {
+describe.sequential("M2.8 API observability acceptance under real distributed failures", () => {
+  it("reports delivery, watchdog, interruption, and shutdown evidence without leaking identifiers", async () => {
     await withUnhandledRejectionAudit(async () => {
       const topology = await TestTopology.createActivated();
       const apiA = topology.apiA;
@@ -1915,8 +2048,76 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
       expect(apiB.evidence.environment?.API_DELIVERY_MODE).toBe("distributed");
       expect(apiA.evidence.rejectedBeforeEstablished).toBe(true);
       expect(apiB.evidence.rejectedBeforeEstablished).toBe(true);
+      expect(apiA.evidence.lifecycle.entries).toEqual([]);
+      expect(apiB.evidence.lifecycle.entries).toEqual([]);
+
+      const [liveBeforeConsumer, readyBeforeConsumer, socketBeforeConsumer] = await Promise.all([
+        operationalRequest(apiA, "/health/live"),
+        operationalRequest(apiA, "/health/ready"),
+        operationalRequest(apiA, "/health/socket-ready"),
+      ]);
+      expect(liveBeforeConsumer).toMatchObject({ status: 200 });
+      expect(JSON.parse(liveBeforeConsumer.body)).toEqual({ ok: true, status: "live" });
+      expect(readyBeforeConsumer).toMatchObject({ status: 200 });
+      expect(JSON.parse(readyBeforeConsumer.body)).toEqual({ ok: true, status: "ready" });
+      expect(socketBeforeConsumer).toMatchObject({ status: 503 });
+
+      const missingCredentials = await operationalRequest(apiA, "/metrics");
+      const incorrectCredentials = await operationalRequest(
+        apiA,
+        "/metrics",
+        "Bearer definitely-not-the-acceptance-token",
+      );
+      expect(missingCredentials).toEqual(incorrectCredentials);
+      expect(missingCredentials.status).toBe(401);
+      const initialMetrics = await scrapeMetrics(apiA);
+      expect(initialMetrics.status).toBe(200);
+      expect(initialMetrics.contentType).toBe(PROMETHEUS_CONTENT_TYPE);
+      expect(metricValue(initialMetrics.body, "converge_delivery_consumer_ready")).toBe(0);
+      expect(metricValue(initialMetrics.body, "converge_socket_ready")).toBe(0);
+      expect(await scrapeMetrics(apiA)).toEqual(initialMetrics);
+      expect(initialMetrics.body).not.toContain("delivery.consumer.lifecycle");
+      expect(initialMetrics.body).not.toContain(metricsBearerToken);
+      expectFixedMetricCatalog(initialMetrics.body);
+      const recorderBeforeFailure = apiA.server?.telemetry.snapshot();
+      apiA.evidence.failMetricsSnapshot = true;
+      const failedMetrics = await scrapeMetrics(apiA);
+      expect(failedMetrics).toMatchObject({
+        status: 503,
+        contentType: "text/plain; charset=utf-8",
+        body: "Metrics unavailable\n",
+      });
+      expect(apiA.server?.telemetry.snapshot()).toEqual(recorderBeforeFailure);
+      apiA.evidence.failMetricsSnapshot = false;
+      expect(await scrapeMetrics(apiA)).toEqual(initialMetrics);
+
+      apiA.evidence.transport?.releaseInitialRead();
+      apiB.evidence.transport?.releaseInitialRead();
+      await Promise.all([
+        withDeadline(
+          apiA.evidence.lifecycle.waitFor(({ state }) => state === "established"),
+          "API A initial consumer establishment",
+          () => topology.diagnostics(),
+        ),
+        withDeadline(
+          apiB.evidence.lifecycle.waitFor(({ state }) => state === "established"),
+          "API B initial consumer establishment",
+          () => topology.diagnostics(),
+        ),
+      ]);
       expect(apiA.evidence.lifecycle.entries).toContainEqual({ state: "established" });
       expect(apiB.evidence.lifecycle.entries).toContainEqual({ state: "established" });
+      expect((await operationalRequest(apiA, "/health/ready")).status).toBe(200);
+      expect((await operationalRequest(apiA, "/health/socket-ready")).status).toBe(200);
+      const establishedMetrics = await scrapeMetrics(apiA);
+      expect(metricValue(establishedMetrics.body, "converge_delivery_consumer_ready")).toBe(1);
+      expect(metricValue(establishedMetrics.body, "converge_socket_ready")).toBe(1);
+      expect(
+        metricValue(
+          establishedMetrics.body,
+          'converge_delivery_state_transitions_total{source="consumer",state="established"}',
+        ),
+      ).toBe(1);
       expect(apiA.context.io.of("/").adapter.constructor.name).toBe("Adapter");
       expect(apiB.context.io.of("/").adapter.constructor.name).toBe("Adapter");
 
@@ -1972,6 +2173,106 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
       await expectConverged(clientA, boardId);
       await expectConverged(clientB, boardId);
       const stateAfterFirst = structuredClone(clientA.state);
+      const metricsAfterFirst = await waitForMetricValue(
+        apiA,
+        'converge_delivery_events_total{event_type="operation",outcome="handled"}',
+        1,
+      );
+      expect(
+        metricValue(
+          metricsAfterFirst.body,
+          'converge_delivery_events_total{event_type="operation",outcome="handled"}',
+        ),
+      ).toBe(1);
+      for (const outcome of ["duplicate", "failed", "quarantined"])
+        expect(
+          metricValue(
+            metricsAfterFirst.body,
+            `converge_delivery_events_total{event_type="operation",outcome="${outcome}"}`,
+          ),
+        ).toBe(0);
+
+      const duplicateOperationId = await appendDuplicate(
+        topology.streamKey,
+        publishedFirst.payload,
+      );
+      await Promise.all([
+        topology.waitForReadEvidence(apiA, duplicateOperationId),
+        topology.waitForReadEvidence(apiB, duplicateOperationId),
+        topology.waitForCursor(apiA, duplicateOperationId),
+        topology.waitForCursor(apiB, duplicateOperationId),
+      ]);
+      expect(clientA.rawOperationCounts.get(first.opId)).toBe(1);
+      expect(clientB.rawOperationCounts.get(first.opId)).toBe(1);
+      const metricsAfterDuplicate = await waitForMetricValue(
+        apiA,
+        'converge_delivery_events_total{event_type="operation",outcome="duplicate"}',
+        1,
+      );
+      expect(
+        metricValue(
+          metricsAfterDuplicate.body,
+          'converge_delivery_events_total{event_type="operation",outcome="handled"}',
+        ),
+      ).toBe(1);
+      expect(
+        metricValue(
+          metricsAfterDuplicate.body,
+          'converge_delivery_events_total{event_type="operation",outcome="duplicate"}',
+        ),
+      ).toBe(1);
+      expect((await operationalRequest(apiA, "/health/socket-ready")).status).toBe(200);
+
+      await new BoardRecoveryMaterialRepository(requireAssertionPool()).refresh(boardId);
+      const snapshotTailRecovery = await operationalRequest(
+        apiA,
+        `/v1/boards/${boardId}/recovery`,
+        `Bearer ${tokens.owner}`,
+      );
+      expect(snapshotTailRecovery.status).toBe(200);
+      const refreshedBoardId = await topology.createBoard();
+      const refreshedRecovery = await operationalRequest(
+        apiA,
+        `/v1/boards/${refreshedBoardId}/recovery`,
+        `Bearer ${tokens.owner}`,
+      );
+      expect(refreshedRecovery.status).toBe(200);
+      const blockedBoardId = await topology.createBoard();
+      apiA.evidence.recoveryFailures.set(blockedBoardId, "blocked");
+      const blockedRecovery = await operationalRequest(
+        apiA,
+        `/v1/boards/${blockedBoardId}/recovery`,
+        `Bearer ${tokens.owner}`,
+      );
+      expect(blockedRecovery.status).toBe(409);
+      expect(JSON.parse(blockedRecovery.body)).toMatchObject({ code: "RECOVERY_BLOCKED" });
+      const retryableBoardId = await topology.createBoard();
+      apiA.evidence.recoveryFailures.set(retryableBoardId, "retryable");
+      expect(
+        (
+          await operationalRequest(
+            apiA,
+            `/v1/boards/${retryableBoardId}/recovery`,
+            `Bearer ${tokens.owner}`,
+          )
+        ).status,
+      ).toBe(500);
+      expect((await operationalRequest(apiA, `/v1/boards/${boardId}/recovery`)).status).toBe(401);
+      const recoveryMetrics = await scrapeMetrics(apiA);
+      for (const outcome of [
+        "snapshot_tail",
+        "refreshed",
+        "recovery_blocked",
+        "retryable_failure",
+        "authorization_failure",
+      ])
+        expect(
+          metricValue(
+            recoveryMetrics.body,
+            `converge_recovery_requests_total{outcome="${outcome}"}`,
+          ),
+        ).toBe(1);
+      expect(metricValue(recoveryMetrics.body, "converge_recovery_duration_seconds_count")).toBe(5);
 
       const paused = createRectangleCommand(boardId);
       await expect(topology.submit(clientA, paused)).resolves.toMatchObject({
@@ -1991,6 +2292,8 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
       expect(apiB.evidence.watchdogLifecycle.entries).toEqual([]);
       expect(clientA.socket.connected).toBe(true);
       expect(clientB.socket.connected).toBe(true);
+      expect((await operationalRequest(apiA, "/health/ready")).status).toBe(200);
+      expect((await operationalRequest(apiA, "/health/socket-ready")).status).toBe(200);
       const { client: beforeDeadline, joined: beforeDeadlineJoin } = await topology.connect(
         apiB,
         tokens.viewer,
@@ -2029,6 +2332,26 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
         code: "DELIVERY_HEAD_DIVERGED",
         boardIds: [boardId],
       });
+      expect((await operationalRequest(apiA, "/health/ready")).status).toBe(200);
+      expect((await operationalRequest(apiA, "/health/socket-ready")).status).toBe(503);
+      const divergentMetrics = await waitForMetricValue(
+        apiA,
+        'converge_delivery_state_transitions_total{source="watchdog",state="unavailable"}',
+        1,
+      );
+      expect(metricValue(divergentMetrics.body, "converge_socket_ready")).toBe(0);
+      expect(
+        metricValue(
+          divergentMetrics.body,
+          'converge_delivery_state_transitions_total{source="watchdog",state="unavailable"}',
+        ),
+      ).toBe(1);
+      expect(
+        metricValue(
+          divergentMetrics.body,
+          'converge_delivery_state_transitions_total{source="socket_readiness",state="unavailable"}',
+        ),
+      ).toBe(1);
       await expectSocketReadinessRejected(apiA, tokens.owner);
       await expectSocketReadinessRejected(apiB, tokens.owner);
       const healthyHttp = await apiA.context.app.inject({
@@ -2064,6 +2387,26 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
           "API B watchdog recovery",
         ),
       ]);
+      expect((await operationalRequest(apiA, "/health/socket-ready")).status).toBe(200);
+      const recoveredWatchdogMetrics = await waitForMetricValue(
+        apiA,
+        'converge_delivery_state_transitions_total{source="watchdog",state="recovered"}',
+        1,
+      );
+      expect(metricValue(recoveredWatchdogMetrics.body, "converge_socket_ready")).toBe(1);
+      expect(
+        metricValue(
+          recoveredWatchdogMetrics.body,
+          'converge_delivery_state_transitions_total{source="watchdog",state="recovered"}',
+        ),
+      ).toBe(1);
+      await topology.runWatchdogChecks();
+      expect(
+        metricValue(
+          (await scrapeMetrics(apiA)).body,
+          'converge_delivery_state_transitions_total{source="watchdog",state="recovered"}',
+        ),
+      ).toBe(1);
       const { client: recoveredA, joined: recoveredJoinA } = await topology.connect(
         apiA,
         tokens.editor,
@@ -2112,6 +2455,27 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
         ),
       ]);
       expect(recoveredB.socket.connected).toBe(true);
+      expect((await operationalRequest(apiA, "/health/ready")).status).toBe(200);
+      expect((await operationalRequest(apiA, "/health/socket-ready")).status).toBe(503);
+      const interruptedMetrics = await waitForMetricValue(
+        apiA,
+        'converge_delivery_state_transitions_total{source="consumer",state="recovering"}',
+        1,
+      );
+      expect(metricValue(interruptedMetrics.body, "converge_delivery_consumer_ready")).toBe(0);
+      expect(metricValue(interruptedMetrics.body, "converge_socket_ready")).toBe(0);
+      expect(
+        metricValue(
+          interruptedMetrics.body,
+          'converge_delivery_state_transitions_total{source="consumer",state="unavailable"}',
+        ),
+      ).toBe(1);
+      expect(
+        metricValue(
+          interruptedMetrics.body,
+          'converge_delivery_state_transitions_total{source="consumer",state="recovering"}',
+        ),
+      ).toBe(1);
       await expectSocketReadinessRejected(apiA, tokens.owner);
       const httpDuringRedisRecovery = await apiA.context.app.inject({
         method: "GET",
@@ -2160,6 +2524,20 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
         apiB.evidence.lifecycle.entries.filter(({ state }) => state === "unavailable"),
       ).toHaveLength(apiBUnavailableBefore);
       expect(recoveredB.rawOperationCounts.get(duringRedisInterruption.opId)).toBe(1);
+      expect((await operationalRequest(apiA, "/health/socket-ready")).status).toBe(200);
+      const reconnectedMetrics = await waitForMetricValue(
+        apiA,
+        'converge_delivery_state_transitions_total{source="consumer",state="recovered"}',
+        1,
+      );
+      expect(metricValue(reconnectedMetrics.body, "converge_delivery_consumer_ready")).toBe(1);
+      expect(metricValue(reconnectedMetrics.body, "converge_socket_ready")).toBe(1);
+      expect(
+        metricValue(
+          reconnectedMetrics.body,
+          'converge_delivery_state_transitions_total{source="consumer",state="recovered"}',
+        ),
+      ).toBe(1);
 
       const { client: postInterruptA, joined: postInterruptJoin } = await topology.connect(
         apiA,
@@ -2240,10 +2618,65 @@ describe.sequential("M2.5 activated distributed readiness and failure recovery",
       await expectConverged(viewer, boardId);
       expect(await consumerGroups(topology.streamKey)).toEqual([]);
 
+      const finalMetrics = await scrapeMetrics(apiA);
+      expectFixedMetricCatalog(finalMetrics.body);
+      expect(finalMetrics.body).not.toContain("recovery.request.result");
+      const telemetryEvidence = JSON.stringify(apiA.server?.telemetry.snapshot());
+      const successfulRecoveryEvidence = [
+        JSON.parse(snapshotTailRecovery.body) as Record<string, unknown>,
+        JSON.parse(refreshedRecovery.body) as Record<string, unknown>,
+      ];
+      const forbiddenEvidence = [
+        boardId,
+        otherBoardId,
+        refreshedBoardId,
+        blockedBoardId,
+        retryableBoardId,
+        first.opId,
+        paused.opId,
+        publishedFirst.eventId,
+        publishedFirst.redisEntryId,
+        metricsBearerToken,
+        `Bearer ${metricsBearerToken}`,
+        tokens.owner,
+        identities.owner.id,
+        ...successfulRecoveryEvidence.flatMap((material) =>
+          ["snapshotId", "snapshotHash", "reconstructedHash"]
+            .map((key) => material[key])
+            .filter((value): value is string => typeof value === "string"),
+        ),
+      ];
+      for (const value of forbiddenEvidence) {
+        expect(finalMetrics.body).not.toContain(value);
+        expect(telemetryEvidence).not.toContain(value);
+      }
+
       const closeA = apiA.close();
       expect(apiA.close()).toBe(closeA);
       await closeA;
+      const stoppedSnapshot = apiA.server?.telemetry.snapshot();
+      const stoppedLifecycleEvents = stoppedSnapshot?.events.filter(
+        ({ eventName }) => eventName === "api.lifecycle",
+      );
+      expect(stoppedLifecycleEvents?.map(({ code }) => code)).toEqual([
+        "STARTING",
+        "READY",
+        "STOPPING",
+        "STOPPED",
+      ]);
+      expect(
+        stoppedSnapshot?.gauges.find(({ name }) => name === "converge_delivery_consumer_ready")
+          ?.value,
+      ).toBe(0);
+      expect(
+        stoppedSnapshot?.gauges.find(({ name }) => name === "converge_socket_ready")?.value,
+      ).toBe(0);
       await apiA.evidence.runtimeObserver?.lifecycle({ state: "recovered" });
+      expect(
+        apiA.server?.telemetry
+          .snapshot()
+          .events.filter(({ eventName }) => eventName === "api.lifecycle"),
+      ).toEqual(stoppedLifecycleEvents);
       expect(apiA.context.app.server.listening).toBe(false);
       expect(apiA.evidence.transport?.closeCalls).toBe(1);
       expect(apiA.evidence.watchdogScheduler?.pendingTasks).toBe(0);

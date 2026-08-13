@@ -93,6 +93,14 @@ const membershipEnvelope = membershipRevokedDeliveryEnvelopeSchema.parse({
   payload: { revokedUserId: ids.revoked, initiatedByUserId: ids.actor },
 });
 
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 function runtimeHarness(options: { startError?: Error; establishOnStart?: boolean } = {}) {
   let handlers: DeliveryRuntimeEventHandlers | undefined;
   let observer: DeliveryRuntimeObserver | undefined;
@@ -231,6 +239,42 @@ function healthyHttpPool(): DatabasePool {
 }
 
 describe("distributed-delivery application composition", () => {
+  it("accepts HTTP health checks while distributed consumer establishment is pending", async () => {
+    const startEntered = deferred();
+    const establish = deferred();
+    const start = vi.fn(() => {
+      startEntered.resolve();
+      return establish.promise;
+    });
+    const stop = vi.fn(() => Promise.resolve());
+    const context = await buildApp(environment, healthyHttpPool(), authorizedAuth, {
+      deliveryMode: { mode: "distributed", createRuntime: () => ({ start, stop }) },
+      healthProbe: { check: () => Promise.resolve() },
+    });
+    const readyWork = context.app.ready();
+    try {
+      await startEntered.promise;
+      await expect(
+        Promise.race([
+          readyWork.then(() => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
+        ]),
+      ).resolves.toBe(true);
+      expect((await context.app.inject({ method: "GET", url: "/health/ready" })).statusCode).toBe(
+        200,
+      );
+      expect(
+        (await context.app.inject({ method: "GET", url: "/health/socket-ready" })).statusCode,
+      ).toBe(503);
+    } finally {
+      establish.resolve();
+      await readyWork;
+      await context.app.close();
+    }
+    expect(start).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
   it("starts socket-unready until the distributed consumer is established", async () => {
     const state = runtimeHarness({ establishOnStart: false });
     authorizedSocketAuthentication.mockClear();
@@ -497,7 +541,7 @@ describe("distributed-delivery application composition", () => {
     expect(closeSocketIo).toHaveBeenCalledOnce();
   });
 
-  it("stops a failed startup once before Socket.IO closes", async () => {
+  it("keeps HTTP ready and stops a failed delivery startup once before Socket.IO closes", async () => {
     const calls: string[] = [];
     const telemetry = new InMemoryTelemetryRecorder();
     const state = runtimeHarness({ startError: new Error("runtime startup failed") });
@@ -515,13 +559,21 @@ describe("distributed-delivery application composition", () => {
         createRuntime: state.createRuntime,
       },
       telemetry,
+      healthProbe: { check: () => Promise.resolve() },
     });
     vi.spyOn(context.io, "close").mockImplementation(() => {
       calls.push("socket:close");
       return Promise.resolve();
     });
 
-    await expect(context.app.ready()).rejects.toThrow("runtime startup failed");
+    await context.app.ready();
+    expect((await context.app.inject({ method: "GET", url: "/health/ready" })).statusCode).toBe(
+      200,
+    );
+    expect(
+      (await context.app.inject({ method: "GET", url: "/health/socket-ready" })).statusCode,
+    ).toBe(503);
+    await vi.waitFor(() => expect(state.stopRuntime).toHaveBeenCalledOnce());
     await context.app.close();
     expect(state.startRuntime).toHaveBeenCalledOnce();
     expect(state.stopRuntime).toHaveBeenCalledOnce();
@@ -531,7 +583,7 @@ describe("distributed-delivery application composition", () => {
         .snapshot()
         .events.filter(({ eventName }) => eventName === "api.lifecycle")
         .map(({ code }) => code),
-    ).toEqual(["STARTING", "STARTUP_FAILED", "STOPPING", "STOPPED"]);
+    ).toEqual(["STARTING", "READY", "STOPPING", "STOPPED"]);
   });
 
   it("routes a consumed operation only through the matching API-local board room", async () => {
