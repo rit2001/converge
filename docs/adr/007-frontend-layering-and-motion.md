@@ -1,6 +1,6 @@
 # ADR 007: Frontend layering and motion
 
-Status: proposed  
+Status: proposed
 Date: 2026-08-13
 
 ## Context

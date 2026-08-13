@@ -1,7 +1,7 @@
 # Milestone 3: Premium product experience
 
-Status: proposed architecture and UX audit  
-Last reviewed: 2026-08-13  
+Status: proposed architecture and UX audit
+Last reviewed: 2026-08-13
 Baseline: `v0.2.0-m2`
 
 ## Definition of premium
