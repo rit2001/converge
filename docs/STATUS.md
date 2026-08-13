@@ -72,8 +72,9 @@ fixed low-cardinality metric catalog, bounded structured diagnostic events, no-o
 in-memory recorders, immutable export snapshots, explicit error classification, and telemetry
 failure isolation. Distributed API delivery/recovery instrumentation is complete. Worker
 outbox/snapshot/compaction instrumentation is complete. Deterministic Prometheus text rendering is
-complete. API and worker HTTP exposition, operational health endpoints, alerts, and benchmarks
-remain pending.
+complete. API liveness, PostgreSQL-backed HTTP readiness, composite socket-readiness, and opt-in
+Bearer-protected metrics endpoints are complete. Worker operational endpoints, deployment probe
+selection, alerts, dashboards, and benchmarks remain pending.
 
 ## Deferred by design
 

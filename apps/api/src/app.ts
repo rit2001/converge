@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { Writable } from "node:stream";
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
@@ -6,8 +7,10 @@ import { Server, type DefaultEventsMap } from "socket.io";
 import { z } from "zod";
 import {
   noOpTelemetryRecorder,
+  safeRenderPrometheus,
   safeTelemetryRecorder,
   type TelemetryRecorder,
+  type TelemetrySnapshot,
 } from "@converge/observability";
 import {
   BoardRecoveryError,
@@ -44,6 +47,7 @@ import {
   type ServerToClientEvents,
 } from "@converge/protocol";
 import { AuthenticationError, type AuthAdapter, type AuthenticatedPrincipal } from "./auth.js";
+import { InstanceApiOperationalState, type ApiOperationalState } from "./api-operational-state.js";
 import { BoardRecoveryService, type BoardRecoveryLoadResult } from "./board-recovery-service.js";
 export { BoardRecoveryService } from "./board-recovery-service.js";
 import { BoardDeliveryCoordinator } from "./board-delivery-coordinator.js";
@@ -202,6 +206,49 @@ export interface AppContext {
   io: AppIo;
 }
 
+export interface ApiHealthProbe {
+  check(): Promise<void> | void;
+}
+
+const DEFAULT_API_HEALTH_PROBE_TIMEOUT_MS = 1_000;
+const MAXIMUM_API_HEALTH_PROBE_TIMEOUT_MS = 30_000;
+const MAXIMUM_BEARER_TOKEN_LENGTH = 256;
+const liveResponse = Object.freeze({ ok: true as const, status: "live" as const });
+const readyResponse = Object.freeze({ ok: true as const, status: "ready" as const });
+const unavailableResponse = Object.freeze({ ok: false as const, status: "unavailable" as const });
+const unauthorizedResponse = Object.freeze({ ok: false as const, status: "unauthorized" as const });
+const metricsUnavailableResponse = "Metrics unavailable\n";
+
+function boundedBearerToken(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= MAXIMUM_BEARER_TOKEN_LENGTH &&
+    [...value].every((character) => {
+      const code = character.charCodeAt(0);
+      return code >= 33 && code <= 126;
+    })
+  );
+}
+
+function authorizedMetricsRequest(authorization: string | undefined, expected: string): boolean {
+  if (authorization === undefined || !authorization.startsWith("Bearer ")) return false;
+  const provided = authorization.slice("Bearer ".length);
+  if (!boundedBearerToken(provided) || !boundedBearerToken(expected)) return false;
+  const expectedDigest = createHash("sha256").update(expected, "utf8").digest();
+  const providedDigest = createHash("sha256").update(provided, "utf8").digest();
+  return timingSafeEqual(expectedDigest, providedDigest);
+}
+
+function recorderSnapshot(recorder: TelemetryRecorder): (() => TelemetrySnapshot) | undefined {
+  try {
+    const snapshot = (recorder as TelemetryRecorder & { snapshot?: () => TelemetrySnapshot })
+      .snapshot;
+    return typeof snapshot === "function" ? () => snapshot.call(recorder) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface AuthenticatedSocketData {
   principal: AuthenticatedPrincipal;
   revokedBoards: Set<string>;
@@ -299,6 +346,10 @@ export interface BuildAppOptions {
   loggerStream?: Writable;
   telemetry?: TelemetryRecorder;
   telemetryClock?: { now(): number };
+  telemetrySnapshot?: () => TelemetrySnapshot;
+  operationalState?: ApiOperationalState;
+  healthProbe?: ApiHealthProbe;
+  healthProbeTimeoutMs?: number;
 }
 
 export async function buildApp(
@@ -307,7 +358,24 @@ export async function buildApp(
   auth: AuthAdapter,
   options: BuildAppOptions = {},
 ): Promise<AppContext> {
-  const telemetry = safeTelemetryRecorder(options.telemetry ?? noOpTelemetryRecorder);
+  const rawTelemetry = options.telemetry ?? noOpTelemetryRecorder;
+  const telemetry = safeTelemetryRecorder(rawTelemetry);
+  const snapshotTelemetry = options.telemetrySnapshot ?? recorderSnapshot(rawTelemetry);
+  const deliveryMode = options.deliveryMode ?? { mode: "local" as const };
+  const operationalState =
+    options.operationalState ?? new InstanceApiOperationalState(deliveryMode.mode === "local");
+  operationalState.transition("starting");
+  const healthProbeTimeoutMs = z
+    .number()
+    .int()
+    .min(1)
+    .max(MAXIMUM_API_HEALTH_PROBE_TIMEOUT_MS)
+    .parse(options.healthProbeTimeoutMs ?? DEFAULT_API_HEALTH_PROBE_TIMEOUT_MS);
+  const healthProbe = options.healthProbe ?? {
+    check: async () => {
+      await pool.query("SELECT 1");
+    },
+  };
   const telemetryClock = options.telemetryClock ?? { now: () => performance.now() };
   const telemetryNow = (): number | undefined => {
     try {
@@ -343,6 +411,7 @@ export async function buildApp(
   const transitionApiLifecycle = (next: typeof apiLifecycle): void => {
     if (apiLifecycle === next || apiLifecycle === "stopped") return;
     apiLifecycle = next;
+    operationalState.transition(next);
     emit(
       "api.lifecycle",
       "api",
@@ -364,9 +433,9 @@ export async function buildApp(
   const recoveryMaterialRepository =
     options.recoveryMaterialRepository ?? new BoardRecoveryService(boardRecoveryMaterialRepository);
   const deliveryCoordinator = options.deliveryCoordinator ?? new BoardDeliveryCoordinator();
-  const deliveryMode = options.deliveryMode ?? { mode: "local" as const };
   telemetry.setGauge("converge_delivery_consumer_ready", {}, 0);
   telemetry.setGauge("converge_socket_ready", {}, deliveryMode.mode === "local" ? 1 : 0);
+  operationalState.setSocketReady(deliveryMode.mode === "local");
   const synchronizationBatchSize = z
     .number()
     .int()
@@ -422,6 +491,68 @@ export async function buildApp(
   };
 
   app.get("/health", () => ({ ok: true }));
+  app.get("/health/live", { config: { rateLimit: false } }, (_request, reply) =>
+    operationalState.isLive()
+      ? reply.code(200).send(liveResponse)
+      : reply.code(503).send(unavailableResponse),
+  );
+  app.get("/health/ready", { config: { rateLimit: false } }, async (_request, reply) => {
+    if (!operationalState.isHttpReady()) return reply.code(503).send(unavailableResponse);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const probe = Promise.resolve()
+      .then(() => healthProbe.check())
+      .then(
+        () => true,
+        () => false,
+      );
+    const timedOut = new Promise<false>((resolve) => {
+      timeout = setTimeout(() => resolve(false), healthProbeTimeoutMs);
+    });
+    const healthy = await Promise.race([probe, timedOut]);
+    if (timeout !== undefined) clearTimeout(timeout);
+    return healthy && operationalState.isHttpReady()
+      ? reply.code(200).send(readyResponse)
+      : reply.code(503).send(unavailableResponse);
+  });
+  app.get("/health/socket-ready", { config: { rateLimit: false } }, (_request, reply) =>
+    operationalState.isSocketReady()
+      ? reply.code(200).send(readyResponse)
+      : reply.code(503).send(unavailableResponse),
+  );
+  if (environment.API_METRICS_ENABLED)
+    app.get("/metrics", { config: { rateLimit: false } }, (request, reply) => {
+      if (
+        !authorizedMetricsRequest(
+          request.headers.authorization,
+          environment.API_METRICS_BEARER_TOKEN,
+        )
+      )
+        return reply.code(401).send(unauthorizedResponse);
+      if (snapshotTelemetry === undefined)
+        return reply
+          .code(503)
+          .header("content-type", "text/plain; charset=utf-8")
+          .send(metricsUnavailableResponse);
+      let snapshot: TelemetrySnapshot;
+      try {
+        snapshot = snapshotTelemetry();
+      } catch {
+        return reply
+          .code(503)
+          .header("content-type", "text/plain; charset=utf-8")
+          .send(metricsUnavailableResponse);
+      }
+      const rendered = safeRenderPrometheus(snapshot);
+      if (!rendered.ok)
+        return reply
+          .code(503)
+          .header("content-type", "text/plain; charset=utf-8")
+          .send(metricsUnavailableResponse);
+      return reply
+        .code(200)
+        .header("content-type", rendered.value.contentType)
+        .send(rendered.value.body);
+    });
   app.post("/v1/boards", async (request, reply) => {
     const user = await authenticateHttp(request);
     const body = createBoardRequestSchema.parse(request.body);
@@ -641,6 +772,7 @@ export async function buildApp(
       consumerSocketReady &&
       watchdogSocketReady;
     acceptsDistributedDeliveries = distributedSocketReady;
+    operationalState.setSocketReady(distributedSocketReady);
     const nextGauge = distributedSocketReady ? 1 : 0;
     if (nextGauge !== socketReadyGauge) {
       socketReadyGauge = nextGauge;

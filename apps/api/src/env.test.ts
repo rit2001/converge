@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { EnvironmentConfigurationError, parseEnvironment } from "./env.js";
 
@@ -17,6 +18,8 @@ describe("environment validation", () => {
       NODE_ENV: "production",
       DATABASE_URL: required.DATABASE_URL,
       WEB_ORIGIN: "https://example.test",
+      API_METRICS_ENABLED: false,
+      API_METRICS_BEARER_TOKEN: "",
       API_DELIVERY_MODE: "local",
       REDIS_URL: "redis://localhost:6379",
       REDIS_STREAM_KEY: "converge:delivery:v1",
@@ -79,6 +82,48 @@ describe("environment validation", () => {
     expect(() => parseEnvironment({ NODE_ENV: "production" })).toThrowError(
       new EnvironmentConfigurationError(["DATABASE_URL"]),
     );
+  });
+
+  it("enables API metrics only with exact true and a bounded printable bearer token", () => {
+    expect(
+      parseEnvironment({
+        ...required,
+        API_METRICS_ENABLED: "true",
+        API_METRICS_BEARER_TOKEN: "bounded-metrics-token",
+      }),
+    ).toMatchObject({
+      API_METRICS_ENABLED: true,
+      API_METRICS_BEARER_TOKEN: "bounded-metrics-token",
+    });
+    expect(() =>
+      parseEnvironment({
+        ...required,
+        API_METRICS_ENABLED: "TRUE",
+        API_METRICS_BEARER_TOKEN: "bounded-metrics-token",
+      }),
+    ).toThrowError(new EnvironmentConfigurationError(["API_METRICS_ENABLED"]));
+    expect(() => parseEnvironment({ ...required, API_METRICS_ENABLED: "true" })).toThrowError(
+      new EnvironmentConfigurationError(["API_METRICS_BEARER_TOKEN"]),
+    );
+  });
+
+  it("rejects unsafe metrics tokens without exposing them and documents both variables", () => {
+    const unsafe = `private-token\n${"x".repeat(257)}`;
+    let message = "";
+    try {
+      parseEnvironment({
+        ...required,
+        API_METRICS_ENABLED: "true",
+        API_METRICS_BEARER_TOKEN: unsafe,
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe("Invalid environment configuration: API_METRICS_BEARER_TOKEN");
+    expect(message).not.toContain("private-token");
+    const example = readFileSync(new URL("../../../.env.example", import.meta.url), "utf8");
+    expect(example).toContain("API_METRICS_ENABLED=false\n");
+    expect(example).toContain("API_METRICS_BEARER_TOKEN=\n");
   });
 
   it("does not include credentials or complete connection strings in configuration errors", () => {

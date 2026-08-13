@@ -16,8 +16,19 @@ const REDIS_DELIVERY_MINIMUM_QUEUE_BYTES =
     REDIS_STREAM_ENTRY_ID_MAX_BYTES);
 const LOCAL_REDIS_URL = "redis://localhost:6379";
 const LOCAL_REDIS_STREAM_KEY = "converge:delivery:v1";
+const API_METRICS_BEARER_TOKEN_MAXIMUM_LENGTH = 256;
 
 const redisStreamKeyPattern = /^[A-Za-z0-9:._-]{1,128}$/;
+
+function isBearerToken(value: string): boolean {
+  return (
+    value.length <= API_METRICS_BEARER_TOKEN_MAXIMUM_LENGTH &&
+    [...value].every((character) => {
+      const code = character.charCodeAt(0);
+      return code >= 33 && code <= 126;
+    })
+  );
+}
 
 const environmentShape = {
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -25,6 +36,11 @@ const environmentShape = {
   API_PORT: z.coerce.number().int().min(1).max(65_535).default(4000),
   WEB_ORIGIN: z.string().url().default("http://localhost:3000"),
   DATABASE_URL: z.string().url(),
+  API_METRICS_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  API_METRICS_BEARER_TOKEN: z.string().refine(isBearerToken).default(""),
   API_DELIVERY_MODE: z.enum(["local", "distributed"]).default("local"),
   REDIS_URL: z.string().url().optional(),
   REDIS_STREAM_KEY: z.string().optional(),
@@ -90,6 +106,12 @@ export const apiEnvironmentVariableNames = Object.freeze(Object.keys(environment
 const environmentSchema = z
   .object(environmentShape)
   .superRefine((environment, context) => {
+    if (environment.API_METRICS_ENABLED && environment.API_METRICS_BEARER_TOKEN.length === 0)
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["API_METRICS_BEARER_TOKEN"],
+        message: "A bearer token is required when API metrics are enabled",
+      });
     if (environment.API_DELIVERY_MODE === "distributed") {
       if (environment.REDIS_URL === undefined)
         context.addIssue({

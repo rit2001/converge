@@ -95,5 +95,22 @@ layout. Structured diagnostic events are validated but never converted to or inc
 metrics. The safe rendering wrapper returns one fixed sanitized error and suppresses synchronous or
 asynchronous fallback failures without retaining or mutating the snapshot.
 
-API and worker HTTP exposition, operational health endpoints, dashboards, alert thresholds, external
+## API operational endpoints
+
+The existing API Fastify server exposes three unauthenticated, fixed-body health routes with distinct
+meanings. `GET /health/live` reports only whether the API lifecycle is running. `GET /health/ready`
+performs one timeout-bounded PostgreSQL probe and reports whether PostgreSQL-backed HTTP service is
+ready. `GET /health/socket-ready` performs no dependency command and reports the existing composite
+Socket.IO delivery gate: local mode is ready while the application is running, while distributed mode
+requires current consumer and watchdog health. Redis delivery failure can therefore make socket
+readiness unavailable without changing healthy HTTP/PostgreSQL readiness.
+
+`GET /metrics` is absent unless `API_METRICS_ENABLED` is exactly `true`. Enabling it requires a
+bounded printable `API_METRICS_BEARER_TOKEN`; requests use a dedicated Bearer header and timing-safe
+comparison rather than board/user authentication. Missing and invalid credentials share one fixed
+401 response. Authorized requests render an immutable snapshot from the API-owned recorder, preserve
+the Prometheus content type and body, and return one fixed plain-text 503 response if snapshotting or
+rendering fails. Scrapes emit no telemetry and perform no board, PostgreSQL, or Redis work.
+
+Worker HTTP exposition, deployment probe selection, dashboards, alert thresholds, external
 collectors, deployment integration, and benchmark claims remain explicitly deferred.
