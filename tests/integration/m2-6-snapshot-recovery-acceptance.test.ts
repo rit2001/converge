@@ -347,6 +347,7 @@ function startTransport(
     pendingStore?: IsolatedPendingStore;
     apiBaseUrl?: string;
     fetcher?: typeof fetch;
+    loadRecovery?: (boardId: string, signal: AbortSignal) => Promise<unknown>;
     connect?: boolean;
   } = {},
 ): {
@@ -372,6 +373,7 @@ function startTransport(
     scheduler,
     pendingStore,
     fetcher: options.fetcher ?? authenticatedFetch,
+    ...(options.loadRecovery ? { loadRecovery: options.loadRecovery } : {}),
     socketFactory: (url) => {
       const socket = createTestSocket(url, recoveryToken);
       sockets.add(socket);
@@ -434,7 +436,7 @@ beforeAll(async () => {
   const migration = await pool.query<{ name: string }>(
     "SELECT name FROM converge_migrations ORDER BY name DESC LIMIT 1",
   );
-  expect(migration.rows[0]?.name).toBe("0008_snapshot_invalidation_diagnostics.sql");
+  expect(migration.rows[0]?.name).toBe("0009_board_replay_receipts_and_recovery_floors.sql");
 });
 
 afterEach(async () => {
@@ -865,38 +867,38 @@ describe("M2.6 verified snapshot recovery acceptance", () => {
     const staleBoard = await createBoard("stale-session");
     await boards.commitOperation(owner.id, objectCommand(staleBoard, 0));
     await snapshots.create(staleBoard);
+    const staleMaterial = await recovery.load(staleBoard);
     const beforeApply = deferred<void>();
     const enteredApply = deferred<void>();
-    const stale = startTransport(staleBoard, 2, { connect: false });
+    const stale = startTransport(staleBoard, 2, {
+      connect: false,
+      loadRecovery: async () => {
+        enteredApply.resolve();
+        await beforeApply.promise;
+        return staleMaterial;
+      },
+    });
     await vi.waitFor(() => expect(useBoardStore.getState().authoritativeHash.status).toBe("ready"));
-    const digest = crypto.subtle.digest.bind(crypto.subtle);
-    let holdVerification = true;
-    const digestSpy = vi
-      .spyOn(crypto.subtle, "digest")
-      .mockImplementation(async (...arguments_) => {
-        if (holdVerification) {
-          holdVerification = false;
-          enteredApply.resolve();
-          await beforeApply.promise;
-        }
-        return digest(...arguments_);
-      });
     stale.transport.connect();
     await enteredApply.promise;
     stale.transport.disconnect();
     transports.delete(stale.transport);
     const replacement = startTransport(staleBoard, 0);
-    await vi.waitFor(() => expect(useBoardStore.getState().connection).toBe("ready"));
-    beforeApply.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    digestSpy.mockRestore();
-    expect(useBoardStore.getState()).toMatchObject({
-      sessionToken: replacement.token,
-      connection: "ready",
-      committed: { lastSeq: 1 },
-    });
-    replacement.transport.disconnect();
+    try {
+      await vi.waitFor(() => expect(useBoardStore.getState().connection).toBe("ready"));
+      beforeApply.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(useBoardStore.getState()).toMatchObject({
+        sessionToken: replacement.token,
+        connection: "ready",
+        committed: { lastSeq: 1 },
+      });
+    } finally {
+      beforeApply.resolve();
+      stale.transport.disconnect();
+      replacement.transport.disconnect();
+    }
     replacement.transport.disconnect();
   });
 });

@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -12,14 +14,18 @@ import {
 } from "@converge/database";
 import { createRectangleCommand, fixtureIds } from "@converge/testkit";
 
-const databaseUrl =
+const sharedDatabaseUrl =
   process.env.DATABASE_URL ?? "postgresql://converge:converge@localhost:55432/converge";
-const pool = createPool(databaseUrl);
-const boards = new BoardRepository(pool);
-const snapshots = new BoardSnapshotRepository(pool);
-const discovery = new BoardCompactionCandidateRepository(pool);
-const compaction = new BoardCompactionRepository(pool);
+const repositoryRoot = new URL("../..", import.meta.url);
+const runFile = promisify(execFile);
 const boardIds = new Set<string>();
+let databaseName: string;
+let adminPool: ReturnType<typeof createPool>;
+let pool: ReturnType<typeof createPool>;
+let boards: BoardRepository;
+let snapshots: BoardSnapshotRepository;
+let discovery: BoardCompactionCandidateRepository;
+let compaction: BoardCompactionRepository;
 
 async function createBoard(label: string): Promise<string> {
   const boardId = (await boards.createBoard(fixtureIds.user, `${label}-${crypto.randomUUID()}`)).id;
@@ -74,7 +80,26 @@ async function durableSummary(boardId: string): Promise<unknown> {
 }
 
 beforeAll(async () => {
-  await pool.query("SELECT 1");
+  databaseName = `converge_compaction_candidates_${process.pid}_${crypto
+    .randomUUID()
+    .replaceAll("-", "")
+    .slice(0, 10)}`;
+  const adminUrl = new URL(sharedDatabaseUrl);
+  adminUrl.pathname = "/postgres";
+  adminPool = createPool(adminUrl.toString());
+  await adminPool.query(`CREATE DATABASE "${databaseName}"`);
+  const isolatedUrl = new URL(sharedDatabaseUrl);
+  isolatedUrl.pathname = `/${databaseName}`;
+  await runFile("pnpm", ["--filter", "@converge/database", "migrate"], {
+    cwd: repositoryRoot,
+    env: { ...process.env, DATABASE_URL: isolatedUrl.toString() },
+    maxBuffer: 1024 * 1024,
+  });
+  pool = createPool(isolatedUrl.toString());
+  boards = new BoardRepository(pool);
+  snapshots = new BoardSnapshotRepository(pool);
+  discovery = new BoardCompactionCandidateRepository(pool);
+  compaction = new BoardCompactionRepository(pool);
   const migration = await pool.query<{ name: string }>(
     "SELECT name FROM converge_migrations ORDER BY name DESC LIMIT 1",
   );
@@ -88,7 +113,16 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-  await pool.end();
+  try {
+    await pool?.end();
+  } finally {
+    try {
+      if (adminPool && databaseName)
+        await adminPool.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+    } finally {
+      await adminPool?.end();
+    }
+  }
 });
 
 describe("bounded compaction candidate discovery", () => {

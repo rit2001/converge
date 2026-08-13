@@ -1955,7 +1955,7 @@ describe.sequential("M2.5 distributed membership revocation across API replicas"
     });
   });
 
-  it("lets API B enforce revocation while API A's consumer is stopped", async () => {
+  it("lets API B enforce revocation while API A's delivery runtime is stopped", async () => {
     await withUnhandledRejectionAudit(async () => {
       const topology = await TestTopology.create({}, "m25");
       const boardId = await topology.createBoard();
@@ -1975,7 +1975,7 @@ describe.sequential("M2.5 distributed membership revocation across API replicas"
       ]);
 
       expect(roomHas(topology.apiB, boardId, editorB)).toBe(false);
-      expect(roomHas(topology.apiA, boardId, editorA)).toBe(true);
+      expect(roomHas(topology.apiA, boardId, editorA)).toBe(false);
       expect(editorA.revocations.entries).toEqual([]);
       expect(topology.apiA.evidence.consumer?.lastHandledCursor).toBe(stoppedCursor);
       expect(topology.apiB.evidence.consumer?.lastHandledCursor).toBe(published.redisEntryId);
