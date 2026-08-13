@@ -5,4 +5,5 @@ export * from "./lifecycle.js";
 export * from "./logger.js";
 export * from "./redis-stream.js";
 export * from "./snapshot-coordinator.js";
+export * from "./telemetry.js";
 export * from "./worker.js";

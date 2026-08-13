@@ -5,6 +5,7 @@ import type {
   BoardCompactionCandidateDiscoveryResult,
   BoardCompactionResult,
 } from "@converge/database";
+import { InMemoryTelemetryRecorder } from "@converge/observability";
 import {
   CompactionCoordinator,
   CompactionCoordinatorConfigurationError,
@@ -184,6 +185,7 @@ function configuration(
 function harness(
   overrides: Partial<CompactionCoordinatorConfiguration> = {},
   randomValues: number[] = [],
+  telemetry = new InMemoryTelemetryRecorder(),
 ) {
   const candidates = new FakeCandidates();
   const compaction = new FakeCompaction();
@@ -198,9 +200,11 @@ function harness(
     clock: { now: () => scheduler.currentTime },
     random: { next: () => randomValues[randomIndex++] ?? 0.5 },
     scheduler,
+    telemetry,
+    telemetryClock: { now: () => scheduler.currentTime },
     hooks: { compacted: success, blocked: blockedHook },
   });
-  return { coordinator, candidates, compaction, scheduler, success, blockedHook };
+  return { coordinator, candidates, compaction, scheduler, success, blockedHook, telemetry };
 }
 
 async function startAndFinish(state: ReturnType<typeof harness>): Promise<void> {
@@ -234,6 +238,11 @@ describe("standalone compaction coordinator", () => {
     const first = state.coordinator.runCycle();
     expect(state.coordinator.runCycle()).toBe(first);
     expect(state.candidates.calls).toHaveLength(1);
+    expect(
+      state.telemetry
+        .snapshot()
+        .gauges.find(({ name }) => name === "converge_compaction_active_work")?.value,
+    ).toBe(0);
     pending.resolve(discovery());
     await first;
     await flush();
@@ -252,6 +261,11 @@ describe("standalone compaction coordinator", () => {
     await flush();
     expect(state.compaction.calls).toEqual(boardIds.slice(0, 2));
     expect(state.coordinator.diagnostics.activeCompactions).toBe(2);
+    expect(
+      state.telemetry
+        .snapshot()
+        .gauges.find(({ name }) => name === "converge_compaction_active_work")?.value,
+    ).toBe(2);
     pending[0]!.reject(new Error("database unavailable"));
     await flush();
     expect(state.compaction.calls[2]).toBe(boardIds[2]);
@@ -262,6 +276,11 @@ describe("standalone compaction coordinator", () => {
     pending[3]!.resolve(noProgress(values[3]!));
     await state.coordinator.runCycle();
     expect(state.coordinator.diagnostics).toMatchObject({ activeCompactions: 0, retryBoards: 1 });
+    expect(
+      state.telemetry
+        .snapshot()
+        .gauges.find(({ name }) => name === "converge_compaction_active_work")?.value,
+    ).toBe(0);
     await state.coordinator.stop();
   });
 
@@ -338,6 +357,58 @@ describe("standalone compaction coordinator", () => {
     expect(state.compaction.calls).toHaveLength(2);
     expect(state.blockedHook).toHaveBeenCalledTimes(2);
     await state.coordinator.stop();
+  });
+
+  it("maps all five compaction outcomes once with duration and no private fields", async () => {
+    const telemetry = new InMemoryTelemetryRecorder();
+    const value = candidate(0);
+    const outcomes: Array<BoardCompactionResult | Error> = [
+      compacted(value),
+      noProgress(value),
+      { outcome: "no_verified_boundary", boardId: value.boardId },
+      blocked(value),
+      new Error("SELECT secret_floor FROM private_compaction"),
+    ];
+
+    for (const outcome of outcomes) {
+      const state = harness({}, [], telemetry);
+      state.candidates.implementation = () => Promise.resolve(discovery([value]));
+      state.compaction.implementation = () => {
+        state.scheduler.currentTime += 200;
+        return outcome instanceof Error ? Promise.reject(outcome) : Promise.resolve(outcome);
+      };
+      await startAndFinish(state);
+      await state.coordinator.stop();
+    }
+
+    const snapshot = telemetry.snapshot();
+    expect(
+      snapshot.counters
+        .filter(({ name }) => name === "converge_compaction_runs_total")
+        .map(({ labels, value: count }) => ({ ...labels, value: count })),
+    ).toEqual([
+      { outcome: "blocked", value: 1 },
+      { outcome: "compacted", value: 1 },
+      { outcome: "no_boundary", value: 1 },
+      { outcome: "no_progress", value: 1 },
+      { outcome: "transient_failure", value: 1 },
+    ]);
+    expect(
+      snapshot.histograms.find(({ name }) => name === "converge_compaction_duration_seconds"),
+    ).toMatchObject({ count: 5, sum: 1 });
+    expect(snapshot.events.map(({ code }) => code)).toEqual([
+      "COMPACTED",
+      "NO_PROGRESS",
+      "NO_BOUNDARY",
+      "BLOCKED",
+      "TRANSIENT_FAILURE",
+    ]);
+    expect(
+      snapshot.gauges.find(({ name }) => name === "converge_compaction_active_work")?.value,
+    ).toBe(0);
+    expect(JSON.stringify(snapshot)).not.toMatch(
+      /10000000-0000-4000|50000000-0000-4000|SELECT|private|secret|payload/i,
+    );
   });
 
   it("applies full-jitter exponential retry through the cap", async () => {
@@ -445,9 +516,11 @@ describe("standalone compaction coordinator", () => {
     const stopping = state.coordinator.stop();
     await state.scheduler.advanceBy(100);
     await stopping;
+    const fenced = state.telemetry.snapshot();
     pending.resolve(blocked(value));
     await flush();
     expect(state.blockedHook).not.toHaveBeenCalled();
+    expect(state.telemetry.snapshot()).toEqual(fenced);
     expect(state.scheduler.pendingTasks).toBe(0);
     expect(state.coordinator.diagnostics).toMatchObject({
       lifecycle: "stopped",

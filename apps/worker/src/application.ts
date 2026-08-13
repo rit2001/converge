@@ -6,7 +6,12 @@ import {
   createPool,
   type DatabasePool,
 } from "@converge/database";
-import type { StructuredLogger } from "@converge/observability";
+import {
+  noOpTelemetryRecorder,
+  safeTelemetryRecorder,
+  type StructuredLogger,
+  type TelemetryRecorder,
+} from "@converge/observability";
 import type { WorkerEnvironment } from "./env.js";
 import {
   CompactionCoordinator,
@@ -20,6 +25,7 @@ import {
   SnapshotCoordinator,
   type SnapshotCoordinatorConfiguration,
 } from "./snapshot-coordinator.js";
+import { systemWorkerTelemetryClock, type WorkerTelemetryClock } from "./telemetry.js";
 import {
   OutboxWorker,
   systemWorkerScheduler,
@@ -56,6 +62,8 @@ export interface WorkerApplicationFactories {
     database: WorkerApplicationDatabase;
     configuration: SnapshotCoordinatorConfiguration;
     logger: StructuredLogger;
+    telemetry: TelemetryRecorder;
+    telemetryClock: WorkerTelemetryClock;
   }): SnapshotCoordinatorComponent;
   createCompactionCandidateRepository(
     database: WorkerApplicationDatabase,
@@ -68,6 +76,8 @@ export interface WorkerApplicationFactories {
     compaction: CompactionExecutionRepository;
     configuration: CompactionCoordinatorConfiguration;
     logger: StructuredLogger;
+    telemetry: TelemetryRecorder;
+    telemetryClock: WorkerTelemetryClock;
   }): CompactionCoordinatorComponent;
   createStream(input: { environment: WorkerEnvironment; logger: StructuredLogger }): DeliveryStream;
   createOutboxPublisher(input: {
@@ -75,6 +85,8 @@ export interface WorkerApplicationFactories {
     stream: DeliveryStream;
     configuration: OutboxWorkerConfiguration;
     logger: StructuredLogger;
+    telemetry: TelemetryRecorder;
+    telemetryClock: WorkerTelemetryClock;
   }): OutboxPublisherComponent;
   reconnectScheduler: Pick<WorkerScheduler, "sleep">;
 }
@@ -82,10 +94,12 @@ export interface WorkerApplicationFactories {
 const productionWorkerApplicationFactories: WorkerApplicationFactories = {
   createLogger: createWorkerLogger,
   createDatabase: createPool,
-  createSnapshotCoordinator: ({ database, configuration, logger }) =>
+  createSnapshotCoordinator: ({ database, configuration, logger, telemetry, telemetryClock }) =>
     new SnapshotCoordinator({
       repository: new BoardSnapshotCandidateRepository(database as DatabasePool),
       configuration,
+      telemetry,
+      telemetryClock,
       hooks: {
         captured: (snapshot) =>
           logger.info(
@@ -103,11 +117,20 @@ const productionWorkerApplicationFactories: WorkerApplicationFactories = {
     new BoardCompactionCandidateRepository(database as DatabasePool),
   createBoardCompactionRepository: (database) =>
     new BoardCompactionRepository(database as DatabasePool),
-  createCompactionCoordinator: ({ candidates, compaction, configuration, logger }) =>
+  createCompactionCoordinator: ({
+    candidates,
+    compaction,
+    configuration,
+    logger,
+    telemetry,
+    telemetryClock,
+  }) =>
     new CompactionCoordinator({
       candidates,
       compaction,
       configuration,
+      telemetry,
+      telemetryClock,
       hooks: {
         compacted: (result) =>
           logger.info(
@@ -129,8 +152,17 @@ const productionWorkerApplicationFactories: WorkerApplicationFactories = {
       environment.REDIS_STREAM_MAX_AGE_MS,
       logger,
     ),
-  createOutboxPublisher: ({ database, stream, configuration, logger }) =>
-    new OutboxWorker(new OutboxRepository(database as DatabasePool), stream, configuration, logger),
+  createOutboxPublisher: ({ database, stream, configuration, logger, telemetry, telemetryClock }) =>
+    new OutboxWorker(
+      new OutboxRepository(database as DatabasePool),
+      stream,
+      configuration,
+      logger,
+      undefined,
+      undefined,
+      telemetry,
+      telemetryClock,
+    ),
   reconnectScheduler: systemWorkerScheduler,
 };
 
@@ -143,6 +175,9 @@ export class WorkerApplication {
   private outboxRun: Promise<void> | undefined;
   private redisRun: Promise<void> | undefined;
   private stopping = false;
+  private readonly telemetry: TelemetryRecorder;
+  private lifecycle: "idle" | "starting" | "ready" | "startup_failed" | "stopping" | "stopped" =
+    "idle";
 
   constructor(
     private readonly database: WorkerApplicationDatabase,
@@ -154,7 +189,10 @@ export class WorkerApplication {
     private readonly shutdownGraceMs: number,
     private readonly logger: StructuredLogger,
     private readonly reconnectScheduler: Pick<WorkerScheduler, "sleep">,
-  ) {}
+    telemetry: TelemetryRecorder = noOpTelemetryRecorder,
+  ) {
+    this.telemetry = safeTelemetryRecorder(telemetry);
+  }
 
   start(): Promise<void> {
     this.startPromise ??= this.startOnce();
@@ -172,6 +210,7 @@ export class WorkerApplication {
   }
 
   private async startOnce(): Promise<void> {
+    this.transitionLifecycle("starting");
     try {
       await this.database.query("SELECT 1");
       if (this.stopping) return;
@@ -181,7 +220,9 @@ export class WorkerApplication {
       if (this.stopping) return;
       this.outboxRun = this.runOutbox();
       this.redisRun = this.maintainRedisConnection();
+      this.transitionLifecycle("ready");
     } catch (error) {
+      this.transitionLifecycle("startup_failed");
       await this.shutdown("PROCESS_END");
       throw error;
     }
@@ -224,6 +265,7 @@ export class WorkerApplication {
 
   private async shutdownOnce(signal: WorkerShutdownSignal): Promise<void> {
     this.stopping = true;
+    this.transitionLifecycle("stopping");
     this.outbox.stopTakingClaims();
     this.controller.abort();
     const [snapshotResult, compactionResult, outboxResult] = await Promise.allSettled([
@@ -242,8 +284,27 @@ export class WorkerApplication {
     try {
       await this.stream.close(!drained);
     } finally {
-      await this.database.end();
+      try {
+        await this.database.end();
+      } finally {
+        this.transitionLifecycle("stopped");
+      }
     }
+  }
+
+  private transitionLifecycle(
+    next: "starting" | "ready" | "startup_failed" | "stopping" | "stopped",
+  ): void {
+    if (this.lifecycle === next || this.lifecycle === "stopped") return;
+    this.lifecycle = next;
+    this.telemetry.emit({
+      schemaVersion: 1,
+      eventName: "worker.lifecycle",
+      severity: next === "startup_failed" ? "error" : "info",
+      component: "worker",
+      timestamp: new Date().toISOString(),
+      code: next.toUpperCase(),
+    });
   }
 }
 
@@ -298,8 +359,14 @@ function outboxConfiguration(environment: WorkerEnvironment): OutboxWorkerConfig
 export async function createWorkerApplication(
   environment: WorkerEnvironment,
   overrides: Partial<WorkerApplicationFactories> = {},
+  options: {
+    telemetry?: TelemetryRecorder;
+    telemetryClock?: WorkerTelemetryClock;
+  } = {},
 ): Promise<WorkerApplication> {
   const factories = { ...productionWorkerApplicationFactories, ...overrides };
+  const telemetry = options.telemetry ?? noOpTelemetryRecorder;
+  const telemetryClock = options.telemetryClock ?? systemWorkerTelemetryClock;
   const logger = factories.createLogger(environment.LOG_LEVEL);
   let database: WorkerApplicationDatabase | undefined;
   let snapshots: SnapshotCoordinatorComponent | undefined;
@@ -311,6 +378,8 @@ export async function createWorkerApplication(
       database,
       configuration: snapshotConfiguration(environment),
       logger,
+      telemetry,
+      telemetryClock,
     });
     if (environment.COMPACTION_ENABLED) {
       const candidates = factories.createCompactionCandidateRepository(database);
@@ -320,6 +389,8 @@ export async function createWorkerApplication(
         compaction: boardCompaction,
         configuration: compactionConfiguration(environment),
         logger,
+        telemetry,
+        telemetryClock,
       });
     }
     stream = factories.createStream({ environment, logger });
@@ -328,6 +399,8 @@ export async function createWorkerApplication(
       stream,
       configuration: outboxConfiguration(environment),
       logger,
+      telemetry,
+      telemetryClock,
     });
     return new WorkerApplication(
       database,
@@ -339,6 +412,7 @@ export async function createWorkerApplication(
       environment.WORKER_SHUTDOWN_GRACE_MS,
       logger,
       factories.reconnectScheduler,
+      telemetry,
     );
   } catch (error) {
     await Promise.allSettled([

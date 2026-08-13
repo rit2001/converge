@@ -6,6 +6,7 @@ import type {
   SnapshotCaptureOptions,
   SnapshotCaptureOutcome,
 } from "@converge/database";
+import { InMemoryTelemetryRecorder } from "@converge/observability";
 import {
   SnapshotCoordinator,
   SnapshotCoordinatorConfigurationError,
@@ -135,6 +136,7 @@ function configuration(
 function harness(
   overrides: Partial<SnapshotCoordinatorConfiguration> = {},
   randomValues: number[] = [],
+  telemetry = new InMemoryTelemetryRecorder(),
 ) {
   const repository = new FakeRepository();
   const scheduler = new FakeScheduler();
@@ -147,9 +149,11 @@ function harness(
     clock: { now: () => scheduler.currentTime },
     random: { next: () => randomValues[randomIndex++] ?? 0.5 },
     scheduler,
+    telemetry,
+    telemetryClock: { now: () => scheduler.currentTime },
     hooks: { captured, deterministicFailure },
   });
-  return { coordinator, repository, scheduler, captured, deterministicFailure };
+  return { coordinator, repository, scheduler, captured, deterministicFailure, telemetry };
 }
 
 async function startAndFinishFirstCycle(state: ReturnType<typeof harness>): Promise<void> {
@@ -194,6 +198,10 @@ describe("snapshot coordinator", () => {
 
     expect(first).toBe(second);
     expect(state.repository.discoverCalls).toHaveLength(1);
+    expect(
+      state.telemetry.snapshot().gauges.find(({ name }) => name === "converge_snapshot_active_work")
+        ?.value,
+    ).toBe(0);
     pending.resolve(discovery());
     await first;
     await flush();
@@ -218,6 +226,10 @@ describe("snapshot coordinator", () => {
       boardIds[1],
     ]);
     expect(state.coordinator.diagnostics.activeCaptures).toBe(2);
+    expect(
+      state.telemetry.snapshot().gauges.find(({ name }) => name === "converge_snapshot_active_work")
+        ?.value,
+    ).toBe(2);
 
     pending[0]!.reject(new Error("database unavailable"));
     await flush();
@@ -229,6 +241,10 @@ describe("snapshot coordinator", () => {
     pending[3]!.resolve({ status: "no_longer_eligible" });
     await state.coordinator.runCycle();
     expect(state.coordinator.diagnostics.activeCaptures).toBe(0);
+    expect(
+      state.telemetry.snapshot().gauges.find(({ name }) => name === "converge_snapshot_active_work")
+        ?.value,
+    ).toBe(0);
     expect(state.coordinator.diagnostics.retryBoards).toBe(1);
     await state.coordinator.stop();
   });
@@ -311,6 +327,62 @@ describe("snapshot coordinator", () => {
     expect(state.repository.captureCalls).toHaveLength(2);
     expect(state.deterministicFailure).toHaveBeenCalledTimes(2);
     await state.coordinator.stop();
+  });
+
+  it("maps all five capture outcomes once with duration and no private fields", async () => {
+    const telemetry = new InMemoryTelemetryRecorder();
+    const outcomes: Array<SnapshotCaptureOutcome | Error> = [
+      {
+        status: "captured",
+        snapshotId: "50000000-0000-4000-8000-000000000099",
+        canvasHead: 10,
+        deliveryHead: 10,
+      },
+      { status: "busy" },
+      { status: "no_longer_eligible" },
+      { status: "deterministic_failure", code: "SNAPSHOT_TOO_LARGE" },
+      new Error("SELECT secret_snapshot_payload FROM private_table"),
+    ];
+
+    for (const outcome of outcomes) {
+      const state = harness({}, [], telemetry);
+      state.repository.discoverImplementation = () => Promise.resolve(discovery([candidate(0)]));
+      state.repository.captureImplementation = () => {
+        state.scheduler.currentTime += 250;
+        return outcome instanceof Error ? Promise.reject(outcome) : Promise.resolve(outcome);
+      };
+      await startAndFinishFirstCycle(state);
+      await state.coordinator.stop();
+    }
+
+    const snapshot = telemetry.snapshot();
+    expect(
+      snapshot.counters
+        .filter(({ name }) => name === "converge_snapshot_runs_total")
+        .map(({ labels, value }) => ({ ...labels, value })),
+    ).toEqual([
+      { outcome: "busy", value: 1 },
+      { outcome: "captured", value: 1 },
+      { outcome: "deterministic_failure", value: 1 },
+      { outcome: "no_progress", value: 1 },
+      { outcome: "transient_failure", value: 1 },
+    ]);
+    expect(
+      snapshot.histograms.find(({ name }) => name === "converge_snapshot_duration_seconds"),
+    ).toMatchObject({ count: 5, sum: 1.25 });
+    expect(snapshot.events.map(({ code }) => code)).toEqual([
+      "CAPTURED",
+      "BUSY",
+      "NO_PROGRESS",
+      "DETERMINISTIC_FAILURE",
+      "TRANSIENT_FAILURE",
+    ]);
+    expect(
+      snapshot.gauges.find(({ name }) => name === "converge_snapshot_active_work")?.value,
+    ).toBe(0);
+    expect(JSON.stringify(snapshot)).not.toMatch(
+      /10000000-0000-4000|50000000-0000-4000|SELECT|private|secret|payload/i,
+    );
   });
 
   it("bounds suppression, retry, and cooldown maps with deterministic LRU eviction", async () => {
@@ -405,6 +477,7 @@ describe("snapshot coordinator", () => {
     const stopping = state.coordinator.stop();
     await state.scheduler.advanceBy(100);
     await stopping;
+    const fenced = state.telemetry.snapshot();
     pending.resolve({
       status: "captured",
       snapshotId: crypto.randomUUID(),
@@ -414,6 +487,7 @@ describe("snapshot coordinator", () => {
     await flush();
 
     expect(state.captured).not.toHaveBeenCalled();
+    expect(state.telemetry.snapshot()).toEqual(fenced);
     expect(state.scheduler.pendingTasks).toBe(0);
     expect(state.coordinator.diagnostics).toMatchObject({
       lifecycle: "stopped",

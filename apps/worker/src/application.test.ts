@@ -1,5 +1,6 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import type { StructuredLogger } from "@converge/observability";
+import { InMemoryTelemetryRecorder, type StructuredLogger } from "@converge/observability";
 import type { DeliveryStreamFields } from "@converge/protocol";
 import {
   createWorkerApplication,
@@ -282,8 +283,11 @@ function harness(stream = new FakeStream(), compactionEnabled = false) {
 describe("worker application supervision", () => {
   it("starts snapshots before Redis and runs both components when Redis is ready", async () => {
     const state = harness();
+    const telemetry = new InMemoryTelemetryRecorder();
     state.stream.connectOutcomes.push("ready");
-    const application = await createWorkerApplication(state.environment, state.factories);
+    const application = await createWorkerApplication(state.environment, state.factories, {
+      telemetry,
+    });
 
     await application.start();
     await flush();
@@ -304,6 +308,43 @@ describe("worker application supervision", () => {
       maximumPayloadBytes: 16_777_216,
       shutdownGraceMs: 10_000,
     });
+    await application.shutdown("PROCESS_END");
+    await application.shutdown("SIGTERM");
+    expect(
+      telemetry
+        .snapshot()
+        .events.filter(({ eventName }) => eventName === "worker.lifecycle")
+        .map(({ code }) => code),
+    ).toEqual(["STARTING", "READY", "STOPPING", "STOPPED"]);
+  });
+
+  it("passes one injected recorder to every configured component and production owns 1,000 events", async () => {
+    const state = harness(new FakeStream(), true);
+    const telemetry = new InMemoryTelemetryRecorder();
+    const observed: unknown[] = [];
+    const snapshotFactory = state.factories.createSnapshotCoordinator!;
+    const compactionFactory = state.factories.createCompactionCoordinator!;
+    const outboxFactory = state.factories.createOutboxPublisher!;
+    state.factories.createSnapshotCoordinator = (input) => {
+      observed.push(input.telemetry);
+      return snapshotFactory(input);
+    };
+    state.factories.createCompactionCoordinator = (input) => {
+      observed.push(input.telemetry);
+      return compactionFactory(input);
+    };
+    state.factories.createOutboxPublisher = (input) => {
+      observed.push(input.telemetry);
+      return outboxFactory(input);
+    };
+
+    const application = await createWorkerApplication(state.environment, state.factories, {
+      telemetry,
+    });
+    expect(observed).toEqual([telemetry, telemetry, telemetry]);
+    expect(readFileSync(new URL("./server.ts", import.meta.url), "utf8")).toContain(
+      "new InMemoryTelemetryRecorder(1_000)",
+    );
     await application.shutdown("PROCESS_END");
   });
 
@@ -341,8 +382,11 @@ describe("worker application supervision", () => {
 
   it("keeps snapshots running and outbox claims at zero across Redis startup failure", async () => {
     const state = harness(new FakeStream(), true);
+    const telemetry = new InMemoryTelemetryRecorder();
     state.stream.connectOutcomes.push(new Error("redis unavailable"));
-    const application = await createWorkerApplication(state.environment, state.factories);
+    const application = await createWorkerApplication(state.environment, state.factories, {
+      telemetry,
+    });
 
     await application.start();
     await flush();
@@ -358,6 +402,12 @@ describe("worker application supervision", () => {
     expect(JSON.stringify((logger.warn as ReturnType<typeof vi.fn>).mock.calls)).not.toContain(
       "redis unavailable",
     );
+    expect(
+      telemetry
+        .snapshot()
+        .events.filter(({ eventName }) => eventName === "worker.lifecycle")
+        .map(({ code }) => code),
+    ).toEqual(["STARTING", "READY"]);
     await application.shutdown("PROCESS_END");
   });
 
@@ -417,8 +467,11 @@ describe("worker application supervision", () => {
 
   it("treats PostgreSQL startup failure as fatal and cleans every resource once", async () => {
     const state = harness(new FakeStream(), true);
+    const telemetry = new InMemoryTelemetryRecorder();
     state.database.queryFailure = new Error("database unavailable");
-    const application = await createWorkerApplication(state.environment, state.factories);
+    const application = await createWorkerApplication(state.environment, state.factories, {
+      telemetry,
+    });
 
     await expect(application.start()).rejects.toThrow("database unavailable");
     expect(state.snapshots.startCalls).toBe(0);
@@ -431,6 +484,12 @@ describe("worker application supervision", () => {
     await application.shutdown("SIGTERM");
     expect(state.stream.closeCalls).toHaveLength(1);
     expect(state.database.endCalls).toBe(1);
+    expect(
+      telemetry
+        .snapshot()
+        .events.filter(({ eventName }) => eventName === "worker.lifecycle")
+        .map(({ code }) => code),
+    ).toEqual(["STARTING", "STARTUP_FAILED", "STOPPING", "STOPPED"]);
   });
 
   it("stops all components within one grace and shares repeated shutdown", async () => {

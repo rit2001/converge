@@ -5,7 +5,12 @@ import type {
   MarkOutboxPublishedInput,
   RecordOutboxFailureInput,
 } from "@converge/database";
-import type { StructuredLogger } from "@converge/observability";
+import {
+  noOpTelemetryRecorder,
+  safeTelemetryRecorder,
+  type StructuredLogger,
+  type TelemetryRecorder,
+} from "@converge/observability";
 import {
   deliveryEnvelopeSchema,
   encodeDeliveryStreamFields,
@@ -17,6 +22,12 @@ import {
   RedisXaddRejectedError,
   type DeliveryStream,
 } from "./redis-stream.js";
+import {
+  systemWorkerTelemetryClock,
+  telemetryDurationSeconds,
+  telemetryNow,
+  type WorkerTelemetryClock,
+} from "./telemetry.js";
 
 export interface OutboxPublicationRepository {
   claimAvailable(options: ClaimOutboxOptions): Promise<ClaimedOutboxEvent[]>;
@@ -179,6 +190,9 @@ export class OutboxWorker {
   private retentionController: AbortController | undefined;
   private acceptingClaims = true;
   private abandoningActiveLeases = false;
+  private readonly telemetry: TelemetryRecorder;
+  private activeTelemetryWork = 0;
+  private telemetryFenced = false;
 
   constructor(
     private readonly repository: OutboxPublicationRepository,
@@ -187,7 +201,12 @@ export class OutboxWorker {
     private readonly logger: StructuredLogger,
     private readonly scheduler: WorkerScheduler = systemWorkerScheduler,
     private readonly hooks: OutboxWorkerHooks = {},
-  ) {}
+    telemetry: TelemetryRecorder = noOpTelemetryRecorder,
+    private readonly telemetryClock: WorkerTelemetryClock = systemWorkerTelemetryClock,
+  ) {
+    this.telemetry = safeTelemetryRecorder(telemetry);
+    this.telemetry.setGauge("converge_outbox_active_work", {}, 0);
+  }
 
   stopTakingClaims(): void {
     this.acceptingClaims = false;
@@ -196,6 +215,9 @@ export class OutboxWorker {
   abandonActiveLeases(): void {
     this.abandoningActiveLeases = true;
     this.retentionController?.abort();
+    this.activeTelemetryWork = 0;
+    this.telemetry.setGauge("converge_outbox_active_work", {}, 0);
+    this.telemetryFenced = true;
   }
 
   async drain(gracePeriodMs: number): Promise<boolean> {
@@ -282,8 +304,14 @@ export class OutboxWorker {
   }
 
   private async publishSafely(claim: ClaimedOutboxEvent): Promise<PublicationOutcome> {
+    const startedAt = telemetryNow(this.telemetryClock);
+    this.activeTelemetryWork += 1;
+    if (!this.telemetryFenced)
+      this.telemetry.setGauge("converge_outbox_active_work", {}, this.activeTelemetryWork);
     try {
-      return await this.publish(claim);
+      const outcome = await this.publish(claim);
+      this.recordPublicationOutcome(outcome, startedAt);
+      return outcome;
     } catch (error) {
       if (error instanceof SimulatedWorkerCrash) throw error;
       this.logger.error(
@@ -291,7 +319,33 @@ export class OutboxWorker {
         "Event publication failed unexpectedly",
       );
       return "unexpected_failure";
+    } finally {
+      this.activeTelemetryWork = Math.max(0, this.activeTelemetryWork - 1);
+      if (!this.telemetryFenced)
+        this.telemetry.setGauge("converge_outbox_active_work", {}, this.activeTelemetryWork);
     }
+  }
+
+  private recordPublicationOutcome(
+    outcome: PublicationOutcome,
+    startedAt: number | undefined,
+  ): void {
+    if (this.telemetryFenced || outcome === "unexpected_failure") return;
+    const metricOutcome = outcome === "retry_scheduled" ? "retry" : outcome;
+    this.telemetry.increment("converge_outbox_publications_total", { outcome: metricOutcome });
+    this.telemetry.observe(
+      "converge_outbox_publication_duration_seconds",
+      {},
+      telemetryDurationSeconds(this.telemetryClock, startedAt),
+    );
+    this.telemetry.emit({
+      schemaVersion: 1,
+      eventName: "outbox.publication.result",
+      severity: metricOutcome === "published" ? "info" : "warn",
+      component: "outbox",
+      timestamp: new Date().toISOString(),
+      code: metricOutcome.toUpperCase(),
+    });
   }
 
   private async publish(claim: ClaimedOutboxEvent): Promise<PublicationOutcome> {

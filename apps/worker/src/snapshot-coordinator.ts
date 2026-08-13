@@ -11,6 +11,17 @@ import {
   type SnapshotCaptureOptions,
   type SnapshotCaptureOutcome,
 } from "@converge/database";
+import {
+  noOpTelemetryRecorder,
+  safeTelemetryRecorder,
+  type TelemetryRecorder,
+} from "@converge/observability";
+import {
+  systemWorkerTelemetryClock,
+  telemetryDurationSeconds,
+  telemetryNow,
+  type WorkerTelemetryClock,
+} from "./telemetry.js";
 
 const TIMER_MAXIMUM_MS = 2_147_483_647;
 
@@ -112,6 +123,8 @@ export interface SnapshotCoordinatorDependencies {
   random?: SnapshotCoordinatorRandomSource;
   scheduler?: SnapshotCoordinatorScheduler;
   hooks?: SnapshotCoordinatorHooks;
+  telemetry?: TelemetryRecorder;
+  telemetryClock?: WorkerTelemetryClock;
 }
 
 export class SnapshotCoordinatorConfigurationError extends Error {
@@ -185,6 +198,8 @@ export class SnapshotCoordinator {
   private readonly random: SnapshotCoordinatorRandomSource;
   private readonly scheduler: SnapshotCoordinatorScheduler;
   private readonly hooks: SnapshotCoordinatorHooks;
+  private readonly telemetry: TelemetryRecorder;
+  private readonly telemetryClock: WorkerTelemetryClock;
   private readonly retries = new Map<string, RetryState>();
   private readonly cooldowns = new Map<string, CooldownState>();
   private readonly suppressions = new Map<string, SuppressionState>();
@@ -199,6 +214,8 @@ export class SnapshotCoordinator {
   private generation = 0;
   private ordinal = 0;
   private resultsFenced = false;
+  private activeTelemetryWork = 0;
+  private telemetryFenced = false;
 
   constructor(dependencies: SnapshotCoordinatorDependencies) {
     this.repository = dependencies.repository;
@@ -208,7 +225,10 @@ export class SnapshotCoordinator {
     this.random = dependencies.random ?? systemSnapshotCoordinatorRandomSource;
     this.scheduler = dependencies.scheduler ?? systemSnapshotCoordinatorScheduler;
     this.hooks = dependencies.hooks ?? {};
+    this.telemetry = safeTelemetryRecorder(dependencies.telemetry ?? noOpTelemetryRecorder);
+    this.telemetryClock = dependencies.telemetryClock ?? systemWorkerTelemetryClock;
     validateConfiguration(this.configuration);
+    this.telemetry.setGauge("converge_snapshot_active_work", {}, 0);
   }
 
   get diagnostics(): Readonly<{
@@ -249,6 +269,7 @@ export class SnapshotCoordinator {
     if (this.lifecycle === "idle") {
       this.clearRetainedState();
       this.resultsFenced = true;
+      this.fenceTelemetry();
       this.lifecycle = "stopped";
       this.stopPromise = Promise.resolve();
       return this.stopPromise;
@@ -330,53 +351,102 @@ export class SnapshotCoordinator {
   }
 
   private async captureCandidate(candidate: SnapshotCandidate, generation: number): Promise<void> {
-    let outcome: SnapshotCaptureOutcome;
+    let startedAt: number | undefined;
+    let telemetryActive = false;
     try {
-      outcome = await this.repository.capture(candidate.boardId, {
-        operationThreshold: this.configuration.operationThreshold,
-        changedAgeMs: this.configuration.changedAgeMs,
-        operationBytesThreshold: this.configuration.operationBytesThreshold,
-        maximumPayloadBytes: this.configuration.maximumPayloadBytes,
-        currentTime: new Date(this.currentTime()),
-      });
-    } catch {
-      if (this.canAcceptResult(generation))
-        this.recordTransientFailure(candidate, this.currentTime());
-      return;
-    }
-    if (!this.canAcceptResult(generation)) return;
+      let outcome: SnapshotCaptureOutcome;
+      try {
+        const options = {
+          operationThreshold: this.configuration.operationThreshold,
+          changedAgeMs: this.configuration.changedAgeMs,
+          operationBytesThreshold: this.configuration.operationBytesThreshold,
+          maximumPayloadBytes: this.configuration.maximumPayloadBytes,
+          currentTime: new Date(this.currentTime()),
+        };
+        startedAt = telemetryNow(this.telemetryClock);
+        this.beginTelemetryWork();
+        telemetryActive = true;
+        outcome = await this.repository.capture(candidate.boardId, options);
+      } catch {
+        if (this.canAcceptResult(generation)) {
+          this.recordTransientFailure(candidate, this.currentTime());
+          if (telemetryActive) this.recordTelemetryOutcome("transient_failure", startedAt);
+        }
+        return;
+      }
+      if (!this.canAcceptResult(generation)) return;
 
-    switch (outcome.status) {
-      case "captured":
-        this.clearBoardState(candidate.boardId);
-        await this.invokeHook(() =>
-          this.hooks.captured?.({
-            boardId: candidate.boardId,
-            snapshotId: outcome.snapshotId,
-            canvasHead: outcome.canvasHead,
-            deliveryHead: outcome.deliveryHead,
-          }),
-        );
-        return;
-      case "busy":
-        this.recordBusy(candidate, this.currentTime());
-        return;
-      case "no_longer_eligible":
-        this.clearBoardState(candidate.boardId);
-        return;
-      case "deterministic_failure":
-        this.retries.delete(candidate.boardId);
-        this.cooldowns.delete(candidate.boardId);
-        this.recordSuppression(candidate);
-        await this.invokeHook(() =>
-          this.hooks.deterministicFailure?.({
-            boardId: candidate.boardId,
-            canvasHead: candidate.canvasHead,
-            deliveryHead: candidate.deliveryHead,
-            code: outcome.code,
-          }),
-        );
+      switch (outcome.status) {
+        case "captured":
+          this.clearBoardState(candidate.boardId);
+          this.recordTelemetryOutcome("captured", startedAt);
+          await this.invokeHook(() =>
+            this.hooks.captured?.({
+              boardId: candidate.boardId,
+              snapshotId: outcome.snapshotId,
+              canvasHead: outcome.canvasHead,
+              deliveryHead: outcome.deliveryHead,
+            }),
+          );
+          return;
+        case "busy":
+          this.recordBusy(candidate, this.currentTime());
+          this.recordTelemetryOutcome("busy", startedAt);
+          return;
+        case "no_longer_eligible":
+          this.clearBoardState(candidate.boardId);
+          this.recordTelemetryOutcome("no_progress", startedAt);
+          return;
+        case "deterministic_failure":
+          this.retries.delete(candidate.boardId);
+          this.cooldowns.delete(candidate.boardId);
+          this.recordSuppression(candidate);
+          this.recordTelemetryOutcome("deterministic_failure", startedAt);
+          await this.invokeHook(() =>
+            this.hooks.deterministicFailure?.({
+              boardId: candidate.boardId,
+              canvasHead: candidate.canvasHead,
+              deliveryHead: candidate.deliveryHead,
+              code: outcome.code,
+            }),
+          );
+      }
+    } finally {
+      if (telemetryActive) this.finishTelemetryWork();
     }
+  }
+
+  private beginTelemetryWork(): void {
+    this.activeTelemetryWork += 1;
+    if (!this.telemetryFenced)
+      this.telemetry.setGauge("converge_snapshot_active_work", {}, this.activeTelemetryWork);
+  }
+
+  private finishTelemetryWork(): void {
+    this.activeTelemetryWork = Math.max(0, this.activeTelemetryWork - 1);
+    if (!this.telemetryFenced)
+      this.telemetry.setGauge("converge_snapshot_active_work", {}, this.activeTelemetryWork);
+  }
+
+  private recordTelemetryOutcome(
+    outcome: "captured" | "busy" | "no_progress" | "deterministic_failure" | "transient_failure",
+    startedAt: number | undefined,
+  ): void {
+    if (this.telemetryFenced) return;
+    this.telemetry.increment("converge_snapshot_runs_total", { outcome });
+    this.telemetry.observe(
+      "converge_snapshot_duration_seconds",
+      {},
+      telemetryDurationSeconds(this.telemetryClock, startedAt),
+    );
+    this.telemetry.emit({
+      schemaVersion: 1,
+      eventName: "snapshot.capture.result",
+      severity: outcome === "captured" || outcome === "no_progress" ? "info" : "warn",
+      component: "snapshot",
+      timestamp: new Date().toISOString(),
+      code: outcome.toUpperCase(),
+    });
   }
 
   private shouldSkip(candidate: SnapshotCandidate, currentTime: number): boolean {
@@ -517,6 +587,7 @@ export class SnapshotCoordinator {
       this.graceTimer = undefined;
     }
     this.resultsFenced = true;
+    this.fenceTelemetry();
     this.lifecycle = "stopped";
     this.generation += 1;
     this.cyclePromise = undefined;
@@ -524,6 +595,13 @@ export class SnapshotCoordinator {
     const finish = this.finishStop;
     this.finishStop = undefined;
     finish?.();
+  }
+
+  private fenceTelemetry(): void {
+    if (this.telemetryFenced) return;
+    this.activeTelemetryWork = 0;
+    this.telemetry.setGauge("converge_snapshot_active_work", {}, 0);
+    this.telemetryFenced = true;
   }
 
   private clearRetainedState(): void {

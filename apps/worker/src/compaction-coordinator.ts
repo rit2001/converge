@@ -6,6 +6,17 @@ import {
   type BoardCompactionCandidateDiscoveryResult,
   type BoardCompactionResult,
 } from "@converge/database";
+import {
+  noOpTelemetryRecorder,
+  safeTelemetryRecorder,
+  type TelemetryRecorder,
+} from "@converge/observability";
+import {
+  systemWorkerTelemetryClock,
+  telemetryDurationSeconds,
+  telemetryNow,
+  type WorkerTelemetryClock,
+} from "./telemetry.js";
 
 const TIMER_MAXIMUM_MS = 2_147_483_647;
 
@@ -112,6 +123,8 @@ export interface CompactionCoordinatorDependencies {
   random?: CompactionCoordinatorRandomSource;
   scheduler?: CompactionCoordinatorScheduler;
   hooks?: CompactionCoordinatorHooks;
+  telemetry?: TelemetryRecorder;
+  telemetryClock?: WorkerTelemetryClock;
 }
 
 export class CompactionCoordinatorConfigurationError extends Error {
@@ -181,6 +194,8 @@ export class CompactionCoordinator {
   private readonly random: CompactionCoordinatorRandomSource;
   private readonly scheduler: CompactionCoordinatorScheduler;
   private readonly hooks: CompactionCoordinatorHooks;
+  private readonly telemetry: TelemetryRecorder;
+  private readonly telemetryClock: WorkerTelemetryClock;
   private readonly retries = new Map<string, RetryState>();
   private readonly blocked = new Map<string, BlockedState>();
   private readonly activeCompactions = new Set<Promise<void>>();
@@ -194,6 +209,8 @@ export class CompactionCoordinator {
   private generation = 0;
   private ordinal = 0;
   private resultsFenced = false;
+  private activeTelemetryWork = 0;
+  private telemetryFenced = false;
 
   constructor(dependencies: CompactionCoordinatorDependencies) {
     this.candidates = dependencies.candidates;
@@ -204,7 +221,10 @@ export class CompactionCoordinator {
     this.random = dependencies.random ?? systemCompactionCoordinatorRandomSource;
     this.scheduler = dependencies.scheduler ?? systemCompactionCoordinatorScheduler;
     this.hooks = dependencies.hooks ?? {};
+    this.telemetry = safeTelemetryRecorder(dependencies.telemetry ?? noOpTelemetryRecorder);
+    this.telemetryClock = dependencies.telemetryClock ?? systemWorkerTelemetryClock;
     validateConfiguration(this.configuration);
+    this.telemetry.setGauge("converge_compaction_active_work", {}, 0);
   }
 
   get diagnostics(): Readonly<{
@@ -242,6 +262,7 @@ export class CompactionCoordinator {
     if (this.stopPromise) return this.stopPromise;
     if (this.lifecycle === "idle") {
       this.resultsFenced = true;
+      this.fenceTelemetry();
       this.lifecycle = "stopped";
       this.clearRetainedState();
       this.stopPromise = Promise.resolve();
@@ -329,52 +350,99 @@ export class CompactionCoordinator {
     candidate: BoardCompactionCandidate,
     generation: number,
   ): Promise<void> {
-    let result: BoardCompactionResult;
+    const startedAt = telemetryNow(this.telemetryClock);
+    this.beginTelemetryWork();
     try {
-      result = await this.compaction.compact(candidate.boardId);
-    } catch {
-      if (this.canAcceptResult(generation))
-        this.recordTransientFailure(candidate, this.currentTime());
-      return;
-    }
-    if (!this.canAcceptResult(generation)) return;
-    switch (result.outcome) {
-      case "compacted":
-        this.clearBoardState(candidate.boardId);
-        await this.invokeHook(() =>
-          this.hooks.compacted?.({
-            boardId: result.boardId,
-            snapshotId: result.snapshotId,
-            snapshotCanvasSeq: result.snapshotCanvasSeq,
-            snapshotDeliverySeq: result.snapshotDeliverySeq,
-            previousOperationFloor: result.previousOperationFloor,
-            newOperationFloor: result.newOperationFloor,
-            previousDeliveryFloor: result.previousDeliveryFloor,
-            newDeliveryFloor: result.newDeliveryFloor,
-            deletedOperationCount: result.deletedOperationCount,
-            deletedOutboxCount: result.deletedOutboxCount,
-          }),
-        );
+      let result: BoardCompactionResult;
+      try {
+        result = await this.compaction.compact(candidate.boardId);
+      } catch {
+        if (this.canAcceptResult(generation)) {
+          this.recordTransientFailure(candidate, this.currentTime());
+          this.recordTelemetryOutcome("transient_failure", startedAt);
+        }
         return;
-      case "no_progress":
-      case "no_verified_boundary":
-        this.clearBoardState(candidate.boardId);
-        return;
-      case "blocked":
-        this.retries.delete(candidate.boardId);
-        this.recordBlocked(candidate);
-        await this.invokeHook(() =>
-          this.hooks.blocked?.({
-            boardId: candidate.boardId,
-            snapshotId: candidate.snapshotId,
-            snapshotCanvasSeq: candidate.snapshotCanvasSeq,
-            snapshotDeliverySeq: candidate.snapshotDeliverySeq,
-            operationRecoveryFloor: candidate.operationRecoveryFloor,
-            deliveryRecoveryFloor: candidate.deliveryRecoveryFloor,
-            code: result.code,
-          }),
-        );
+      }
+      if (!this.canAcceptResult(generation)) return;
+      switch (result.outcome) {
+        case "compacted":
+          this.clearBoardState(candidate.boardId);
+          this.recordTelemetryOutcome("compacted", startedAt);
+          await this.invokeHook(() =>
+            this.hooks.compacted?.({
+              boardId: result.boardId,
+              snapshotId: result.snapshotId,
+              snapshotCanvasSeq: result.snapshotCanvasSeq,
+              snapshotDeliverySeq: result.snapshotDeliverySeq,
+              previousOperationFloor: result.previousOperationFloor,
+              newOperationFloor: result.newOperationFloor,
+              previousDeliveryFloor: result.previousDeliveryFloor,
+              newDeliveryFloor: result.newDeliveryFloor,
+              deletedOperationCount: result.deletedOperationCount,
+              deletedOutboxCount: result.deletedOutboxCount,
+            }),
+          );
+          return;
+        case "no_progress":
+          this.clearBoardState(candidate.boardId);
+          this.recordTelemetryOutcome("no_progress", startedAt);
+          return;
+        case "no_verified_boundary":
+          this.clearBoardState(candidate.boardId);
+          this.recordTelemetryOutcome("no_boundary", startedAt);
+          return;
+        case "blocked":
+          this.retries.delete(candidate.boardId);
+          this.recordBlocked(candidate);
+          this.recordTelemetryOutcome("blocked", startedAt);
+          await this.invokeHook(() =>
+            this.hooks.blocked?.({
+              boardId: candidate.boardId,
+              snapshotId: candidate.snapshotId,
+              snapshotCanvasSeq: candidate.snapshotCanvasSeq,
+              snapshotDeliverySeq: candidate.snapshotDeliverySeq,
+              operationRecoveryFloor: candidate.operationRecoveryFloor,
+              deliveryRecoveryFloor: candidate.deliveryRecoveryFloor,
+              code: result.code,
+            }),
+          );
+      }
+    } finally {
+      this.finishTelemetryWork();
     }
+  }
+
+  private beginTelemetryWork(): void {
+    this.activeTelemetryWork += 1;
+    if (!this.telemetryFenced)
+      this.telemetry.setGauge("converge_compaction_active_work", {}, this.activeTelemetryWork);
+  }
+
+  private finishTelemetryWork(): void {
+    this.activeTelemetryWork = Math.max(0, this.activeTelemetryWork - 1);
+    if (!this.telemetryFenced)
+      this.telemetry.setGauge("converge_compaction_active_work", {}, this.activeTelemetryWork);
+  }
+
+  private recordTelemetryOutcome(
+    outcome: "compacted" | "no_progress" | "no_boundary" | "blocked" | "transient_failure",
+    startedAt: number | undefined,
+  ): void {
+    if (this.telemetryFenced) return;
+    this.telemetry.increment("converge_compaction_runs_total", { outcome });
+    this.telemetry.observe(
+      "converge_compaction_duration_seconds",
+      {},
+      telemetryDurationSeconds(this.telemetryClock, startedAt),
+    );
+    this.telemetry.emit({
+      schemaVersion: 1,
+      eventName: "compaction.result",
+      severity: outcome === "compacted" || outcome === "no_progress" ? "info" : "warn",
+      component: "compaction",
+      timestamp: new Date().toISOString(),
+      code: outcome.toUpperCase(),
+    });
   }
 
   private shouldSkip(candidate: BoardCompactionCandidate, currentTime: number): boolean {
@@ -499,6 +567,7 @@ export class CompactionCoordinator {
       this.graceTimer = undefined;
     }
     this.resultsFenced = true;
+    this.fenceTelemetry();
     this.lifecycle = "stopped";
     this.generation += 1;
     this.cyclePromise = undefined;
@@ -506,6 +575,13 @@ export class CompactionCoordinator {
     const finish = this.finishStop;
     this.finishStop = undefined;
     finish?.();
+  }
+
+  private fenceTelemetry(): void {
+    if (this.telemetryFenced) return;
+    this.activeTelemetryWork = 0;
+    this.telemetry.setGauge("converge_compaction_active_work", {}, 0);
+    this.telemetryFenced = true;
   }
 
   private clearRetainedState(): void {

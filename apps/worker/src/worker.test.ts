@@ -6,7 +6,11 @@ import type {
   MarkOutboxPublishedInput,
   RecordOutboxFailureInput,
 } from "@converge/database";
-import type { StructuredLogger } from "@converge/observability";
+import {
+  InMemoryTelemetryRecorder,
+  type StructuredLogger,
+  type TelemetryRecorder,
+} from "@converge/observability";
 import {
   DELIVERY_ENVELOPE_MAX_BYTES,
   DELIVERY_STREAM_ENTRY_MAX_BYTES,
@@ -547,6 +551,106 @@ describe("outbox worker", () => {
     expect(repository.failures).toEqual([]);
   });
 
+  it("records all four final publication outcomes once with duration and fixed fields", async () => {
+    const telemetry = new InMemoryTelemetryRecorder();
+    let currentTime = 0;
+    const telemetryClock = { now: () => (currentTime += 250) };
+    const privateValues: string[] = [];
+    const scenarios = ["published", "retry", "blocked", "stale"] as const;
+
+    for (const scenario of scenarios) {
+      const repository = new FakeRepository();
+      const stream = new FakeStream();
+      const event = claim();
+      privateValues.push(event.eventId, event.boardId, event.leaseToken);
+      repository.claims.push(event);
+      if (scenario === "retry") stream.results.push(new Error("redis://user:secret@private"));
+      if (scenario === "blocked")
+        repository.recordFailure = (input) => {
+          repository.failures.push(input);
+          return Promise.resolve(applied(input.eventId, "blocked"));
+        };
+      if (scenario === "blocked") stream.results.push(new RedisXaddRejectedError("rejected"));
+      if (scenario === "stale")
+        repository.publishResult = { outcome: "stale", eventId: event.eventId };
+      const worker = new OutboxWorker(
+        repository,
+        stream,
+        configuration,
+        logger,
+        scheduler,
+        {},
+        telemetry,
+        telemetryClock,
+      );
+      expect((await worker.runCycle()).outcomes).toEqual([
+        scenario === "retry" ? "retry_scheduled" : scenario,
+      ]);
+    }
+
+    const snapshot = telemetry.snapshot();
+    expect(
+      snapshot.counters
+        .filter(({ name }) => name === "converge_outbox_publications_total")
+        .map(({ labels, value }) => ({ ...labels, value })),
+    ).toEqual([
+      { outcome: "blocked", value: 1 },
+      { outcome: "published", value: 1 },
+      { outcome: "retry", value: 1 },
+      { outcome: "stale", value: 1 },
+    ]);
+    expect(
+      snapshot.histograms.find(
+        ({ name }) => name === "converge_outbox_publication_duration_seconds",
+      ),
+    ).toMatchObject({ count: 4, sum: 1, labels: {} });
+    expect(snapshot.events.map(({ code }) => code)).toEqual([
+      "PUBLISHED",
+      "RETRY",
+      "BLOCKED",
+      "STALE",
+    ]);
+    expect(snapshot.gauges.find(({ name }) => name === "converge_outbox_active_work")?.value).toBe(
+      0,
+    );
+    const exported = JSON.stringify(snapshot);
+    for (const value of privateValues) expect(exported).not.toContain(value);
+    expect(exported).not.toMatch(/redis:\/\/|private|secret|payload/i);
+  });
+
+  it("contains recorder and clock failures without changing publication", async () => {
+    const repository = new FakeRepository();
+    const stream = new FakeStream();
+    repository.claims.push(claim());
+    const reject = () => Promise.reject(new Error("private telemetry rejection"));
+    const failing = {
+      increment: () => {
+        throw new Error("private telemetry throw");
+      },
+      observe: reject,
+      setGauge: reject,
+      emit: reject,
+    } as unknown as TelemetryRecorder;
+    const worker = new OutboxWorker(
+      repository,
+      stream,
+      configuration,
+      logger,
+      scheduler,
+      {},
+      failing,
+      {
+        now: () => {
+          throw new Error("private clock failure");
+        },
+      },
+    );
+
+    await expect(worker.runCycle()).resolves.toMatchObject({ outcomes: ["published"] });
+    expect(repository.published).toHaveLength(1);
+    await Promise.resolve();
+  });
+
   it("caps claims and active Redis publications at eight", async () => {
     const repository = new FakeRepository();
     const gates = Array.from({ length: 8 }, () => deferred<unknown>());
@@ -566,15 +670,30 @@ describe("outbox worker", () => {
       });
     };
     repository.claims.push(...Array.from({ length: 10 }, () => claim()));
-    const worker = new OutboxWorker(repository, stream, configuration, logger, scheduler);
+    const telemetry = new InMemoryTelemetryRecorder();
+    const worker = new OutboxWorker(
+      repository,
+      stream,
+      configuration,
+      logger,
+      scheduler,
+      {},
+      telemetry,
+    );
 
     const cycle = worker.runCycle();
     await allStarted.promise;
     expect(repository.claimOptions[0]?.batchSize).toBe(8);
     expect(stream.appended).toHaveLength(8);
+    expect(
+      telemetry.snapshot().gauges.find(({ name }) => name === "converge_outbox_active_work")?.value,
+    ).toBe(8);
     for (const [index, gate] of gates.entries()) gate.resolve(`${4000 + index}-0`);
     expect((await cycle).claimed).toBe(8);
     expect(maximumActive).toBe(8);
+    expect(
+      telemetry.snapshot().gauges.find(({ name }) => name === "converge_outbox_active_work")?.value,
+    ).toBe(0);
     expect(repository.claims).toHaveLength(2);
   });
 
@@ -662,12 +781,15 @@ describe("outbox worker", () => {
       random: () => 0,
       sleep: (delay) => (delay === 10_000 ? grace.promise : publicationTimeout.promise),
     };
+    const telemetry = new InMemoryTelemetryRecorder();
     const worker = new OutboxWorker(
       repository,
       stream,
       { ...configuration, publishConcurrency: 1 },
       logger,
       shutdownScheduler,
+      {},
+      telemetry,
     );
     const cycle = worker.runCycle();
     await appendStarted.promise;
@@ -677,12 +799,15 @@ describe("outbox worker", () => {
 
     await expect(draining).resolves.toBe(false);
     worker.abandonActiveLeases();
+    const fenced = telemetry.snapshot();
+    expect(fenced.gauges.find(({ name }) => name === "converge_outbox_active_work")?.value).toBe(0);
     await expect(worker.runCycle()).resolves.toMatchObject({ state: "stopping", claimed: 0 });
     expect(repository.claimOptions).toHaveLength(1);
     expect(repository.failures).toEqual([]);
     append.resolve("5000-0");
     await cycle;
     expect(repository.published).toEqual([]);
+    expect(telemetry.snapshot()).toEqual(fenced);
   });
 
   it("waits for a pending claim that resolves inside shutdown grace and drains it", async () => {

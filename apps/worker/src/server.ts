@@ -1,8 +1,10 @@
+import { InMemoryTelemetryRecorder } from "@converge/observability";
 import { createWorkerApplication } from "./application.js";
 import { parseWorkerEnvironment, type WorkerEnvironment } from "./env.js";
 
 export async function runWorkerServer(environment: WorkerEnvironment): Promise<void> {
-  const application = await createWorkerApplication(environment);
+  const telemetry = new InMemoryTelemetryRecorder(1_000);
+  const application = await createWorkerApplication(environment, {}, { telemetry });
   let signalReceived = false;
   const onInterrupt = (): void => {
     signalReceived = true;

@@ -71,7 +71,8 @@ The provider-neutral bounded telemetry contract now exists in `packages/observab
 fixed low-cardinality metric catalog, bounded structured diagnostic events, no-op and deterministic
 in-memory recorders, immutable export snapshots, explicit error classification, and telemetry
 failure isolation. Distributed API delivery/recovery instrumentation is complete. Worker
-instrumentation and telemetry exposition remain pending.
+outbox/snapshot/compaction instrumentation is complete. Telemetry exposition, operational health
+endpoints, alerts, and benchmarks remain pending.
 
 ## Deferred by design
 
