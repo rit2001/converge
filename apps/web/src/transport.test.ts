@@ -26,6 +26,7 @@ import {
 
 const boardId = "10000000-0000-4000-8000-000000000001";
 const clientId = "20000000-0000-4000-8000-000000000001";
+const testApiUrl = "http://transport.test:4100";
 let generation = 0;
 
 function uuid(group: string, index: number): string {
@@ -354,6 +355,7 @@ function harness(
   options: {
     initialSeq?: number;
     initialPending?: DurableCommand[];
+    apiUrl?: string;
     fetcher?: typeof fetch;
     loadRecovery?: (id: string, signal: AbortSignal) => Promise<unknown>;
     useDefaultRecovery?: boolean;
@@ -374,6 +376,7 @@ function harness(
   for (const command of initialPending) persistence.rows.set(command.opId, command);
   const fetcher = options.fetcher ?? (() => Promise.resolve(response(0, 0, [])));
   const transport = new BoardTransport(boardId, clientId, token, {
+    apiUrl: options.apiUrl ?? testApiUrl,
     scheduler,
     pendingStore: persistence,
     socketFactory: () => socket as never,
@@ -1068,8 +1071,8 @@ describe("authoritative resynchronization and pending interaction", () => {
     succeedJoin(test.socket, 0, 1);
     await settle();
     expect(urls).toEqual([
-      `http://localhost:4000/v1/boards/${boardId}/operations?after=0&watermark=1`,
-      `http://localhost:4000/v1/boards/${boardId}/recovery`,
+      `${testApiUrl}/v1/boards/${boardId}/operations?after=0&watermark=1`,
+      `${testApiUrl}/v1/boards/${boardId}/recovery`,
     ]);
     expect(useBoardStore.getState()).toMatchObject({
       connection: "retry-wait",
@@ -1245,7 +1248,7 @@ describe("verified snapshot-plus-tail recovery", () => {
     });
     expect(failed.socket.connected).toBe(false);
     expect(failed.scheduler.tasks.size).toBe(0);
-    expect(urls).toEqual([`http://localhost:4000/v1/boards/${boardId}/recovery`]);
+    expect(urls).toEqual([`${testApiUrl}/v1/boards/${boardId}/recovery`]);
 
     const replacement = harness({ loadRecovery: () => Promise.resolve(repairedMaterial) });
     requireRecovery(replacement.socket);
