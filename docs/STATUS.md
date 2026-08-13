@@ -83,6 +83,12 @@ repository-level policy validation and pinned Prometheus 3.5.0 syntax, PromQL, a
 fixtures enforced locally and in CI. External-probe and stuck-work alerts, Alertmanager/provider
 integration, deployment probe selection, dashboards, and benchmarks remain pending.
 
+The reproducible k6 collaboration workload contract is complete: vanilla k6 Engine.IO v4 / Socket.IO
+v4 framing, strict acknowledgements and live-event validation, bounded deduplication/sequence state,
+safe smoke/baseline/scale-step profiles, fixed low-cardinality metrics, target safeguards, and pure
+helper tests are defined. No stateful workload or benchmark has been executed, and result artifacts,
+scale execution, deployment, and performance claims remain pending.
+
 ## Deferred by design
 
 - Production activation of transactional-outbox dispatch (the repository, worker publisher, and
