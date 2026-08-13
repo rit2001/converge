@@ -11,6 +11,8 @@
     "benchmark:k6:check": "pnpm --filter @converge/k6 test && node --test scripts/k6-smoke-harness.test.mjs && pnpm --filter @converge/k6 lint",
     "benchmark:k6:acceptance": "node scripts/run-isolated-k6-smoke.mjs",
     "benchmark:k6:baseline": "CONVERGE_K6_ACCEPTANCE_MODE=baseline node scripts/run-isolated-k6-smoke.mjs",
+    "benchmark:k6:scale-step": "CONVERGE_K6_ACCEPTANCE_MODE=scale-step node scripts/run-isolated-k6-smoke.mjs",
+    "benchmark:k6:scale-gate": "CONVERGE_K6_ACCEPTANCE_MODE=scale-gate node scripts/run-isolated-k6-smoke.mjs",
     "benchmark:k6:bounded-one": "CONVERGE_K6_ACCEPTANCE_MODE=bounded-one node scripts/run-isolated-k6-smoke.mjs",
     "benchmark:k6:bounded-two": "CONVERGE_K6_ACCEPTANCE_MODE=bounded-two node scripts/run-isolated-k6-smoke.mjs",
     "benchmark:k6:bounded-ten": "CONVERGE_K6_ACCEPTANCE_MODE=bounded-ten node scripts/run-isolated-k6-smoke.mjs",

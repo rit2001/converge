@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import { ITERATION_FAILURE_REASONS, ITERATION_PHASES } from "../tests/k6/iteration-lifecycle.js";
+
 const FORBIDDEN_ARTIFACT_PATTERNS = [
   /authorization/i,
   /bearer/i,
@@ -71,12 +74,22 @@ export function validateEnvironmentArtifact(value) {
       ? "smoke"
       : value.profile === "baseline" && value.virtualUsers === 10 && value.duration === "2m"
         ? "baseline"
-        : undefined;
+        : value.profile === "scale-step" && value.virtualUsers === 100 && value.duration === "3m45s"
+          ? "scale-step"
+          : undefined;
   if (!preset) throw new Error("Benchmark environment metadata is not an approved preset");
   assertSanitizedArtifact(value);
 }
 
-export function validateK6Summary(summary) {
+export function validateK6Summary(
+  summary,
+  {
+    requireCommandAckThreshold = true,
+    maximumSnapshots,
+    expectedScaleSessions,
+    requirePersistentScaleEvidence = false,
+  } = {},
+) {
   const metrics = summary?.metrics;
   if (!metrics || typeof metrics !== "object") throw new Error("k6 summary metrics are missing");
   const requiredThresholds = [
@@ -85,8 +98,14 @@ export function validateK6Summary(summary) {
     "converge_sequence_gaps",
     "converge_socket_connect_duration",
     "converge_board_join_ack_duration",
-    "converge_command_ack_duration",
   ];
+  if (requireCommandAckThreshold) requiredThresholds.push("converge_command_ack_duration");
+  if (requirePersistentScaleEvidence)
+    requiredThresholds.push(
+      "converge_scale_second_invocations",
+      "converge_scale_unexpected_disconnects",
+      "converge_scale_session_failures",
+    );
   for (const name of requiredThresholds) {
     const thresholds = metrics[name]?.thresholds;
     if (!thresholds || Object.values(thresholds).some((failed) => failed !== false))
@@ -103,12 +122,159 @@ export function validateK6Summary(summary) {
   const liveEvents = value("converge_live_events_received", "count");
   if (acknowledgements <= 0 || liveEvents < acknowledgements)
     throw new Error("k6 did not observe committed commands and corresponding live delivery");
+  const snapshotRequestCount = value("converge_snapshot_requests", "count");
+  const scaleSessionCount = value("converge_scale_sessions_started", "count");
+  if (
+    maximumSnapshots !== undefined &&
+    (!Number.isSafeInteger(snapshotRequestCount) || snapshotRequestCount > maximumSnapshots)
+  )
+    throw new Error("Persistent scale snapshot request budget exceeded");
+  if (expectedScaleSessions !== undefined && scaleSessionCount !== expectedScaleSessions)
+    throw new Error("Persistent scale session ownership did not converge");
+  const scaleSessionsInitialized = value("converge_scale_sessions_initialized", "count");
+  const scaleSessionsCompleted = value("converge_scale_sessions_completed", "count");
+  const scaleSecondInvocations = value("converge_scale_second_invocations", "count");
+  const scaleUnexpectedDisconnects = value("converge_scale_unexpected_disconnects", "count");
+  const scaleSessionFailures = value("converge_scale_session_failures", "count");
+  if (
+    requirePersistentScaleEvidence &&
+    (scaleSessionsInitialized !== scaleSessionCount ||
+      scaleSessionsCompleted !== scaleSessionCount ||
+      scaleSecondInvocations !== 0 ||
+      scaleUnexpectedDisconnects !== 0 ||
+      scaleSessionFailures !== 0 ||
+      snapshotRequestCount > scaleSessionCount)
+  )
+    throw new Error("Persistent scale lifecycle evidence did not converge");
   return {
     acknowledgements,
     liveEvents,
     transportDuplicatesObserved: value("converge_duplicate_events", "count"),
     transportDuplicatesSuppressed: value("converge_duplicate_events", "count"),
+    snapshotRequests: snapshotRequestCount,
+    scaleSessions: scaleSessionCount,
+    rangeRequests: value("converge_range_requests", "count"),
+    scaleSessionsInitialized,
+    scaleSessionsCompleted,
+    scaleSecondInvocations,
+    scaleUnexpectedDisconnects,
+    scaleSessionFailures,
   };
+}
+
+function appendBoundedTail(current, chunk, maximumBytes) {
+  const combined = Buffer.concat([current, Buffer.from(chunk)]);
+  return combined.length <= maximumBytes
+    ? combined
+    : combined.subarray(combined.length - maximumBytes);
+}
+
+export function runStreamingCommand(command, args, { cwd, env, tailBytes = 16_384 } = {}) {
+  if (!Number.isInteger(tailBytes) || tailBytes < 1 || tailBytes > 65_536)
+    throw new Error("Invalid subprocess tail limit");
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdoutTail = Buffer.alloc(0);
+    let stderrTail = Buffer.alloc(0);
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const diagnostics = createFailureDiagnosticAggregator();
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      stdoutTail = appendBoundedTail(stdoutTail, chunk, tailBytes);
+      diagnostics.push("stdout", chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      stderrTail = appendBoundedTail(stderrTail, chunk, tailBytes);
+      diagnostics.push("stderr", chunk);
+    });
+    child.once("error", reject);
+    child.once("close", (status) => {
+      diagnostics.finish();
+      resolvePromise({
+        status: status ?? 1,
+        stdoutTail: stdoutTail.toString("utf8"),
+        stderrTail: stderrTail.toString("utf8"),
+        stdoutBytes,
+        stderrBytes,
+        failureDiagnostics: diagnostics.snapshot(),
+      });
+    });
+  });
+}
+
+const FAILURE_EVIDENCE =
+  /^(?: status=[0-9]+| last_sequence=[0-9]+| objects=[0-9]+| response_bytes=[0-9]+| configured_limit=[0-9]+| snapshot_canvas_sequence=[0-9]+| current_canvas_sequence=[0-9]+| buffered_canvas_sequence=[0-9]+| sameOperationIdentity=(?:true|false)| sameCanonicalContent=(?:true|false))*$/;
+
+export function createFailureDiagnosticAggregator() {
+  const counts = new Map();
+  const partial = { stdout: "", stderr: "" };
+  let invalid = 0;
+  const accept = (line) => {
+    let payload = line;
+    if (!line.startsWith("converge_failure ")) {
+      const wrapped =
+        /^time="[0-9T:.+Z-]{20,40}" level=info msg="(converge_failure [^"\\]{1,512})" source=console$/.exec(
+          line,
+        );
+      if (wrapped) payload = wrapped[1];
+      else {
+        if (line.includes("converge_failure")) invalid += 1;
+        return;
+      }
+    }
+    const match =
+      /^converge_failure vu=[0-9]+ iteration=[0-9]+ phase=([a-z_]+) reason=([a-z_]+)(.*)$/.exec(
+        payload,
+      );
+    if (
+      !match ||
+      !ITERATION_PHASES.includes(match[1]) ||
+      !ITERATION_FAILURE_REASONS.includes(match[2]) ||
+      !FAILURE_EVIDENCE.test(match[3])
+    ) {
+      invalid += 1;
+      return;
+    }
+    const key = `${match[1]}:${match[2]}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  };
+  return Object.freeze({
+    push(stream, chunk) {
+      if (!(stream in partial)) throw new Error("Unknown diagnostic stream");
+      const joined = partial[stream] + Buffer.from(chunk).toString("utf8");
+      const lines = joined.split("\n");
+      partial[stream] = lines.pop() ?? "";
+      for (const line of lines) accept(line.trim());
+    },
+    finish() {
+      for (const stream of Object.keys(partial)) {
+        if (partial[stream]) accept(partial[stream].trim());
+        partial[stream] = "";
+      }
+    },
+    snapshot() {
+      return Object.freeze({
+        invalid,
+        counts: Object.freeze(
+          [...counts.entries()]
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, count]) => {
+              const [phase, reason] = key.split(":");
+              return Object.freeze({ phase, reason, count });
+            }),
+        ),
+      });
+    },
+  });
+}
+
+export function aggregateFailureDiagnostics(output) {
+  const aggregator = createFailureDiagnosticAggregator();
+  aggregator.push("stdout", `${String(output)}\n`);
+  aggregator.finish();
+  return aggregator.snapshot();
 }
 
 export function readK6FailureDiagnostic(summary) {

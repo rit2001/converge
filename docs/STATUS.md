@@ -81,8 +81,7 @@ Redis failure boundaries. The provider-neutral SLO, alert-threshold, inhibition/
 incident-runbook policy is complete. The twelve metric-backed Prometheus alerts are encoded with
 repository-level policy validation and pinned Prometheus 3.5.0 syntax, PromQL, and deterministic rule
 fixtures enforced locally and in CI. External-probe and stuck-work alerts, Alertmanager/provider
-integration, deployment probe selection, dashboards, and repeatable performance benchmarks remain
-pending.
+integration, deployment probe selection, and dashboards remain pending.
 
 The reproducible k6 collaboration workload contract is complete: vanilla k6 Engine.IO v4 / Socket.IO
 v4 framing, strict acknowledgements and live-event validation, bounded deduplication/sequence state,
@@ -91,8 +90,11 @@ helper tests are defined. One isolated 2-VU/30-second correctness smoke has pass
 production-composed distributed API and worker with disposable PostgreSQL and test-owned Redis
 state. One controlled local 10-VU/2-minute baseline also passed using a bounded one-object-per-VU
 working set and real `object.update` mutations. Sanitized result artifacts record protocol,
-durable-state, publication, consumer-progress, threshold, and cleanup evidence. Scale-step execution,
-deployment, repeated measurements, statistical confidence, and capacity claims remain pending.
+durable-state, publication, consumer-progress, threshold, and cleanup evidence. M2.8 observability
+and its reproducible benchmark framework are complete: the correctness smoke and 10-VU baseline are
+accepted, while local 10→50→100 scale acceptance was not achieved. The failed executions are retained
+only as an unaccepted observation; high-concurrency refinement is deferred to a future performance
+milestone. No production, deployment, multi-replica-capacity, or 10,000-user claim is supported.
 
 ## Deferred by design
 

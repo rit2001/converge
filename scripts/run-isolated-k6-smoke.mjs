@@ -12,6 +12,8 @@ import {
   collectPostFailureEvidence,
   durableEvidenceSql,
   readK6FailureDiagnostic,
+  aggregateFailureDiagnostics,
+  runStreamingCommand,
   validateEnvironmentArtifact,
   validateDurableEvidence,
   validateK6Summary,
@@ -40,16 +42,37 @@ const debugConcurrent = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "concurrent"
 const debugSequential = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "sequential";
 const preflightOnly = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "preflight";
 const baseline = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "baseline";
+const scaleStep = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "scale-step";
+const scaleGate = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "scale-gate";
 const boundedOne = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "bounded-one";
 const boundedTwo = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "bounded-two";
 const boundedTen = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "bounded-ten";
 const boundedThirty = process.env.CONVERGE_K6_ACCEPTANCE_MODE === "bounded-30s";
-const boundedGate = boundedOne || boundedTwo || boundedTen || boundedThirty;
-const baselineProfile = baseline || boundedGate;
-const profile = baselineProfile ? "baseline" : "smoke";
-const profileVus = boundedOne ? 1 : boundedTwo ? 2 : baselineProfile ? 10 : 2;
-const profileDuration = boundedThirty ? "30s" : baselineProfile ? "2m" : "30s";
-const commandsPerIteration = baselineProfile ? 10 : 2;
+const boundedGate = boundedOne || boundedTwo || boundedTen || boundedThirty || scaleGate;
+const scaleProfile = scaleStep || scaleGate;
+const boundedProfile = baseline || scaleProfile || boundedGate;
+const profile = scaleProfile ? "scale-step" : boundedProfile ? "baseline" : "smoke";
+const profileVus = scaleProfile
+  ? scaleGate
+    ? 10
+    : 100
+  : boundedOne
+    ? 1
+    : boundedTwo
+      ? 2
+      : boundedProfile
+        ? 10
+        : 2;
+const profileDuration = scaleProfile
+  ? scaleGate
+    ? "20s"
+    : "3m45s"
+  : boundedThirty
+    ? "30s"
+    : boundedProfile
+      ? "2m"
+      : "30s";
+const commandsPerIteration = boundedProfile ? 10 : 2;
 
 class PreflightComplete extends Error {}
 
@@ -416,57 +439,91 @@ try {
   ]);
 
   let k6CommandFailure;
-  const k6 = await command("node", ["scripts/run-k6-smoke.mjs"], {
-    env: {
-      ...process.env,
-      CONVERGE_BASE_URL: `http://host.docker.internal:${apiPort}`,
-      CONVERGE_SOCKET_URL: `http://host.docker.internal:${apiPort}`,
-      CONVERGE_BOARD_ID: boardId,
-      CONVERGE_AUTH_TOKEN: authToken,
-      CONVERGE_ALLOW_REMOTE_TARGET: "true",
-      CONVERGE_PROFILE: profile,
-      CONVERGE_K6_SUMMARY_PATH: summaryPath,
-      ...(debugOnce
-        ? {
-            CONVERGE_K6_DEBUG_ONCE: "true",
-            CONVERGE_DEBUG_PHASES: "true",
-            CONVERGE_COMMANDS_PER_CLIENT: "1",
-          }
-        : {}),
-      ...(debugRepeat
-        ? {
-            CONVERGE_DEBUG_PHASES: "true",
-            CONVERGE_DEBUG_REPEAT: "true",
-            CONVERGE_COMMANDS_PER_CLIENT: "1",
-          }
-        : {}),
-      ...(debugConcurrent
-        ? {
-            CONVERGE_DEBUG_PHASES: "true",
-            CONVERGE_DEBUG_CONCURRENT: "true",
-            CONVERGE_COMMANDS_PER_CLIENT: "1",
-          }
-        : {}),
-      ...(debugSequential
-        ? {
-            CONVERGE_DEBUG_PHASES: "true",
-            CONVERGE_DEBUG_SEQUENTIAL: "true",
-            CONVERGE_COMMANDS_PER_CLIENT: "1",
-          }
-        : {}),
-      ...(boundedOne ? { CONVERGE_DEBUG_BOUNDED_ONE: "true" } : {}),
-      ...(boundedTwo ? { CONVERGE_DEBUG_BOUNDED_TWO: "true" } : {}),
-      ...(boundedTen ? { CONVERGE_DEBUG_BOUNDED_TEN: "true" } : {}),
-      ...(boundedThirty ? { CONVERGE_DURATION: "30s" } : {}),
-      ...(baselineProfile ? { CONVERGE_DEBUG_FAILURES: "true" } : {}),
-    },
-  }).catch((error) => {
-    k6CommandFailure = new Error(`The isolated k6 ${profile} command failed`);
-    return { stdout: error.stdout ?? "", stderr: error.stderr ?? "" };
-  });
-  process.stdout.write(k6.stdout);
-  process.stderr.write(k6.stderr);
-  const k6Summary = JSON.parse(await readFile(summaryPath, "utf8"));
+  const k6Environment = {
+    ...process.env,
+    CONVERGE_BASE_URL: `http://host.docker.internal:${apiPort}`,
+    CONVERGE_SOCKET_URL: `http://host.docker.internal:${apiPort}`,
+    CONVERGE_BOARD_ID: boardId,
+    CONVERGE_AUTH_TOKEN: authToken,
+    CONVERGE_ALLOW_REMOTE_TARGET: "true",
+    CONVERGE_PROFILE: profile,
+    CONVERGE_K6_SUMMARY_PATH: summaryPath,
+    ...(debugOnce
+      ? {
+          CONVERGE_K6_DEBUG_ONCE: "true",
+          CONVERGE_DEBUG_PHASES: "true",
+          CONVERGE_COMMANDS_PER_CLIENT: "1",
+        }
+      : {}),
+    ...(debugRepeat
+      ? {
+          CONVERGE_DEBUG_PHASES: "true",
+          CONVERGE_DEBUG_REPEAT: "true",
+          CONVERGE_COMMANDS_PER_CLIENT: "1",
+        }
+      : {}),
+    ...(debugConcurrent
+      ? {
+          CONVERGE_DEBUG_PHASES: "true",
+          CONVERGE_DEBUG_CONCURRENT: "true",
+          CONVERGE_COMMANDS_PER_CLIENT: "1",
+        }
+      : {}),
+    ...(debugSequential
+      ? {
+          CONVERGE_DEBUG_PHASES: "true",
+          CONVERGE_DEBUG_SEQUENTIAL: "true",
+          CONVERGE_COMMANDS_PER_CLIENT: "1",
+        }
+      : {}),
+    ...(boundedOne ? { CONVERGE_DEBUG_BOUNDED_ONE: "true" } : {}),
+    ...(boundedTwo ? { CONVERGE_DEBUG_BOUNDED_TWO: "true" } : {}),
+    ...(boundedTen ? { CONVERGE_DEBUG_BOUNDED_TEN: "true" } : {}),
+    ...(scaleGate ? { CONVERGE_DEBUG_SCALE_GATE: "true" } : {}),
+    ...(boundedThirty ? { CONVERGE_DURATION: "30s" } : {}),
+    ...(boundedProfile ? { CONVERGE_DEBUG_FAILURES: "true" } : {}),
+  };
+  let k6;
+  if (scaleProfile) {
+    k6 = await runStreamingCommand("node", ["scripts/run-k6-smoke.mjs"], {
+      cwd: repositoryRoot,
+      env: k6Environment,
+      tailBytes: 32_768,
+    });
+    if (k6.status !== 0) k6CommandFailure = new Error(`The isolated k6 ${profile} command failed`);
+  } else {
+    k6 = await command("node", ["scripts/run-k6-smoke.mjs"], {
+      env: k6Environment,
+    }).catch((error) => {
+      k6CommandFailure = new Error(`The isolated k6 ${profile} command failed`);
+      return { stdout: error.stdout ?? "", stderr: error.stderr ?? "" };
+    });
+  }
+  const k6Stdout = k6.stdout ?? k6.stdoutTail ?? "";
+  const k6Stderr = k6.stderr ?? k6.stderrTail ?? "";
+  if (!scaleProfile) {
+    process.stdout.write(k6Stdout);
+    process.stderr.write(k6Stderr);
+  }
+  const failureDiagnostics =
+    k6.failureDiagnostics ?? aggregateFailureDiagnostics(`${k6Stdout}\n${k6Stderr}`);
+  const writeFailureDiagnostics = () => {
+    if (failureDiagnostics.invalid !== 0)
+      process.stderr.write(
+        `converge_failure_summary invalid_diagnostics=${failureDiagnostics.invalid}\n`,
+      );
+    for (const item of failureDiagnostics.counts)
+      process.stderr.write(
+        `converge_failure_summary phase=${item.phase} reason=${item.reason} count=${item.count}\n`,
+      );
+  };
+  let k6Summary;
+  try {
+    k6Summary = JSON.parse(await readFile(summaryPath, "utf8"));
+  } catch {
+    writeFailureDiagnostics();
+    throw new Error("The authoritative k6 summary export is missing or malformed");
+  }
   if (k6CommandFailure) {
     const diagnostic = readK6FailureDiagnostic(k6Summary);
     const collected = await collectPostFailureEvidence(k6CommandFailure, async () => {
@@ -487,17 +544,30 @@ try {
         ? `converge_post_failure_evidence iterations=${diagnostic.iterations} iteration_failures=${diagnostic.iterationFailures} protocol_failures=${diagnostic.protocolFailures} sequence_gaps=${diagnostic.sequenceGaps} acknowledgements=${diagnostic.acknowledgements} live_events=${diagnostic.liveEvents} transport_duplicates=${diagnostic.transportDuplicates} operations=${durable.operations} outbox=${durable.outbox} objects=${durable.objects} canvas_head=${durable.lastSequence} delivery_head=${durable.deliveryHead} published=${durable.published} handled=${durable.handled}\n`
         : `converge_post_failure_evidence unavailable=true iterations=${diagnostic.iterations} iteration_failures=${diagnostic.iterationFailures}\n`,
     );
+    writeFailureDiagnostics();
     throw collected.originalFailure;
   }
-  thresholdEvidence = validateK6Summary(k6Summary);
+  if (failureDiagnostics.invalid !== 0)
+    throw new Error("The streamed k6 diagnostics contained an unknown format");
+  thresholdEvidence = validateK6Summary(k6Summary, {
+    requireCommandAckThreshold: !scaleProfile,
+    ...(scaleProfile
+      ? {
+          maximumSnapshots: profileVus,
+          expectedScaleSessions: profileVus,
+          requirePersistentScaleEvidence: true,
+        }
+      : {}),
+  });
   const completedIterations = Number(k6Summary.metrics?.iterations?.count ?? 0);
   if (
-    baselineProfile &&
+    boundedProfile &&
+    !scaleProfile &&
     thresholdEvidence.acknowledgements !== completedIterations * commandsPerIteration
   )
     throw new Error("Bounded workload command accounting did not converge");
   if (debugOnce || debugRepeat || debugConcurrent || debugSequential) {
-    const debugOutput = `${k6.stdout}\n${k6.stderr}`;
+    const debugOutput = `${k6Stdout}\n${k6Stderr}`;
     const requiredPhases = [
       "connected",
       "authenticated",
@@ -542,7 +612,7 @@ try {
       return validateDurableEvidence(
         await readDurableEvidence(databaseName, boardId, handled),
         thresholdEvidence.acknowledgements,
-        baselineProfile ? profileVus : thresholdEvidence.acknowledgements,
+        boundedProfile ? profileVus : thresholdEvidence.acknowledgements,
       );
     } catch {
       return undefined;
@@ -634,11 +704,14 @@ const environmentArtifact = {
     database: "disposable PostgreSQL migrated through 0009",
     redis: "test-owned isolated delivery stream",
     compactionEnabled: false,
-    workloadModel: baselineProfile
+    workloadModel: boundedProfile
       ? "one stable object per VU with object.update mutations"
       : "create-only correctness smoke",
     commandsPerIteration,
-    projectionObjects: baselineProfile ? profileVus : undefined,
+    projectionObjects: boundedProfile ? profileVus : undefined,
+    stageSchedule: scaleStep
+      ? "15s ramp to 10; 30s hold; 30s ramp to 50; 45s hold; 30s ramp to 100; 60s hold; 15s ramp down"
+      : undefined,
     maximumSnapshotResponseBytes: 131_072,
   },
 };
@@ -664,8 +737,27 @@ const deliveryLatency = trend("converge_live_delivery_duration");
 const iterationRate = Number(k6Summary.metrics?.iterations?.rate ?? 0);
 const acknowledgementRate = Number(k6Summary.metrics?.converge_commands_acknowledged?.rate ?? 0);
 const display = (value) => Number(value.toFixed(3)).toString();
-const summaryMarkdown = baseline
-  ? `# M2.8 controlled local k6 baseline
+const summaryMarkdown = scaleStep
+  ? `# M2.8 controlled local k6 scale-step observation
+
+This was one exploratory local scale-step execution, not a capacity or production benchmark.
+
+- Schedule: ramp to 10 VUs for 15 seconds, hold 10 for 30 seconds, ramp to 50 for 30 seconds, hold 50 for 45 seconds, ramp to 100 for 30 seconds, hold 100 for 60 seconds, then ramp down for 15 seconds.
+- Topology: one production-composed distributed API, one production-composed worker, one disposable PostgreSQL database migrated through 0009, and one test-owned Redis delivery stream on a single machine.
+- Workload: ${iterations} completed iterations with ${commandsPerIteration} commands per iteration; each initialized VU owned one stable object and subsequent commands used object.update. Projection cardinality plateaued at ${evidence.objects} objects while ${thresholdEvidence.acknowledgements} commands were acknowledged with matching logical delivery; ${thresholdEvidence.liveEvents} valid live events were observed.
+- Aggregate throughput: ${display(iterationRate)} completed iterations/second and ${display(acknowledgementRate)} acknowledged commands/second.
+- Aggregate latency milliseconds (p50/p95/p99): connection ${display(connectionLatency.p50)}/${display(connectionLatency.p95)}/${display(connectionLatency.p99)}; join ${display(joinLatency.p50)}/${display(joinLatency.p95)}/${display(joinLatency.p99)}; command acknowledgement ${display(acknowledgementLatency.p50)}/${display(acknowledgementLatency.p95)}/${display(acknowledgementLatency.p99)}; matching live delivery ${display(deliveryLatency.p50)}/${display(deliveryLatency.p95)}/${display(deliveryLatency.p99)}.
+- Stage observations: the fixed metrics contain no reliable stage tag, so per-stage throughput, failures, and latency are not fabricated; only the configured VU schedule above and aggregate results are reported.
+- Correctness: all configured scale-step thresholds passed; iteration failures, protocol failures, sequence gaps/conflicts, and logical reapplications were zero.
+- At-least-once evidence: ${thresholdEvidence.transportDuplicatesObserved} valid transport duplicates were observed and suppressed before logical application or command completion. They are informational, not logical reapplications.
+- Durable convergence: ${evidence.distinctOperations} durable operations, ${evidence.distinctOutboxEvents} outbox rows, ${evidence.published} valid publications, canvas head ${evidence.lastSequence}, delivery head ${evidence.deliveryHead}, and API consumer progress ${evidence.handled} converged.
+- Environmental limits: this single local machine, loopback network, one API replica, one worker, one execution, and no separate resource-monitoring stack provide no multi-replica, production, saturation, or statistical-confidence evidence.
+- Cleanup: API, worker, listeners, database, Redis key, timers, and benchmark process were released; PostgreSQL and Redis were restored to their initial state.
+
+Comparison with the 10-VU baseline is observational only because the profile differs. This result makes no maximum-user, production-readiness, horizontal-scalability, SLA, deployment, or 10,000-user claim.
+`
+  : baseline
+    ? `# M2.8 controlled local k6 baseline
 
 This was one local 10-VU/2-minute baseline, not a capacity or production benchmark.
 
@@ -683,7 +775,7 @@ This was one local 10-VU/2-minute baseline, not a capacity or production benchma
 
 No comparison should be inferred from the earlier smoke because the profiles differ. This result makes no maximum-user, production-capacity, horizontal-scalability, exactly-once-delivery, deployment, or 10,000-user claim.
 `
-  : `# M2.8 isolated k6 smoke result
+    : `# M2.8 isolated k6 smoke result
 
 This is a correctness smoke run, not a capacity benchmark.
 

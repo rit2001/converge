@@ -1,5 +1,7 @@
 import http from "k6/http";
 import ws from "k6/ws";
+import execution from "k6/execution";
+import { sleep } from "k6";
 import { Counter, Rate, Trend } from "k6/metrics";
 import { parseWorkloadConfig, workloadOptions } from "./config.js";
 import { deterministicUuid, workloadCommandType, workloadTargetUuid } from "./identity.js";
@@ -25,6 +27,16 @@ import {
   parseSocketPacket,
   pongFor,
 } from "./protocol.js";
+import {
+  SCALE_RAMP_DOWN_DURATION_MS,
+  SCALE_RAMP_DOWN_START_MS,
+  SCALE_TOTAL_DURATION_MS,
+  createScaleSessionOwnership,
+  scaleSessionCloseAtMs,
+  scaleParkDurationSeconds,
+  shouldCloseScaleSession,
+  shouldClassifySocketFailure,
+} from "./scale-session.js";
 
 const config = parseWorkloadConfig(globalThis.__ENV);
 export const options = workloadOptions(config);
@@ -39,7 +51,16 @@ const duplicateEvents = new Counter("converge_duplicate_events");
 const sequenceGaps = new Counter("converge_sequence_gaps");
 const commandsAcknowledged = new Counter("converge_commands_acknowledged");
 const liveEventsReceived = new Counter("converge_live_events_received");
+const snapshotRequests = new Counter("converge_snapshot_requests");
+const scaleSessionsStarted = new Counter("converge_scale_sessions_started");
+const rangeRequests = new Counter("converge_range_requests");
+const scaleSessionsInitialized = new Counter("converge_scale_sessions_initialized");
+const scaleSessionsCompleted = new Counter("converge_scale_sessions_completed");
+const scaleSecondInvocations = new Counter("converge_scale_second_invocations");
+const scaleUnexpectedDisconnects = new Counter("converge_scale_unexpected_disconnects");
+const scaleSessionFailures = new Counter("converge_scale_session_failures");
 let boundedObjectInitialized = false;
+const scaleSessionOwnership = createScaleSessionOwnership();
 
 function tags(outcome, operationType = "object.create") {
   return { profile: config.profile, operation_type: operationType, outcome };
@@ -139,6 +160,25 @@ function snapshotSchemaReason(error) {
 }
 
 export default function collaborationWorkload() {
+  const persistentScale = config.profile === "scale-step";
+  if (persistentScale && !scaleSessionOwnership.start()) {
+    scaleSecondInvocations.add(1, tags("detected"));
+    scaleSessionFailures.add(1, { ...tags("failed"), reason: "stale_lifecycle" });
+    iterationFailures.add(true, { ...tags("failed"), reason: "stale_lifecycle" });
+    protocolFailures.add(true, tags("failed"));
+    if (config.debugFailures)
+      globalThis.console.log(
+        `converge_failure vu=${globalThis.__VU} iteration=${globalThis.__ITER} phase=closed reason=stale_lifecycle`,
+      );
+    sleep(
+      scaleParkDurationSeconds(
+        Date.now() - execution.scenario.startTime,
+        config.debugScaleGate ? 20_000 : SCALE_TOTAL_DURATION_MS,
+      ),
+    );
+    return;
+  }
+  if (persistentScale) scaleSessionsStarted.add(1, tags("started"));
   const startedAt = Date.now();
   const clientId = identity("client", 0);
   let failed = false;
@@ -191,6 +231,11 @@ export default function collaborationWorkload() {
         terminal: lifecycle.snapshot().terminal,
         activeCommand: activeCommand !== undefined,
       });
+      if (persistentScale) {
+        scaleSessionFailures.add(1, { ...tags("failed"), reason: failureReason });
+        if (failureReason === "unexpected_close")
+          scaleUnexpectedDisconnects.add(1, tags("unexpected"));
+      }
       if (config.debugPhases || config.debugFailures) {
         const evidence = error?.snapshotEvidence;
         const overlap = error?.reconciliationEvidence;
@@ -222,6 +267,7 @@ export default function collaborationWorkload() {
         if (after > watermark) throw new ProtocolFailure("SEQUENCE_REGRESSION");
         for (let page = 0; after < watermark && page < 10; page += 1) {
           stage = "range_request";
+          rangeRequests.add(1, tags("requested"));
           const result = http.get(
             `${config.baseUrl}/v1/boards/${config.boardId}/operations?after=${after}&watermark=${watermark}`,
             { headers: { Authorization: `Bearer ${config.authToken}` }, tags: {} },
@@ -260,6 +306,8 @@ export default function collaborationWorkload() {
 
     const loadSnapshot = () => {
       lifecycle.note("snapshot_requested");
+      if (persistentScale) scaleSessionOwnership.snapshotRequested();
+      snapshotRequests.add(1, tags("requested"));
       let result;
       try {
         result = http.get(`${config.baseUrl}/v1/boards/${config.boardId}`, {
@@ -313,7 +361,23 @@ export default function collaborationWorkload() {
 
     const scheduleNextCommand = () => {
       if (failed || revoked) return close(false);
-      if (commandOrdinal >= config.commandsPerClient) return close(true);
+      const closeBoundary = persistentScale
+        ? scaleSessionCloseAtMs({
+            vu: Number(globalThis.__VU ?? 0),
+            maximumVus: config.debugScaleGate ? 10 : 100,
+            rampDownStartMs: config.debugScaleGate ? 15_000 : SCALE_RAMP_DOWN_START_MS,
+            rampDownDurationMs: config.debugScaleGate ? 5_000 : SCALE_RAMP_DOWN_DURATION_MS,
+            closeMarginMs: config.debugScaleGate ? 4_000 : 5_000,
+          })
+        : 0;
+      const elapsed = Date.now() - execution.scenario.startTime;
+      if (
+        persistentScale &&
+        commandOrdinal >= config.commandsPerClient &&
+        shouldCloseScaleSession(elapsed, closeBoundary)
+      )
+        return close(true);
+      if (!persistentScale && commandOrdinal >= config.commandsPerClient) return close(true);
       lifecycle.schedule(
         socket,
         () => {
@@ -431,6 +495,7 @@ export default function collaborationWorkload() {
             lifecycle.note("prejoin_buffer_reconciled");
             joined = true;
             lifecycle.joined();
+            if (persistentScale) scaleSessionsInitialized.add(1, tags("initialized"));
             scheduleNextCommand();
             return;
           }
@@ -452,6 +517,7 @@ export default function collaborationWorkload() {
                   shouldRunCommandTimeout(acknowledgedOperationId, activeCommand, "liveReceived")
                 ) {
                   classifyTimeout("live_delivery");
+                  if (persistentScale) throw new ProtocolFailure("LIVE_DELIVERY_TIMEOUT");
                   catchUp(result.operation.seq);
                   if (!tracker.has(result.operation.opId))
                     throw new ProtocolFailure("LIVE_DELIVERY_TIMEOUT");
@@ -492,9 +558,11 @@ export default function collaborationWorkload() {
         fail(error);
       }
     });
-    socket.on("error", () => fail(new ProtocolFailure("WEBSOCKET_ERROR")));
+    socket.on("error", () => {
+      if (shouldClassifySocketFailure(complete)) fail(new ProtocolFailure("WEBSOCKET_ERROR"));
+    });
     socket.on("close", () => {
-      if (!complete) fail(new ProtocolFailure("WEBSOCKET_CLOSED"));
+      if (shouldClassifySocketFailure(complete)) fail(new ProtocolFailure("WEBSOCKET_CLOSED"));
     });
     socket.setTimeout(() => {
       if (!connected && !failed) {
@@ -514,6 +582,7 @@ export default function collaborationWorkload() {
     failurePhase = currentPhase;
     failureReason = postConnectReason;
     protocolFailed = postConnectReason === "stale_lifecycle";
+    if (persistentScale) scaleSessionFailures.add(1, { ...tags("failed"), reason: failureReason });
     lifecycle.fail();
     if (config.debugPhases || config.debugFailures)
       globalThis.console.log(
@@ -527,4 +596,13 @@ export default function collaborationWorkload() {
       : tags("completed"),
   );
   protocolFailures.add(protocolFailed, tags(protocolFailed ? "failed" : "valid"));
+  if (persistentScale) {
+    if (!failed) scaleSessionsCompleted.add(1, tags("completed"));
+    sleep(
+      scaleParkDurationSeconds(
+        Date.now() - execution.scenario.startTime,
+        config.debugScaleGate ? 20_000 : SCALE_TOTAL_DURATION_MS,
+      ),
+    );
+  }
 }

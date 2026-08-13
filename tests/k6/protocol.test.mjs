@@ -449,6 +449,18 @@ test("validates safe profiles explicit stateful configuration and remote opt-in"
   assert.equal(baseline.workloadModel, "bounded");
   assert.equal(smoke.workloadModel, "create-only");
   const scaleStep = parseWorkloadConfig({ ...base, CONVERGE_PROFILE: "scale-step" });
+  assert.equal(scaleStep.workloadModel, "bounded");
+  assert.equal(scaleStep.commandsPerClient, 10);
+  assert.equal(scaleStep.commandIntervalMs, 250);
+  assert.deepEqual(scaleStep.stages, [
+    { duration: "15s", target: 10 },
+    { duration: "30s", target: 10 },
+    { duration: "30s", target: 50 },
+    { duration: "45s", target: 50 },
+    { duration: "30s", target: 100 },
+    { duration: "60s", target: 100 },
+    { duration: "15s", target: 0 },
+  ]);
   const debug = parseWorkloadConfig({ ...base, CONVERGE_DEBUG_PHASES: "true" });
   for (const config of [smoke, baseline, scaleStep, debug])
     assert.strictEqual(workloadOptions(config).summaryTrendStats, K6_SUMMARY_TREND_STATS);
@@ -462,9 +474,20 @@ test("validates safe profiles explicit stateful configuration and remote opt-in"
     "p(95)",
     "p(99)",
   ]);
-  assert.equal(
-    parseWorkloadConfig({ ...base, CONVERGE_PROFILE: "scale-step" }).stages.at(-1).target,
-    0,
+  assert.deepEqual(workloadOptions(scaleStep).stages, scaleStep.stages);
+  assert.deepEqual(
+    workloadOptions(
+      parseWorkloadConfig({
+        ...base,
+        CONVERGE_PROFILE: "scale-step",
+        CONVERGE_DEBUG_SCALE_GATE: "true",
+      }),
+    ).stages,
+    [
+      { duration: "5s", target: 10 },
+      { duration: "10s", target: 10 },
+      { duration: "5s", target: 0 },
+    ],
   );
   assert.throws(
     () =>
@@ -509,10 +532,16 @@ test("validates safe profiles explicit stateful configuration and remote opt-in"
     ),
     false,
   );
+  assert.deepEqual(workloadOptions(scaleStep).thresholds.converge_scale_second_invocations, [
+    "count==0",
+  ]);
+  assert.deepEqual(workloadOptions(scaleStep).thresholds.converge_scale_session_failures, [
+    "count==0",
+  ]);
 });
 
 test("keeps the custom metric and tag catalogs fixed and low-cardinality", () => {
-  assert.equal(K6_METRIC_NAMES.length, 10);
+  assert.equal(K6_METRIC_NAMES.length, 18);
   assert.deepEqual(K6_ALLOWED_TAGS, ["profile", "operation_type", "outcome", "reason"]);
   assert.doesNotMatch(
     JSON.stringify(K6_ALLOWED_TAGS),

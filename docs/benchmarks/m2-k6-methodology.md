@@ -13,7 +13,7 @@ namespace authentication, event packets with acknowledgement IDs, acknowledgemen
 events, connection errors, and disconnects. Unknown, malformed, oversized, or uncorrelated packets
 fail the iteration.
 
-Each virtual user:
+Each smoke or baseline virtual user:
 
 1. opens a WebSocket-only Engine.IO v4 connection and authenticates the Socket.IO namespace with the
    configured opaque token;
@@ -27,6 +27,13 @@ Each virtual user:
    the acknowledgement deadline, then strictly validates contiguous authoritative catch-up evidence;
 7. terminates participation on access revocation; and
 8. sends a Socket.IO disconnect and closes the WebSocket.
+
+The exploratory `scale-step` profile uses different lifecycle ownership: each VU loads one snapshot,
+joins once, keeps one connection open, creates one stable object if needed, and submits sequential
+`object.update` mutations every 250 ms. It closes before ramp-down and remains parked inside the
+same invocation, preventing reconnect and snapshot amplification. This persistent profile and its
+streaming harness remain reproducible diagnostic tooling, but the recorded local scale observation
+failed its session-correctness gates and is not accepted benchmark evidence.
 
 The workload retains only a bounded 256-operation deduplication window and current sequence evidence,
 not the board projection. Publication and delivery remain at least once: duplicate detection is a
@@ -47,11 +54,11 @@ projection cardinality instead plateaus at the number of initialized VUs while d
 
 These are configuration presets, not measured claims:
 
-| Profile      | Preset                                                          | Use                                                        |
-| ------------ | --------------------------------------------------------------- | ---------------------------------------------------------- |
-| `smoke`      | 2 VUs, 30 seconds, 2 commands/client, 1-second command interval | Protocol and topology validation only                      |
-| `baseline`   | 10 VUs, 2 minutes, 10 commands/client                           | Explicit opt-in controlled baseline; never automatic in CI |
-| `scale-step` | 10 VUs for 1m, 50 for 2m, 100 for 2m, then 30s drain            | Explicit opt-in later scale study; not run in this slice   |
+| Profile      | Preset                                                                                    | Use                                                        |
+| ------------ | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `smoke`      | 2 VUs, 30 seconds, 2 commands/client, 1-second command interval                           | Protocol and topology validation only                      |
+| `baseline`   | 10 VUs, 2 minutes, 10 commands/client                                                     | Explicit opt-in controlled baseline; never automatic in CI |
+| `scale-step` | 15s ramp/30s hold at 10, 30s ramp/45s hold at 50, 30s ramp/60s hold at 100, 15s ramp down | Explicit opt-in exploratory local scale observation        |
 
 There is no 10,000-user local default. Tests at 1,000 or 10,000 connected clients require provisioned
 distributed infrastructure, isolated data, capacity planning, and a separately reviewed execution
@@ -99,7 +106,11 @@ Custom metric names are fixed:
   `converge_command_ack_duration`, `converge_live_delivery_duration`;
 - rates: `converge_iteration_failures`, `converge_protocol_failures`; and
 - counters: `converge_duplicate_events`, `converge_sequence_gaps`,
-  `converge_commands_acknowledged`, `converge_live_events_received`.
+  `converge_commands_acknowledged`, `converge_live_events_received`,
+  `converge_snapshot_requests`, `converge_range_requests`,
+  `converge_scale_sessions_started`, `converge_scale_sessions_initialized`,
+  `converge_scale_sessions_completed`, `converge_scale_second_invocations`,
+  `converge_scale_unexpected_disconnects`, and `converge_scale_session_failures`.
 
 Only `profile`, `operation_type`, `outcome`, and a fixed allowlisted failure `reason` may be attached
 by the workload. Board, principal,
@@ -139,4 +150,7 @@ capacity claim.
 Accepted artifacts are versioned directories containing sanitized run metadata, k6 JSON summary
 output, threshold/correctness status, aggregate evidence, and operator notes. Raw application
 payloads and identifiers are never artifacts. The controlled baseline result is recorded at
-`docs/benchmarks/results/m2-k6-baseline-20260813T125350228Z/`. Scale results remain deferred.
+`docs/benchmarks/results/m2-k6-baseline-20260813T125350228Z/`. The failed local scale executions are
+documented separately as an [unaccepted observation](./m2-scale-step-observation.md); no accepted
+scale result directory exists. High-concurrency refinement and any further scale execution are
+deferred to a future performance milestone.

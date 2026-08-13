@@ -6,6 +6,8 @@ import {
   collectPostFailureEvidence,
   durableEvidenceSql,
   readK6FailureDiagnostic,
+  aggregateFailureDiagnostics,
+  runStreamingCommand,
   runWithOwnedCleanup,
   validateDurableEvidence,
   validateEnvironmentArtifact,
@@ -25,6 +27,14 @@ function passingSummary() {
       converge_commands_acknowledged: { count: 4 },
       converge_live_events_received: { count: 8 },
       converge_duplicate_events: { count: 0 },
+      converge_snapshot_requests: { count: 2 },
+      converge_scale_sessions_started: { count: 0 },
+      converge_range_requests: { count: 0 },
+      converge_scale_sessions_initialized: { count: 0 },
+      converge_scale_sessions_completed: { count: 0 },
+      converge_scale_second_invocations: { ...threshold, count: 0 },
+      converge_scale_unexpected_disconnects: { ...threshold, count: 0 },
+      converge_scale_session_failures: { ...threshold, count: 0 },
     },
   };
 }
@@ -41,6 +51,21 @@ test("accepts only the required sanitized environment metadata", () => {
     profile: "smoke",
     virtualUsers: 2,
     duration: "30s",
+    apiReplicas: 1,
+    workerReplicas: 1,
+    configuration: { delivery: "distributed", transport: "socket.io-v4" },
+  });
+  validateEnvironmentArtifact({
+    timestampUtc: "2026-08-13T00:00:00.000Z",
+    gitCommitSha: "c".repeat(40),
+    k6Version: "0.57.0",
+    nodeVersion: "22.18.0",
+    pnpmVersion: "10.15.0",
+    os: "darwin",
+    architecture: "arm64",
+    profile: "scale-step",
+    virtualUsers: 100,
+    duration: "3m45s",
     apiReplicas: 1,
     workerReplicas: 1,
     configuration: { delivery: "distributed", transport: "socket.io-v4" },
@@ -105,6 +130,92 @@ test("propagates nonzero k6 status and threshold failures", async () => {
   const failed = passingSummary();
   failed.metrics.converge_command_ack_duration.thresholds.gate = true;
   assert.throws(() => validateK6Summary(failed), /k6 threshold failed/);
+});
+
+test("scale-step validation preserves fixed gates without inventing an acknowledgement threshold", () => {
+  const summary = passingSummary();
+  delete summary.metrics.converge_command_ack_duration;
+  summary.metrics.converge_snapshot_requests.count = 10;
+  summary.metrics.converge_scale_sessions_started.count = 10;
+  summary.metrics.converge_scale_sessions_initialized.count = 10;
+  summary.metrics.converge_scale_sessions_completed.count = 10;
+  assert.doesNotThrow(() =>
+    validateK6Summary(summary, {
+      requireCommandAckThreshold: false,
+      maximumSnapshots: 10,
+      expectedScaleSessions: 10,
+      requirePersistentScaleEvidence: true,
+    }),
+  );
+  summary.metrics.converge_snapshot_requests.count = 11;
+  assert.throws(
+    () =>
+      validateK6Summary(summary, {
+        requireCommandAckThreshold: false,
+        maximumSnapshots: 10,
+        expectedScaleSessions: 10,
+        requirePersistentScaleEvidence: true,
+      }),
+    /snapshot request budget/,
+  );
+  assert.throws(() => validateK6Summary(summary), /converge_command_ack_duration/);
+});
+
+test("streams unbounded child output while retaining only a bounded sanitized tail", async () => {
+  const wrapped =
+    'time="2026-08-13T15:00:00Z" level=info msg="converge_failure vu=1 iteration=1 phase=joined reason=unexpected_close" source=console\n';
+  const result = await runStreamingCommand(
+    process.execPath,
+    [
+      "-e",
+      `process.stdout.write(${JSON.stringify(wrapped)});process.stdout.write('x'.repeat(5*1024*1024));process.stderr.write('fixed-tail')`,
+    ],
+    { tailBytes: 1_024 },
+  );
+  assert.equal(result.status, 0);
+  assert.ok(result.stdoutBytes > 4 * 1024 * 1024);
+  assert.ok(Buffer.byteLength(result.stdoutTail) <= 1_024);
+  assert.equal(result.stderrTail, "fixed-tail");
+  assert.deepEqual(result.failureDiagnostics, {
+    invalid: 0,
+    counts: [{ phase: "joined", reason: "unexpected_close", count: 1 }],
+  });
+});
+
+test("aggregates only fixed phase and reason diagnostics", () => {
+  assert.deepEqual(
+    aggregateFailureDiagnostics(
+      "private-token\nconverge_failure vu=7 iteration=9 phase=joined reason=unexpected_close\nconverge_failure vu=8 iteration=4 phase=joined reason=unexpected_close secret=value",
+    ),
+    {
+      invalid: 1,
+      counts: [{ phase: "joined", reason: "unexpected_close", count: 1 }],
+    },
+  );
+});
+
+test("accepts only the pinned-k6 fixed console wrapper", () => {
+  assert.deepEqual(
+    aggregateFailureDiagnostics(
+      'time="2026-08-13T15:00:00+05:30" level=info msg="converge_failure vu=9 iteration=0 phase=snapshot_response_received reason=snapshot_http_status status=429" source=console',
+    ),
+    {
+      invalid: 0,
+      counts: [
+        {
+          phase: "snapshot_response_received",
+          reason: "snapshot_http_status",
+          count: 1,
+        },
+      ],
+    },
+  );
+  assert.deepEqual(
+    aggregateFailureDiagnostics(
+      'level=warn msg="converge_failure vu=1 iteration=1 phase=joined reason=unexpected_close private=secret"',
+    ),
+    { invalid: 1, counts: [] },
+  );
 });
 
 test("nonzero k6 status retains fixed diagnostics without hiding the original failure", async () => {

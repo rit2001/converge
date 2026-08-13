@@ -28,12 +28,13 @@ const workloadVariables = [
   "CONVERGE_DEBUG_BOUNDED_ONE",
   "CONVERGE_DEBUG_BOUNDED_TWO",
   "CONVERGE_DEBUG_BOUNDED_TEN",
+  "CONVERGE_DEBUG_SCALE_GATE",
   "CONVERGE_DEBUG_FAILURES",
 ];
 const debugOnce = process.env.CONVERGE_K6_DEBUG_ONCE === "true";
 const profile = process.env.CONVERGE_PROFILE ?? "smoke";
-if (profile !== "smoke" && profile !== "baseline") {
-  process.stderr.write("The guarded runner supports only smoke and baseline profiles.\n");
+if (profile !== "smoke" && profile !== "baseline" && profile !== "scale-step") {
+  process.stderr.write("The guarded runner supports only approved benchmark profiles.\n");
   process.exit(1);
 }
 
