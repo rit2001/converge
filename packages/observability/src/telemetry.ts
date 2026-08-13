@@ -12,6 +12,7 @@ export const DEFAULT_DURATION_BUCKETS_SECONDS = Object.freeze([
 const metricCatalog = {
   converge_delivery_events_total: {
     type: "counter",
+    description: "Final distributed delivery event outcomes.",
     labels: {
       event_type: ["operation", "membership_revoked"],
       outcome: ["handled", "duplicate", "quarantined", "failed"],
@@ -19,6 +20,7 @@ const metricCatalog = {
   },
   converge_delivery_state_transitions_total: {
     type: "counter",
+    description: "Actual distributed delivery readiness state transitions.",
     labels: {
       source: ["consumer", "watchdog", "socket_readiness"],
       state: ["established", "unavailable", "recovering", "recovered", "terminal"],
@@ -26,22 +28,26 @@ const metricCatalog = {
   },
   converge_outbox_publications_total: {
     type: "counter",
+    description: "Final transactional outbox publication attempt outcomes.",
     labels: { outcome: ["published", "retry", "blocked", "stale"] },
   },
   converge_snapshot_runs_total: {
     type: "counter",
+    description: "Final authoritative snapshot capture attempt outcomes.",
     labels: {
       outcome: ["captured", "busy", "no_progress", "deterministic_failure", "transient_failure"],
     },
   },
   converge_compaction_runs_total: {
     type: "counter",
+    description: "Final authoritative compaction attempt outcomes.",
     labels: {
       outcome: ["compacted", "no_progress", "no_boundary", "blocked", "transient_failure"],
     },
   },
   converge_recovery_requests_total: {
     type: "counter",
+    description: "Classified API recovery request outcomes.",
     labels: {
       outcome: [
         "snapshot_tail",
@@ -54,29 +60,58 @@ const metricCatalog = {
   },
   converge_outbox_publication_duration_seconds: {
     type: "histogram",
+    description: "Transactional outbox publication attempt duration in seconds.",
     labels: {},
     buckets: DEFAULT_DURATION_BUCKETS_SECONDS,
   },
   converge_snapshot_duration_seconds: {
     type: "histogram",
+    description: "Authoritative snapshot capture attempt duration in seconds.",
     labels: {},
     buckets: DEFAULT_DURATION_BUCKETS_SECONDS,
   },
   converge_compaction_duration_seconds: {
     type: "histogram",
+    description: "Authoritative compaction attempt duration in seconds.",
     labels: {},
     buckets: DEFAULT_DURATION_BUCKETS_SECONDS,
   },
   converge_recovery_duration_seconds: {
     type: "histogram",
+    description: "Complete API recovery request duration in seconds.",
     labels: {},
     buckets: DEFAULT_DURATION_BUCKETS_SECONDS,
   },
-  converge_socket_ready: { type: "gauge", labels: {}, value: "binary" },
-  converge_delivery_consumer_ready: { type: "gauge", labels: {}, value: "binary" },
-  converge_outbox_active_work: { type: "gauge", labels: {}, value: "active_work" },
-  converge_snapshot_active_work: { type: "gauge", labels: {}, value: "active_work" },
-  converge_compaction_active_work: { type: "gauge", labels: {}, value: "active_work" },
+  converge_socket_ready: {
+    type: "gauge",
+    description: "Whether distributed socket delivery is ready.",
+    labels: {},
+    value: "binary",
+  },
+  converge_delivery_consumer_ready: {
+    type: "gauge",
+    description: "Whether the distributed delivery consumer is ready.",
+    labels: {},
+    value: "binary",
+  },
+  converge_outbox_active_work: {
+    type: "gauge",
+    description: "Currently active transactional outbox publication attempts.",
+    labels: {},
+    value: "active_work",
+  },
+  converge_snapshot_active_work: {
+    type: "gauge",
+    description: "Currently active authoritative snapshot captures.",
+    labels: {},
+    value: "active_work",
+  },
+  converge_compaction_active_work: {
+    type: "gauge",
+    description: "Currently active authoritative compaction attempts.",
+    labels: {},
+    value: "active_work",
+  },
 } as const;
 
 function deepFreeze<T>(value: T): Readonly<T> {

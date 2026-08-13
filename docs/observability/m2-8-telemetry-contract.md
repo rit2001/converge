@@ -2,8 +2,8 @@
 
 This contract defines provider-neutral telemetry primitives. Domain code receives an injected
 recorder; it does not depend on Prometheus, OpenTelemetry, a SaaS provider, or a process-global
-registry. API and worker production-path instrumentation is intentionally deferred to later M2.8
-slices.
+registry. API and worker production paths use explicitly owned recorders without changing domain
+outcomes.
 
 ## Metric catalog
 
@@ -75,5 +75,25 @@ The safe recorder wrapper contains synchronous throws and asynchronous rejection
 fallback notification may run for each failed telemetry call; fallback failures are suppressed.
 Telemetry therefore cannot change delivery, recovery, snapshot, compaction, or other domain results.
 
-Prometheus or health endpoints, production API/worker instrumentation, dashboards, alert thresholds,
-external collectors, deployment integration, and benchmark claims remain explicitly deferred.
+## Prometheus text rendering
+
+The dependency-free exporter renders immutable recorder snapshots in Prometheus text exposition
+format 0.0.4 with content type `text/plain; version=0.0.4; charset=utf-8`. HELP descriptions, metric
+names, types, label names and values, and histogram buckets come only from the fixed catalog.
+Observed families and label combinations are ordered deterministically; repeated rendering of the
+same snapshot is byte-identical. Label backslashes, double quotes, and newlines use Prometheus
+escaping, numeric output is locale-independent, and the body ends with exactly one newline.
+
+Counters and gauges include only series present in the snapshot. Histograms include cumulative
+catalog buckets in catalog order, a `+Inf` bucket equal to the total count, sum, and count. An
+unobserved histogram has no snapshot series and is omitted. Consequently, a wholly empty snapshot
+renders as one newline.
+
+Rendering validates the immutable snapshot again and fails closed on unknown metrics, unexpected
+labels, type mismatches, duplicate series, invalid values, malformed events, or an invalid histogram
+layout. Structured diagnostic events are validated but never converted to or included in Prometheus
+metrics. The safe rendering wrapper returns one fixed sanitized error and suppresses synchronous or
+asynchronous fallback failures without retaining or mutating the snapshot.
+
+API and worker HTTP exposition, operational health endpoints, dashboards, alert thresholds, external
+collectors, deployment integration, and benchmark claims remain explicitly deferred.
