@@ -77,8 +77,9 @@ Bearer-protected metrics endpoints are complete. The opt-in worker operational l
 separate lifecycle, PostgreSQL-backed core, and Redis/outbox delivery health plus protected metrics.
 Real distributed API observability acceptance is complete against isolated PostgreSQL and Redis
 failure boundaries. Real worker observability acceptance is complete against isolated PostgreSQL and
-Redis failure boundaries. Deployment probe selection, alerts, dashboards, and benchmarks remain
-pending.
+Redis failure boundaries. The provider-neutral SLO, alert-threshold, inhibition/grouping, and
+incident-runbook policy is complete. Executable alert rules and provider integration, deployment
+probe selection, dashboards, and benchmarks remain pending.
 
 ## Deferred by design
 
