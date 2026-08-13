@@ -76,8 +76,9 @@ complete. API liveness, PostgreSQL-backed HTTP readiness, composite socket-readi
 Bearer-protected metrics endpoints are complete. The opt-in worker operational listener now exposes
 separate lifecycle, PostgreSQL-backed core, and Redis/outbox delivery health plus protected metrics.
 Real distributed API observability acceptance is complete against isolated PostgreSQL and Redis
-failure boundaries. Worker observability acceptance, deployment probe selection, alerts, dashboards,
-and benchmarks remain pending.
+failure boundaries. Real worker observability acceptance is complete against isolated PostgreSQL and
+Redis failure boundaries. Deployment probe selection, alerts, dashboards, and benchmarks remain
+pending.
 
 ## Deferred by design
 

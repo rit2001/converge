@@ -1,13 +1,22 @@
 import { execFile } from "node:child_process";
+import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  BoardRepository,
+  BoardSnapshotCandidateRepository,
+  BoardSnapshotRepository,
   createPool,
   OutboxRepository,
   type ClaimedOutboxEvent,
   type DatabasePool,
 } from "@converge/database";
-import type { StructuredLogger } from "@converge/observability";
+import {
+  InMemoryTelemetryRecorder,
+  METRIC_CATALOG,
+  PROMETHEUS_CONTENT_TYPE,
+  type StructuredLogger,
+} from "@converge/observability";
 import {
   decodeDeliveryStreamFields,
   deliveryStreamFieldsSchema,
@@ -15,17 +24,26 @@ import {
   type DeliveryStreamFields,
 } from "@converge/protocol";
 import {
+  CompactionCoordinator,
   OutboxWorker,
   RedisDeliveryStream,
   RedisXaddRejectedError,
   SimulatedWorkerCrash,
+  SnapshotCoordinator,
+  createWorkerApplication,
+  createNodeWorkerOperationalListener,
+  InstanceWorkerOperationalState,
+  parseWorkerEnvironment,
   systemWorkerScheduler,
+  type CompactionCoordinatorScheduler,
   type DeliveryStream,
   type OutboxPublicationRepository,
   type OutboxWorkerConfiguration,
   type OutboxWorkerHooks,
+  type SnapshotCoordinatorScheduler,
   type WorkerScheduler,
 } from "@converge/worker";
+import { createRectangleCommand } from "@converge/testkit";
 import { createClient, type RedisClientType } from "redis";
 
 const sharedDatabaseUrl =
@@ -36,6 +54,7 @@ const runFile = promisify(execFile);
 const testUserId = "00000000-0000-4000-8000-000000000001";
 
 let databaseName: string | undefined;
+let isolatedDatabaseUrl: string | undefined;
 let adminPool: DatabasePool | undefined;
 let pool: DatabasePool;
 let repository: OutboxRepository;
@@ -96,6 +115,7 @@ beforeAll(async () => {
   const isolatedUrl = new URL(sharedDatabaseUrl);
   isolatedUrl.pathname = `/${databaseName}`;
   isolatedUrl.searchParams.delete("options");
+  isolatedDatabaseUrl = isolatedUrl.toString();
   await runFile("pnpm", ["--filter", "@converge/database", "migrate"], {
     cwd: repositoryRoot,
     env: { ...process.env, DATABASE_URL: isolatedUrl.toString() },
@@ -130,6 +150,12 @@ afterAll(async () => {
 
 function uniqueStreamKey(): string {
   const key = `converge:test:m23:${crypto.randomUUID()}`;
+  streamKeys.add(key);
+  return key;
+}
+
+function uniqueWorkerObservabilityStreamKey(): string {
+  const key = `converge:test:m28-worker:${crypto.randomUUID()}`;
   streamKeys.add(key);
   return key;
 }
@@ -216,6 +242,7 @@ async function createWorker(
     stream?: DeliveryStream;
     scheduler?: WorkerScheduler;
     configuration?: Partial<OutboxWorkerConfiguration>;
+    telemetry?: InMemoryTelemetryRecorder;
   } = {},
 ): Promise<OutboxWorker> {
   const stream = options.stream ?? createStream(key);
@@ -227,6 +254,7 @@ async function createWorker(
     logger,
     options.scheduler ?? systemWorkerScheduler,
     hooks,
+    options.telemetry,
   );
 }
 
@@ -270,6 +298,137 @@ function deferred<T>(): {
     reject = fail;
   });
   return { promise, resolve, reject };
+}
+
+class ManualTimerScheduler implements SnapshotCoordinatorScheduler, CompactionCoordinatorScheduler {
+  private nextId = 1;
+  readonly tasks = new Map<number, { callback: () => void; delayMs: number }>();
+
+  setTimeout(callback: () => void, delayMs: number): number {
+    const id = this.nextId++;
+    this.tasks.set(id, { callback, delayMs });
+    return id;
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.tasks.delete(handle as number);
+  }
+}
+
+class ControlledSleepScheduler implements WorkerScheduler {
+  private nextId = 1;
+  readonly sleeps = new Map<
+    number,
+    { delayMs: number; resolve(): void; signal: AbortSignal | undefined }
+  >();
+
+  random(): number {
+    return 0;
+  }
+
+  sleep(delayMs: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const id = this.nextId++;
+      const finish = (): void => {
+        signal?.removeEventListener("abort", finish);
+        this.sleeps.delete(id);
+        resolve();
+      };
+      this.sleeps.set(id, { delayMs, resolve: finish, signal });
+      signal?.addEventListener("abort", finish, { once: true });
+    });
+  }
+
+  release(delayMs: number): void {
+    const task = [...this.sleeps.values()].find((candidate) => candidate.delayMs === delayMs);
+    if (!task) throw new Error(`No controlled sleep is waiting for ${delayMs}ms`);
+    task.resolve();
+  }
+}
+
+class ControlledRealStream implements DeliveryStream {
+  allowConnection = false;
+  failNextAppend = false;
+  private available = false;
+
+  constructor(readonly delegate: RedisDeliveryStream) {}
+
+  async connect(): Promise<void> {
+    if (!this.allowConnection) throw new Error("controlled Redis unavailability");
+    await this.delegate.connect();
+    this.available = true;
+  }
+
+  isReady(): boolean {
+    return this.available && this.delegate.isReady();
+  }
+
+  append(fields: DeliveryStreamFields, signal: AbortSignal): Promise<unknown> {
+    if (this.failNextAppend) {
+      this.failNextAppend = false;
+      this.available = false;
+      this.allowConnection = false;
+      return Promise.reject(new Error("controlled ambiguous Redis failure"));
+    }
+    return this.delegate.append(fields, signal);
+  }
+
+  trimByAge(signal: AbortSignal): Promise<void> {
+    return this.delegate.trimByAge(signal);
+  }
+
+  resetAfterCommandTimeout(): Promise<void> {
+    return this.delegate.resetAfterCommandTimeout();
+  }
+
+  async close(force = false): Promise<void> {
+    this.available = false;
+    await this.delegate.close(force);
+  }
+}
+
+async function allocatePort(): Promise<number> {
+  const server = createNetServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = (server.address() as AddressInfo).port;
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+
+async function operationalRequest(
+  port: number,
+  path: string,
+  authorization?: string,
+): Promise<{ status: number; contentType: string; body: string }> {
+  const response = await fetch(
+    `http://127.0.0.1:${port}${path}`,
+    authorization === undefined ? undefined : { headers: { authorization } },
+  );
+  return {
+    status: response.status,
+    contentType: response.headers.get("content-type") ?? "",
+    body: await response.text(),
+  };
+}
+
+function metricValue(body: string, series: string): number {
+  const line = body.split("\n").find((candidate) => candidate.startsWith(`${series} `));
+  return line === undefined ? 0 : Number(line.slice(series.length + 1));
+}
+
+async function waitFor<T>(read: () => Promise<T>, predicate: (value: T) => boolean): Promise<T> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const value = await read();
+    if (predicate(value)) return value;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Bounded worker observability assertion did not converge");
 }
 
 describe("worker outbox publication crash recovery", () => {
@@ -319,7 +478,8 @@ describe("worker outbox publication crash recovery", () => {
       resetAfterCommandTimeout: () => Promise.resolve(),
       close: () => Promise.resolve(),
     };
-    const worker = await createWorker(key, {}, { stream });
+    const telemetry = new InMemoryTelemetryRecorder();
+    const worker = await createWorker(key, {}, { stream, telemetry });
 
     expect(new Set((await worker.runCycle()).outcomes)).toEqual(
       new Set(["retry_scheduled", "published"]),
@@ -334,17 +494,27 @@ describe("worker outbox publication crash recovery", () => {
       status: "published",
       redis_entry_id: "6000-0",
     });
+    expect(
+      telemetry
+        .snapshot()
+        .counters.filter(({ name }) => name === "converge_outbox_publications_total"),
+    ).toEqual([
+      expect.objectContaining({ labels: { outcome: "published" }, value: 1 }),
+      expect.objectContaining({ labels: { outcome: "retry" }, value: 1 }),
+    ]);
   });
 
   it("blocks an oversized envelope without calling real Redis", async () => {
     const key = uniqueStreamKey();
     const [event] = await seedBoard();
     if (!event) throw new Error("Expected event");
+    const telemetry = new InMemoryTelemetryRecorder();
     const worker = await createWorker(
       key,
       {},
       {
         configuration: { maximumEnvelopeBytes: 1 },
+        telemetry,
       },
     );
 
@@ -356,6 +526,14 @@ describe("worker outbox publication crash recovery", () => {
       redis_entry_id: null,
       last_error_code: "DELIVERY_ENVELOPE_TOO_LARGE",
     });
+    expect(
+      telemetry
+        .snapshot()
+        .counters.find(
+          ({ name, labels }) =>
+            name === "converge_outbox_publications_total" && labels.outcome === "blocked",
+        )?.value,
+    ).toBe(1);
   });
 
   it("does not publish when Redis returns a malformed XADD result", async () => {
@@ -512,16 +690,21 @@ describe("worker outbox publication crash recovery", () => {
     const [event] = await seedBoard();
     if (!event) throw new Error("Expected event");
     let replacement: ClaimedOutboxEvent | undefined;
-    const stale = await createWorker(key, {
-      afterXadd: async () => {
-        await expireLease(event.eventId);
-        [replacement] = await repository.claimAvailable({
-          owner: "replacement-worker",
-          batchSize: 1,
-          leaseDurationMs: 60_000,
-        });
+    const telemetry = new InMemoryTelemetryRecorder();
+    const stale = await createWorker(
+      key,
+      {
+        afterXadd: async () => {
+          await expireLease(event.eventId);
+          [replacement] = await repository.claimAvailable({
+            owner: "replacement-worker",
+            batchSize: 1,
+            leaseDurationMs: 60_000,
+          });
+        },
       },
-    });
+      { telemetry },
+    );
 
     await expect(stale.runCycle()).resolves.toMatchObject({ outcomes: ["stale"] });
     expect(replacement?.eventId).toBe(event.eventId);
@@ -532,6 +715,14 @@ describe("worker outbox publication crash recovery", () => {
       redis_entry_id: null,
     });
     expect(await entriesFor(key)).toHaveLength(1);
+    expect(
+      telemetry
+        .snapshot()
+        .counters.find(
+          ({ name, labels }) =>
+            name === "converge_outbox_publications_total" && labels.outcome === "stale",
+        )?.value,
+    ).toBe(1);
   });
 
   it("publishes one same-board head at a time in delivery order", async () => {
@@ -584,5 +775,439 @@ describe("worker outbox publication crash recovery", () => {
     const retained = await redis.sendCommand(["XRANGE", ageKey, "-", "+"]);
     if (!Array.isArray(retained)) throw new Error("Expected retained entries");
     expect(retained).toHaveLength(1);
+  });
+});
+
+describe("M2.8 worker observability acceptance under real PostgreSQL and Redis failures", () => {
+  it("reports independent readiness and bounded publication, snapshot, compaction, and shutdown evidence", async () => {
+    if (!isolatedDatabaseUrl) throw new Error("Isolated database URL is unavailable");
+    const metricsToken = "m28-worker-observability-acceptance-token";
+    const port = await allocatePort();
+    const disabledPort = await allocatePort();
+    const disabledState = new InstanceWorkerOperationalState();
+    const disabledListener = createNodeWorkerOperationalListener({
+      configuration: {
+        host: "127.0.0.1",
+        port: disabledPort,
+        metricsEnabled: false,
+        metricsBearerToken: "",
+      },
+      state: disabledState,
+    });
+    await disabledListener.start();
+    expect((await operationalRequest(disabledPort, "/metrics")).status).toBe(404);
+    await disabledListener.close();
+
+    const key = uniqueWorkerObservabilityStreamKey();
+    const workerPool = createPool(isolatedDatabaseUrl);
+    const recorder = new InMemoryTelemetryRecorder(1_000);
+    const operationalState = new InstanceWorkerOperationalState();
+    const realStream = new RedisDeliveryStream(
+      redisUrl,
+      key,
+      100_000,
+      24 * 60 * 60 * 1_000,
+      logger,
+    );
+    const controlledStream = new ControlledRealStream(realStream);
+    const reconnectScheduler = new ControlledSleepScheduler();
+    const outboxScheduler = new ControlledSleepScheduler();
+    const snapshotScheduler = new ManualTimerScheduler();
+    const compactionScheduler = new ManualTimerScheduler();
+    const coreStartEntered = deferred<void>();
+    const allowCoreStart = deferred<void>();
+    const targetBoards: { snapshot?: string; compaction?: string } = {};
+    let holdSnapshot = false;
+    let snapshotStarted = deferred<void>();
+    let releaseSnapshot = deferred<void>();
+    let holdCompaction = false;
+    let compactionStarted = deferred<void>();
+    let releaseCompaction = deferred<void>();
+    let holdPublication = false;
+    let publicationStarted = deferred<void>();
+    let releasePublication = deferred<void>();
+    let failMetricsSnapshot = false;
+    let telemetryTime = 0;
+    const telemetryClock = { now: () => (telemetryTime += 100) };
+    let snapshotCoordinator: SnapshotCoordinator | undefined;
+    let compactionCoordinator: CompactionCoordinator | undefined;
+    let outboxWorker: OutboxWorker | undefined;
+    const environment = parseWorkerEnvironment({
+      NODE_ENV: "test",
+      DATABASE_URL: isolatedDatabaseUrl,
+      REDIS_URL: redisUrl,
+      REDIS_STREAM_KEY: key,
+      WORKER_ID: "m28-worker-observability",
+      COMPACTION_ENABLED: "true",
+      WORKER_OPERATIONS_ENABLED: "true",
+      WORKER_OPERATIONS_HOST: "127.0.0.1",
+      WORKER_OPERATIONS_PORT: String(port),
+      WORKER_METRICS_ENABLED: "true",
+      WORKER_METRICS_BEARER_TOKEN: metricsToken,
+      OUTBOX_IDLE_POLL_MS: "250",
+      OUTBOX_POLL_JITTER_RATIO: "0",
+      SNAPSHOT_OPERATION_THRESHOLD: "1000",
+      SNAPSHOT_POLL_INTERVAL_MS: "30000",
+      SNAPSHOT_POLL_JITTER_PERCENT: "1",
+      COMPACTION_POLL_INTERVAL_MS: "300000",
+      COMPACTION_POLL_JITTER_PERCENT: "1",
+      LOG_LEVEL: "silent",
+    });
+    const application = await createWorkerApplication(
+      environment,
+      {
+        createLogger: () => logger,
+        createDatabase: () => workerPool,
+        createStream: () => controlledStream,
+        reconnectScheduler,
+        createSnapshotCoordinator: ({ database, configuration, telemetry, telemetryClock }) => {
+          const repository = new BoardSnapshotCandidateRepository(database as DatabasePool);
+          snapshotCoordinator = new SnapshotCoordinator({
+            repository: {
+              discover: async (options) => {
+                const result = await repository.discover(options);
+                return {
+                  ...result,
+                  candidates: result.candidates.filter(
+                    ({ boardId }) => boardId === targetBoards.snapshot,
+                  ),
+                };
+              },
+              capture: async (boardId, options) => {
+                if (holdSnapshot && boardId === targetBoards.snapshot) {
+                  snapshotStarted.resolve(undefined);
+                  await releaseSnapshot.promise;
+                }
+                return repository.capture(boardId, options);
+              },
+            },
+            configuration,
+            scheduler: snapshotScheduler,
+            random: { next: () => 0.5 },
+            telemetry,
+            telemetryClock,
+          });
+          return {
+            start: async () => {
+              coreStartEntered.resolve(undefined);
+              await allowCoreStart.promise;
+              await snapshotCoordinator!.start();
+            },
+            stop: () => snapshotCoordinator!.stop(),
+          };
+        },
+        createCompactionCoordinator: ({
+          candidates,
+          compaction,
+          configuration,
+          telemetry,
+          telemetryClock,
+        }) => {
+          compactionCoordinator = new CompactionCoordinator({
+            candidates: {
+              discover: async (options) => {
+                const result = await candidates.discover(options);
+                return {
+                  ...result,
+                  candidates: result.candidates.filter(
+                    ({ boardId }) => boardId === targetBoards.compaction,
+                  ),
+                };
+              },
+            },
+            compaction: {
+              compact: async (boardId) => {
+                if (holdCompaction && boardId === targetBoards.compaction) {
+                  compactionStarted.resolve(undefined);
+                  await releaseCompaction.promise;
+                }
+                return compaction.compact(boardId);
+              },
+            },
+            configuration,
+            scheduler: compactionScheduler,
+            random: { next: () => 0.5 },
+            telemetry,
+            telemetryClock,
+          });
+          return compactionCoordinator;
+        },
+        createOutboxPublisher: ({ database, stream, configuration, telemetry, telemetryClock }) => {
+          outboxWorker = new OutboxWorker(
+            new OutboxRepository(database as DatabasePool),
+            stream,
+            configuration,
+            logger,
+            outboxScheduler,
+            {
+              beforeXadd: async () => {
+                if (!holdPublication) return;
+                publicationStarted.resolve(undefined);
+                await releasePublication.promise;
+              },
+            },
+            telemetry,
+            telemetryClock,
+          );
+          return outboxWorker;
+        },
+      },
+      {
+        telemetry: recorder,
+        telemetryClock,
+        operationalState,
+        telemetrySnapshot: () => {
+          if (failMetricsSnapshot) throw new Error("controlled metrics failure");
+          return recorder.snapshot();
+        },
+      },
+    );
+
+    const start = application.start();
+    await coreStartEntered.promise;
+    expect((await operationalRequest(port, "/health/live")).status).toBe(200);
+    expect((await operationalRequest(port, "/health/ready")).status).toBe(503);
+    expect((await operationalRequest(port, "/health/delivery-ready")).status).toBe(503);
+    const missingToken = await operationalRequest(port, "/metrics");
+    const wrongToken = await operationalRequest(port, "/metrics", "Bearer incorrect-token-value");
+    expect(missingToken).toEqual(wrongToken);
+    allowCoreStart.resolve(undefined);
+    await start;
+    await snapshotCoordinator?.runCycle();
+    await compactionCoordinator?.runCycle();
+    expect((await operationalRequest(port, "/health/ready")).status).toBe(200);
+    expect((await operationalRequest(port, "/health/delivery-ready")).status).toBe(503);
+    const scrape = () => operationalRequest(port, "/metrics", `Bearer ${metricsToken}`);
+    const initialMetrics = await scrape();
+    expect(initialMetrics).toMatchObject({ status: 200, contentType: PROMETHEUS_CONTENT_TYPE });
+    for (const gauge of [
+      "converge_outbox_active_work",
+      "converge_snapshot_active_work",
+      "converge_compaction_active_work",
+    ])
+      expect(metricValue(initialMetrics.body, gauge)).toBe(0);
+    expect(await scrape()).toEqual(initialMetrics);
+
+    controlledStream.allowConnection = true;
+    reconnectScheduler.release(250);
+    await waitFor(
+      () => operationalRequest(port, "/health/delivery-ready"),
+      ({ status }) => status === 200,
+    );
+    expect((await operationalRequest(port, "/health/ready")).status).toBe(200);
+
+    const [publishedEvent] = await seedBoard();
+    if (!publishedEvent) throw new Error("Expected publication fixture");
+    holdPublication = true;
+    outboxScheduler.release(250);
+    await publicationStarted.promise;
+    expect(metricValue((await scrape()).body, "converge_outbox_active_work")).toBe(1);
+    releasePublication.resolve(undefined);
+    const publishedState = await waitFor(
+      () => stateFor(publishedEvent.eventId),
+      ({ status }) => status === "published",
+    );
+    const publishedEntries = await entriesFor(key);
+    expect(publishedState.redis_entry_id).toBe(publishedEntries[0]?.id);
+    const publishedMetrics = await scrape();
+    expect(
+      metricValue(publishedMetrics.body, 'converge_outbox_publications_total{outcome="published"}'),
+    ).toBe(1);
+    expect(
+      metricValue(publishedMetrics.body, "converge_outbox_publication_duration_seconds_count"),
+    ).toBe(1);
+    expect(metricValue(publishedMetrics.body, "converge_outbox_active_work")).toBe(0);
+
+    holdPublication = false;
+    publicationStarted = deferred<void>();
+    releasePublication = deferred<void>();
+    const [retryEvent] = await seedBoard();
+    if (!retryEvent) throw new Error("Expected retry fixture");
+    controlledStream.failNextAppend = true;
+    outboxScheduler.release(250);
+    const retryState = await waitFor(
+      () => stateFor(retryEvent.eventId),
+      ({ status }) => status === "retry_wait",
+    );
+    expect(retryState.redis_entry_id).toBeNull();
+    reconnectScheduler.release(250);
+    await waitFor(
+      () => operationalRequest(port, "/health/delivery-ready"),
+      ({ status }) => status === 503,
+    );
+    expect((await operationalRequest(port, "/health/ready")).status).toBe(200);
+    const retryMetrics = await scrape();
+    expect(
+      metricValue(retryMetrics.body, 'converge_outbox_publications_total{outcome="retry"}'),
+    ).toBe(1);
+    expect(
+      metricValue(retryMetrics.body, "converge_outbox_publication_duration_seconds_count"),
+    ).toBe(2);
+    expect(metricValue(retryMetrics.body, "converge_outbox_active_work")).toBe(0);
+
+    const boards = new BoardRepository(pool);
+    const snapshotBoard = await boards.createBoard(
+      testUserId,
+      `m28-snapshot-${crypto.randomUUID()}`,
+    );
+    boardIds.add(snapshotBoard.id);
+    targetBoards.snapshot = snapshotBoard.id;
+    const snapshotHeadsBefore = await pool.query(
+      "SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1",
+      [snapshotBoard.id],
+    );
+    holdSnapshot = true;
+    snapshotStarted = deferred<void>();
+    releaseSnapshot = deferred<void>();
+    const snapshotCycle = snapshotCoordinator!.runCycle();
+    await snapshotStarted.promise;
+    expect(metricValue((await scrape()).body, "converge_snapshot_active_work")).toBe(1);
+    expect((await operationalRequest(port, "/health/ready")).status).toBe(200);
+    expect((await operationalRequest(port, "/health/delivery-ready")).status).toBe(503);
+    releaseSnapshot.resolve(undefined);
+    await snapshotCycle;
+    expect(
+      await pool.query("SELECT count(*)::int count FROM board_snapshots WHERE board_id = $1", [
+        snapshotBoard.id,
+      ]),
+    ).toMatchObject({ rows: [{ count: 1 }] });
+    expect(
+      await pool.query("SELECT last_seq, last_delivery_seq FROM boards WHERE id = $1", [
+        snapshotBoard.id,
+      ]),
+    ).toMatchObject({ rows: snapshotHeadsBefore.rows });
+    const snapshotMetrics = await scrape();
+    expect(
+      metricValue(snapshotMetrics.body, 'converge_snapshot_runs_total{outcome="captured"}'),
+    ).toBe(1);
+    expect(metricValue(snapshotMetrics.body, "converge_snapshot_duration_seconds_count")).toBe(1);
+    expect(metricValue(snapshotMetrics.body, "converge_snapshot_active_work")).toBe(0);
+
+    const compactionBoard = await boards.createBoard(
+      testUserId,
+      `m28-compaction-${crypto.randomUUID()}`,
+    );
+    boardIds.add(compactionBoard.id);
+    const snapshotRepository = new BoardSnapshotRepository(pool);
+    const commitAndPublish = async (baseSeq: number) => {
+      const command = { ...createRectangleCommand(compactionBoard.id), baseSeq };
+      const committed = await boards.commitOperation(testUserId, command);
+      const claims = await repository.claimAvailable({
+        owner: "m28-compaction-fixture",
+        batchSize: 16,
+        leaseDurationMs: 60_000,
+      });
+      const claim = claims.find(({ eventId }) => eventId === committed.event.eventId);
+      if (!claim) throw new Error("Compaction outbox evidence was not claimable");
+      await repository.markPublished({
+        eventId: claim.eventId,
+        leaseToken: claim.leaseToken,
+        publicationId: `${baseSeq + 10}-0`,
+      });
+    };
+    await commitAndPublish(0);
+    await snapshotRepository.create(compactionBoard.id);
+    await commitAndPublish(1);
+    await snapshotRepository.create(compactionBoard.id);
+    await commitAndPublish(2);
+    targetBoards.compaction = compactionBoard.id;
+    holdCompaction = true;
+    compactionStarted = deferred<void>();
+    releaseCompaction = deferred<void>();
+    const compactionCycle = compactionCoordinator!.runCycle();
+    await compactionStarted.promise;
+    expect(metricValue((await scrape()).body, "converge_compaction_active_work")).toBe(1);
+    releaseCompaction.resolve(undefined);
+    await compactionCycle;
+    const compacted = await pool.query<{
+      operation_recovery_floor: string;
+      delivery_recovery_floor: string;
+      operation_count: string;
+      outbox_count: string;
+    }>(
+      `SELECT operation_recovery_floor, delivery_recovery_floor,
+              (SELECT count(*) FROM board_operations WHERE board_id = b.id) operation_count,
+              (SELECT count(*) FROM outbox_events WHERE board_id = b.id) outbox_count
+       FROM boards b WHERE id = $1`,
+      [compactionBoard.id],
+    );
+    expect(compacted.rows[0]).toEqual({
+      operation_recovery_floor: "1",
+      delivery_recovery_floor: "1",
+      operation_count: "2",
+      outbox_count: "2",
+    });
+    const compactionMetrics = await scrape();
+    expect(
+      metricValue(compactionMetrics.body, 'converge_compaction_runs_total{outcome="compacted"}'),
+    ).toBe(1);
+    expect(metricValue(compactionMetrics.body, "converge_compaction_duration_seconds_count")).toBe(
+      1,
+    );
+    expect(metricValue(compactionMetrics.body, "converge_compaction_active_work")).toBe(0);
+    expect((await operationalRequest(port, "/health/ready")).status).toBe(200);
+    expect((await operationalRequest(port, "/health/delivery-ready")).status).toBe(503);
+
+    const beforeRenderFailure = recorder.snapshot();
+    failMetricsSnapshot = true;
+    expect(await scrape()).toMatchObject({
+      status: 503,
+      contentType: "text/plain; charset=utf-8",
+      body: "Metrics unavailable\n",
+    });
+    expect(recorder.snapshot()).toEqual(beforeRenderFailure);
+    failMetricsSnapshot = false;
+    const finalMetrics = await scrape();
+    expect(finalMetrics.body).not.toMatch(
+      /outbox\.publication\.result|snapshot\.capture\.result|compaction\.result|worker\.lifecycle/,
+    );
+    const knownNames = new Set(Object.keys(METRIC_CATALOG));
+    for (const line of finalMetrics.body.split("\n")) {
+      if (line === "" || line.startsWith("#")) continue;
+      const name = (line.split(/[ {]/, 1)[0] ?? "").replace(/_(bucket|sum|count)$/, "");
+      expect(knownNames.has(name)).toBe(true);
+    }
+    const privateValues = [
+      isolatedDatabaseUrl,
+      redisUrl,
+      metricsToken,
+      publishedEvent.boardId,
+      publishedEvent.eventId,
+      retryEvent.boardId,
+      retryEvent.eventId,
+      snapshotBoard.id,
+      compactionBoard.id,
+      publishedState.redis_entry_id ?? "missing-publication-id",
+    ];
+    const eventEvidence = JSON.stringify(recorder.snapshot().events);
+    for (const value of privateValues) {
+      expect(finalMetrics.body).not.toContain(value);
+      expect(eventEvidence).not.toContain(value);
+    }
+
+    const shutdown = application.shutdown("SIGTERM");
+    expect(application.shutdown("SIGINT")).toBe(shutdown);
+    expect(operationalState.isLive()).toBe(false);
+    expect(operationalState.isCoreReady()).toBe(false);
+    expect(operationalState.isDeliveryReady()).toBe(false);
+    await shutdown;
+    operationalState.setCoreReady(true);
+    operationalState.setRedisReady(true);
+    operationalState.setOutboxAccepting(true);
+    expect(operationalState.isCoreReady()).toBe(false);
+    expect(operationalState.isDeliveryReady()).toBe(false);
+    expect(snapshotScheduler.tasks.size).toBe(0);
+    expect(compactionScheduler.tasks.size).toBe(0);
+    expect(outboxScheduler.sleeps.size).toBe(0);
+    expect(reconnectScheduler.sleeps.size).toBe(0);
+    expect(
+      recorder
+        .snapshot()
+        .events.filter(({ eventName }) => eventName === "worker.lifecycle")
+        .map(({ code }) => code),
+    ).toEqual(["STARTING", "READY", "STOPPING", "STOPPED"]);
+    await redis.sendCommand(["DEL", key]);
+    streamKeys.delete(key);
+    expect(await redis.sendCommand(["EXISTS", key])).toBe(0);
   });
 });

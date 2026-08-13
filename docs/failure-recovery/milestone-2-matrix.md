@@ -185,6 +185,45 @@ event, socket, Redis-entry, principal, snapshot/hash, token, URL, SQL, payload, 
 Shutdown records one stopping/stopped lifecycle, zeros both gauges before cleanup, fences late recovery,
 and leaves no API listener, Redis reader, watchdog task, client, worker stream, or database pool open.
 
+## M2.8 worker observability acceptance evidence
+
+The worker acceptance reuses the real outbox failure topology with one temporary PostgreSQL database
+migrated through 0009, a unique `converge:test:m28-worker:*` Redis stream, the production worker
+application and operational listener, real outbox/snapshot/compaction repositories, and deterministic
+component schedulers and repository barriers. Compaction is explicitly enabled. This accepts the
+worker-observability evidence for F02-F08 and F36-F45 without adding deployment behavior.
+
+While snapshot startup is held, liveness is 200 and both core and delivery readiness are 503. After
+PostgreSQL, snapshot, and enabled compaction startup, core readiness becomes 200 while delivery remains
+503 during controlled Redis unavailability. Current-generation Redis establishment changes only
+delivery readiness to 200. All three active-work gauges begin at zero and worker lifecycle evidence is
+exactly starting, ready, stopping, stopped.
+
+A real claimed outbox event holds the active-work gauge at one through the pre-XADD barrier, appends to
+the real Redis stream, and persists that exact entry ID through fenced `markPublished`. It records one
+published result and one duration before returning the gauge to zero. A controlled ambiguous Redis
+failure records retry only after the real repository stores `retry_wait`, records one duration, returns
+active work to zero, and makes delivery readiness unavailable without changing core readiness. The
+real failure cases separately verify that deterministic preparation failure records blocked only after
+the durable blocked transition and a replaced lease records stale without a forbidden transition;
+focused shutdown fencing confirms abandoned work records no false final outcome.
+
+With Redis unavailable, a real genesis snapshot capture and a real safety-delayed compaction each hold
+only their authoritative-call gauge at one, record one successful counter and duration, and return to
+zero. Snapshot capture leaves board heads unchanged. Compaction deletes covered operation/outbox history
+and advances both coupled floors from zero to one while core readiness stays healthy. Focused bounded
+coordinator evidence covers busy, no-progress, no-boundary, deterministic/blocked, and transient outcome
+classification plus unchanged cooldown/retry/concurrency behavior.
+
+Metrics-disabled control returns fixed 404. Missing and incorrect credentials are indistinguishable;
+authorized unchanged scrapes are byte-identical and use the Prometheus content type. Scrapes export only
+fixed-catalog metric series, never structured events. Direct metric/event inspection excludes database
+and Redis URLs, bearer tokens, board/event/operation/snapshot/Redis-entry identifiers, SQL, payloads,
+raw errors, and stacks. A controlled snapshot/render failure returns the fixed 503 without mutating the
+owned recorder. Repeated shutdown marks all readiness false before draining, stops each component once,
+fences late readiness updates, closes the listener/Redis/database owners, clears deterministic timers,
+and removes the retained test stream.
+
 ## Acceptance rules
 
 - Tests assert at-least-once publication and idempotent effects; they must not assert or describe
