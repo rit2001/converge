@@ -89,7 +89,7 @@ function expectStickyPixel(pixel: number[]): void {
 test("two independent clients converge after editing the same board", async ({ browser }) => {
   const contextA = await browser.newContext();
   const pageA = await contextA.newPage();
-  await pageA.goto("/");
+  await pageA.goto("/studio");
   await expect(pageA.locator("header .connection")).toHaveText("ready");
   await expect.poll(() => new URL(pageA.url()).searchParams.get("board")).not.toBeNull();
   const sharedUrl = pageA.url();
@@ -125,7 +125,7 @@ test("a disconnected client catches up on reconnect without a trigger mutation",
 }) => {
   const contextA = await browser.newContext();
   const pageA = await contextA.newPage();
-  await pageA.goto("/");
+  await pageA.goto("/studio");
   await expect(pageA.locator("header .connection")).toHaveText("ready");
   await expect.poll(() => new URL(pageA.url()).searchParams.get("board")).not.toBeNull();
   const boardId = new URL(pageA.url()).searchParams.get("board");
@@ -162,7 +162,7 @@ test("overlapping objects retain their topmost creation order after reload and r
   const lowId = "10000000-0000-4000-8000-000000000002";
   const contextA = await browser.newContext();
   const pageA = await contextA.newPage();
-  await pageA.goto("/");
+  await pageA.goto("/studio");
   await expect(pageA.locator("header .connection")).toHaveText("ready");
   await expect.poll(() => new URL(pageA.url()).searchParams.get("board")).not.toBeNull();
   const boardId = new URL(pageA.url()).searchParams.get("board");

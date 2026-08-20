@@ -15,23 +15,13 @@ import {
   type BoardSessionToken,
 } from "../board-session";
 import { useBoardStore } from "../board-store";
-import type { SynchronizationStatus } from "../board-store";
 import { indexedDbPendingOperationStore } from "../pending-db";
+import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
 import { Button, StatusPill } from "./ui/primitives";
+import { toneForSynchronization, WorkspaceEntryStatus } from "./workspace-entry-status";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
-
-function connectionTone(
-  status: SynchronizationStatus,
-): "success" | "warning" | "danger" | "reconnecting" | "recovering" | "unavailable" {
-  if (status === "ready") return "success";
-  if (status === "catching-up") return "recovering";
-  if (status === "connecting" || status === "joining" || status === "retry-wait")
-    return "reconnecting";
-  if (status === "authorization-failed" || status === "error") return "danger";
-  return "unavailable";
-}
 
 function commandBase(boardId: string, clientId: string, targetId: string, lastSeq: number) {
   return {
@@ -104,13 +94,18 @@ export function Workspace(): React.JSX.Element {
   const [diagnostics, setDiagnostics] = useState(true);
 
   useEffect(() => {
-    const boardId = new URLSearchParams(window.location.search).get("board");
-    const handle = sessions.start(boardId);
-    session.current = handle;
-    return () => {
-      sessions.stop(handle);
-      if (session.current === handle) session.current = null;
-    };
+    return scheduleOwnedSessionStart(
+      () => {
+        const boardId = new URLSearchParams(window.location.search).get("board");
+        const handle = sessions.start(boardId);
+        session.current = handle;
+        return handle;
+      },
+      (handle) => {
+        sessions.stop(handle);
+        if (session.current === handle) session.current = null;
+      },
+    );
   }, [sessions]);
 
   const submit = (command: DurableCommand): Promise<boolean> =>
@@ -202,7 +197,7 @@ export function Workspace(): React.JSX.Element {
         <StatusPill
           className="connection"
           label={store.connection}
-          tone={connectionTone(store.connection)}
+          tone={toneForSynchronization(store.connection)}
           accessibleLabel={`Synchronization status: ${store.connection}`}
         />
         <Button
@@ -256,7 +251,12 @@ export function Workspace(): React.JSX.Element {
         onSelect={(id) => store.select(id)}
         onTransform={transform}
       />
-      {store.error && <div className="error-toast">{store.error}</div>}
+      <WorkspaceEntryStatus status={store.connection} hasBoard={Boolean(store.boardId)} />
+      {store.error && (
+        <div className="error-toast" role="alert">
+          {store.error}
+        </div>
+      )}
       <section className={`diagnostics ${diagnostics ? "open" : ""}`}>
         <button onClick={() => setDiagnostics((value) => !value)}>
           <span>Diagnostics</span>
