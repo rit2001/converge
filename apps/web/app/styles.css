@@ -1417,6 +1417,7 @@ button {
   background-image: radial-gradient(var(--color-canvas-grid-dot, #c8cdd7) 1px, transparent 1px);
   background-position: var(--canvas-grid-offset, 0 0);
   background-size: var(--canvas-grid-size, 22px) var(--canvas-grid-size, 22px);
+  touch-action: none;
 }
 
 .canvas-shell canvas {
@@ -1630,6 +1631,45 @@ button {
 
 .studio-narrow-notice {
   display: none;
+}
+
+[data-editor-capability="view_only"] .studio-narrow-notice {
+  position: absolute;
+  z-index: var(--layer-chrome, 500);
+  top: calc(var(--space-4, 16px) + 60px + var(--space-3, 12px));
+  right: var(--space-3, 12px);
+  left: var(--space-3, 12px);
+  display: grid;
+  gap: var(--space-1, 4px);
+  padding: var(--space-3, 12px) var(--space-4, 16px);
+  border: 1px solid var(--color-border-default, #d9dde5);
+  border-radius: var(--radius-control, 10px);
+  background: var(--color-surface-primary, #ffffff);
+  color: var(--color-text-secondary, #545b6e);
+  font-size: var(--font-size-caption, 0.75rem);
+  pointer-events: none;
+}
+
+[data-editor-capability="view_only"] .studio-narrow-notice strong {
+  color: var(--color-text-primary, #1e2230);
+}
+
+[data-editor-capability="view_only"] .studio-tool-dock {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  [data-editor-capability="view_only"] .ui-tooltip:has(.layers-trigger) {
+    display: contents;
+  }
+
+  [data-editor-capability="view_only"] .layers-trigger {
+    display: inline-flex;
+  }
+
+  [data-editor-capability="view_only"] .layers-panel {
+    display: block;
+  }
 }
 
 .synchronization-trigger {
@@ -2085,5 +2125,11 @@ button {
   .command-palette input {
     border: 1px solid CanvasText;
     forced-color-adjust: auto;
+  }
+}
+
+@media (max-width: 600px) {
+  [data-editor-capability="view_only"] .layers-panel {
+    display: block;
   }
 }

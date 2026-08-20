@@ -9,9 +9,8 @@ describe("layered studio shell contract", () => {
   const styles = read("app/styles.css");
 
   it("wraps the existing workspace in one isolated, labeled full-viewport shell", () => {
-    expect(workspace).toContain(
-      '<main className="workspace studio-shell" aria-label="Converge studio">',
-    );
+    expect(workspace).toContain('className="workspace studio-shell"');
+    expect(workspace).toContain("data-editor-capability={capability}");
     expect(workspace).toContain('aria-label="Board header"');
     expect(workspace).toContain('id="studio-canvas-region"');
     expect(workspace).toContain('aria-label="Board canvas"');
@@ -41,7 +40,7 @@ describe("layered studio shell contract", () => {
     expect(workspace).toContain("rotationControlsHadFocus");
     expect(workspace).toContain("layersTrigger.current?.focus()");
     expect(workspace).toContain(
-      'rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}`}',
+      'rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}:${capability}`}',
     );
   });
 
@@ -75,8 +74,8 @@ describe("layered studio shell contract", () => {
     expect(styles).toMatch(
       /@media \(max-width: 600px\)\s*{[\s\S]*\.studio-narrow-notice\s*{[^}]*pointer-events:\s*none;/s,
     );
-    expect(workspace).toContain("Desktop-first studio");
-    expect(workspace).toContain("optimized for a larger screen");
+    expect(workspace).toContain("View-only on this screen");
+    expect(workspace).toContain("Use a larger screen to edit this board.");
     expect(workspace).toContain("Restore local layers");
     expect(workspace).toContain("store.clearLocalViewControls()");
   });

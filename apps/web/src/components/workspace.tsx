@@ -38,6 +38,7 @@ import {
 } from "../canvas-action-announcer";
 import { readOnboarding, writeOnboarding, type OnboardingState } from "../onboarding";
 import type { PresenceSnapshot, PresenceStore } from "../presence-store";
+import { useEditorCapability } from "../editor-capability";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
 
@@ -170,6 +171,7 @@ export function Workspace({
     });
   }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
+  const capability = useEditorCapability();
   const [creationTool, setCreationTool] = useState<"rectangle" | "sticky" | null>(null);
   const [diagnostics, setDiagnostics] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
@@ -212,6 +214,8 @@ export function Workspace({
     pendingStatus: store.pendingStatus,
   });
   const terminal = store.connection === "authorization-failed" || store.connection === "error";
+  const mutationAllowed =
+    store.connection === "ready" && Boolean(store.boardId) && capability !== "view_only";
   useEffect(() => setOnboarding(readOnboarding(window.localStorage)), []);
   const dismissOnboarding = (state: Exclude<OnboardingState, "unseen">): void => {
     setOnboarding(state);
@@ -254,7 +258,7 @@ export function Workspace({
       ? "Sticky note"
       : "Rectangle";
   const addObject = (kind: "rectangle" | "sticky", center?: { x: number; y: number }): void => {
-    if (!store.boardId) return;
+    if (!store.boardId || !mutationAllowed) return;
     const targetId = crypto.randomUUID();
     const defaultPosition = {
       x: 120 + store.objects.length * 24,
@@ -300,7 +304,7 @@ export function Workspace({
     targetId: string,
     payload: { x?: number; y?: number; width?: number; height?: number; rotation?: number },
   ): void => {
-    if (!store.boardId || store.lockedObjectIds.has(targetId)) return;
+    if (!store.boardId || !mutationAllowed || store.lockedObjectIds.has(targetId)) return;
     const object = store.objects.find((candidate) => candidate.id === targetId);
     const actionLabel = objectActionLabel(targetId);
     const activeSession = session.current;
@@ -336,7 +340,13 @@ export function Workspace({
   const issueViewport = (action: "in" | "out" | "reset"): void =>
     setViewportCommand((current) => ({ id: (current?.id ?? 0) + 1, action }));
   const remove = (): void => {
-    if (!store.boardId || !store.selectedId || store.lockedObjectIds.has(store.selectedId)) return;
+    if (
+      !store.boardId ||
+      !mutationAllowed ||
+      !store.selectedId ||
+      store.lockedObjectIds.has(store.selectedId)
+    )
+      return;
     const targetId = store.selectedId;
     const actionLabel = objectActionLabel(targetId);
     store.select(null);
@@ -395,6 +405,8 @@ export function Workspace({
       selectedHidden: Boolean(selectedObject && store.hiddenObjectIds.has(selectedObject.id)),
       rotateAvailable: rotationAvailable,
       canvasAvailable: store.connection === "ready" && Boolean(store.boardId),
+      mutationAllowed,
+      viewOnly: capability === "view_only",
       action,
     });
   }, [
@@ -407,6 +419,7 @@ export function Workspace({
     store.lockedObjectIds,
     store.committed.lastSeq,
     viewportCenter,
+    mutationAllowed,
   ]);
   useEffect(() => {
     const editable = (target: EventTarget | null): boolean =>
@@ -473,6 +486,10 @@ export function Workspace({
   }, [terminal]);
 
   useEffect(() => {
+    if (capability === "view_only") setCreationTool(null);
+  }, [capability]);
+
+  useEffect(() => {
     if (terminal) setPaletteOpen(false);
   }, [terminal]);
 
@@ -483,7 +500,11 @@ export function Workspace({
   }, [rotationAvailable]);
 
   return (
-    <main className="workspace studio-shell" aria-label="Converge studio">
+    <main
+      className="workspace studio-shell"
+      aria-label="Converge studio"
+      data-editor-capability={capability}
+    >
       <header className="topbar studio-board-header" aria-label="Board header">
         <Link className="brand" href="/" aria-label="Converge home">
           <span className="brand-mark" aria-hidden="true">
@@ -584,6 +605,7 @@ export function Workspace({
               variant="ghost"
               aria-label="Add rectangle"
               data-testid="add-rectangle"
+              disabled={!mutationAllowed}
               onClick={() => {
                 setCreationTool(null);
                 addObject("rectangle");
@@ -598,6 +620,7 @@ export function Workspace({
               variant="ghost"
               aria-label="Add sticky note"
               data-testid="add-sticky"
+              disabled={!mutationAllowed}
               onClick={() => {
                 setCreationTool(null);
                 addObject("sticky");
@@ -622,7 +645,7 @@ export function Workspace({
               className="workspace-tool-button"
               variant="ghost"
               aria-label="Delete selected"
-              disabled={!store.selectedId || selectedObjectLocked}
+              disabled={!mutationAllowed || !store.selectedId || selectedObjectLocked}
               onClick={remove}
             >
               <ToolIcon name="delete" />
@@ -637,8 +660,8 @@ export function Workspace({
           hiddenObjectIds={store.hiddenObjectIds}
           lockedObjectIds={store.lockedObjectIds}
           tool={tool}
-          rotationEnabled={rotationAvailable}
-          rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}`}
+          rotationEnabled={rotationAvailable && mutationAllowed}
+          rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}:${capability}`}
           presence={presence}
           onPresencePointer={publishPresencePointer}
           onSelect={(id) => {
@@ -646,7 +669,9 @@ export function Workspace({
             if (id) announce("Object selected.");
           }}
           onTransform={transform}
-          keyboardEditingEnabled={rotationAvailable}
+          keyboardEditingEnabled={rotationAvailable && mutationAllowed}
+          editingEnabled={mutationAllowed}
+          capability={capability}
           canvasFocusRequest={canvasFocusRequest}
           onViewportCenterChange={setViewportCenter}
           onKeyboardRejected={announce}
@@ -728,19 +753,21 @@ export function Workspace({
             : "Editing is temporarily paused while the board reconnects."}
         </aside>
       )}
-      <aside className="studio-narrow-notice" aria-label="Desktop editor notice">
-        <strong>Desktop-first studio</strong>
-        <span>Canvas editing is optimized for a larger screen.</span>
-        {hasLocalViewControls && (
-          <button
-            className="studio-narrow-reset"
-            type="button"
-            onClick={() => store.clearLocalViewControls()}
-          >
-            Restore local layers
-          </button>
-        )}
-      </aside>
+      {capability === "view_only" && (
+        <aside className="studio-narrow-notice" aria-label="View-only screen notice" role="status">
+          <strong>View-only on this screen</strong>
+          <span>Use a larger screen to edit this board.</span>
+          {hasLocalViewControls && (
+            <button
+              className="studio-narrow-reset"
+              type="button"
+              onClick={() => store.clearLocalViewControls()}
+            >
+              Restore local layers
+            </button>
+          )}
+        </aside>
+      )}
       <section className={`diagnostics studio-system-details ${diagnostics ? "open" : ""}`}>
         <button
           type="button"

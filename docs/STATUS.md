@@ -181,3 +181,7 @@ accessibility certification. Keyboard manipulation, touch policy, and theme work
 M3.7B is complete: keyboard-only users can create supported objects at the visible viewport center and,
 after focusing the labelled Canvas editing surface, move or resize one visible unlocked selection through
 the existing authoritative transform path. Touch policy and theme work remain pending.
+M3.7C1 is complete: responsive capability is local UI policy—full editor on desktop, compact editor on
+tablet/narrow desktop, and view-only below 640 CSS pixels (plus coarse-pointer short landscape). Phone
+view-only retains synchronization, inspection, pan, and zoom while fencing durable mutation; theme
+preference remains pending.

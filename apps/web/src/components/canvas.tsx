@@ -8,6 +8,7 @@ import { normalizeRotation, rotationLabel, rotationPreviewAngle } from "../canva
 import { CANVAS_GRID_SPACING, type AlignmentGuide, snapObjectPosition } from "../canvas/snapping";
 import { keyboardObjectPatch, viewportCenter } from "../canvas/keyboard-manipulation";
 import type { PresenceSnapshot } from "../presence-store";
+import type { EditorCapability } from "../editor-capability";
 
 const EMPTY_OBJECT_IDS: ReadonlySet<string> = new Set();
 
@@ -38,6 +39,8 @@ interface Props {
   canvasFocusRequest?: number;
   onViewportCenterChange?: (center: { x: number; y: number }) => void;
   onKeyboardRejected?: (message: string) => void;
+  editingEnabled?: boolean;
+  capability?: EditorCapability;
 }
 
 export function Canvas({
@@ -59,6 +62,8 @@ export function Canvas({
   canvasFocusRequest = 0,
   onViewportCenterChange,
   onKeyboardRejected,
+  editingEnabled = true,
+  capability = "full_edit",
 }: Props): React.JSX.Element {
   const [viewport, setViewport] = useState({ width: 900, height: 600 });
   const [stage, setStage] = useState({ x: 0, y: 0, scale: 1 });
@@ -76,6 +81,12 @@ export function Canvas({
   const [rotationFeedbackStroke, setRotationFeedbackStroke] = useState("#5146d8");
   const [rotationHandleFill, setRotationHandleFill] = useState("#ffffff");
   const [rotationPreview, setRotationPreview] = useState<RotationPreview | null>(null);
+  const touchGesture = useRef<{
+    distance: number;
+    startScale: number;
+    world: { x: number; y: number };
+  } | null>(null);
+  const ignoreMouseUntil = useRef(0);
   const visibleObjects = useMemo(
     () => objects.filter((object) => !hiddenObjectIds.has(object.id)),
     [hiddenObjectIds, objects],
@@ -94,7 +105,8 @@ export function Canvas({
       ? guides
       : [];
   const canRotate = Boolean(
-    rotationEnabled &&
+    editingEnabled &&
+      rotationEnabled &&
       tool === "select" &&
       selectedId &&
       visibleObjectIds.has(selectedId) &&
@@ -170,7 +182,7 @@ export function Canvas({
 
   useEffect(() => {
     clearGuides();
-  }, [clearGuides, hiddenObjectIds, lockedObjectIds, objects, tool]);
+  }, [capability, clearGuides, hiddenObjectIds, lockedObjectIds, objects, tool]);
 
   const clearRotationPreview = useCallback(() => {
     rotationInteraction.current = null;
@@ -183,6 +195,33 @@ export function Canvas({
     rotationGesture.current = null;
     clearRotationPreview();
   }, [clearRotationPreview]);
+
+  useEffect(() => {
+    if (capability !== "view_only") return;
+    cancelledDragId.current = activeDragId.current;
+    activeDragId.current = null;
+    touchGesture.current = null;
+    stageRef.current?.stopDrag();
+    clearGuides();
+    fenceRotationPreview();
+    onPresencePointer?.(null);
+  }, [capability, clearGuides, fenceRotationPreview, onPresencePointer]);
+
+  useEffect(() => {
+    const clearTouch = (): void => {
+      touchGesture.current = null;
+      cancelledDragId.current = activeDragId.current;
+      activeDragId.current = null;
+      clearGuides();
+      fenceRotationPreview();
+      onPresencePointer?.(null);
+    };
+    window.addEventListener("blur", clearTouch);
+    return () => {
+      window.removeEventListener("blur", clearTouch);
+      clearTouch();
+    };
+  }, [clearGuides, fenceRotationPreview, onPresencePointer]);
 
   useEffect(() => {
     fenceRotationPreview();
@@ -302,7 +341,70 @@ export function Canvas({
         y={stage.y}
         scaleX={stage.scale}
         scaleY={stage.scale}
-        draggable={tool === "pan"}
+        draggable={tool === "pan" || capability === "view_only"}
+        onTouchStart={(event) => {
+          const touches = event.evt.touches;
+          if (touches.length < 2) return;
+          ignoreMouseUntil.current = Date.now() + 800;
+          cancelledDragId.current = activeDragId.current;
+          activeDragId.current = null;
+          stageRef.current?.stopDrag();
+          clearGuides();
+          fenceRotationPreview();
+          const [first, second] = [touches[0], touches[1]];
+          if (!first || !second) return;
+          const midpoint = {
+            x: (first.clientX + second.clientX) / 2,
+            y: (first.clientY + second.clientY) / 2,
+          };
+          touchGesture.current = {
+            distance: Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY),
+            startScale: stage.scale,
+            world: {
+              x: (midpoint.x - stage.x) / stage.scale,
+              y: (midpoint.y - stage.y) / stage.scale,
+            },
+          };
+          onPresencePointer?.(null);
+        }}
+        onTouchMove={(event) => {
+          const gesture = touchGesture.current;
+          const touches = event.evt.touches;
+          if (!gesture || touches.length < 2) return;
+          event.evt.preventDefault();
+          const [first, second] = [touches[0], touches[1]];
+          if (!first || !second) return;
+          const midpoint = {
+            x: (first.clientX + second.clientX) / 2,
+            y: (first.clientY + second.clientY) / 2,
+          };
+          const distance = Math.hypot(
+            second.clientX - first.clientX,
+            second.clientY - first.clientY,
+          );
+          if (!Number.isFinite(distance) || gesture.distance <= 0) return;
+          const scale = Math.min(
+            3,
+            Math.max(0.25, gesture.startScale * (distance / gesture.distance)),
+          );
+          setStage({
+            scale,
+            x: midpoint.x - gesture.world.x * scale,
+            y: midpoint.y - gesture.world.y * scale,
+          });
+        }}
+        onTouchEnd={(event) => {
+          if (event.evt.touches.length < 2) touchGesture.current = null;
+          onPresencePointer?.(null);
+        }}
+        onTouchCancel={() => {
+          touchGesture.current = null;
+          cancelledDragId.current = activeDragId.current;
+          activeDragId.current = null;
+          clearGuides();
+          fenceRotationPreview();
+          onPresencePointer?.(null);
+        }}
         onDragEnd={(event) => {
           clearGuides();
           if (event.target === stageRef.current)
@@ -326,8 +428,9 @@ export function Canvas({
         }}
         onPointerLeave={() => onPresencePointer?.(null)}
         onPointerDown={(event) => {
+          if (event.evt?.pointerType === "mouse" && Date.now() < ignoreMouseUntil.current) return;
           if (event.target !== event.target.getStage()) return;
-          if (creationTool) {
+          if (creationTool && editingEnabled) {
             onCreateFromCanvas?.(creationTool);
             return;
           }
@@ -365,7 +468,7 @@ export function Canvas({
                 width={object.width}
                 height={object.height}
                 rotation={object.rotation}
-                draggable={tool === "select" && !locked}
+                draggable={editingEnabled && tool === "select" && !locked}
                 onClick={() => {
                   if (!locked) onSelect(object.id);
                 }}
@@ -398,11 +501,11 @@ export function Canvas({
                   clearGuides();
                   activeDragId.current = null;
                   cancelledDragId.current = null;
-                  if (!locked && !wasCancelled)
+                  if (editingEnabled && !locked && !wasCancelled)
                     onTransform(object.id, { x: event.target.x(), y: event.target.y() });
                 }}
                 onTransformEnd={(event) => {
-                  if (locked) return;
+                  if (locked || !editingEnabled) return;
                   const node = event.target;
                   if (fencedRotationId.current === object.id) {
                     fencedRotationId.current = null;

@@ -602,6 +602,21 @@ center. Each accepted action uses the normal create/transform submission boundar
 completion announcement after acknowledgement. No keyboard mutation has a separate queue, protocol, or
 optimistic identity heuristic. Locked/hidden, terminal, stale, and unavailable state remain fenced.
 
+### M3.7C1 responsive and touch policy
+
+Editor capability is a local, SSR-stable media policy: ordinary desktop is `full_edit`, supported tablet
+and narrow desktop is `compact_edit`, and widths below 640 CSS pixels are `view_only`. Coarse-pointer
+short landscape also becomes view-only; a fine-pointer short desktop does not. View-only is not an
+authorization change: recovery, remote updates, roster, Layers inspection, Share, Help, synchronization,
+one-finger canvas pan, and pinch zoom continue, while durable creation, transform, rotation, delete, and
+keyboard mutation are fenced with the concise reason “Use a larger screen to edit.”
+
+Touch navigation uses one two-touch gesture record. It preserves the world point under the gesture
+midpoint while clamping zoom to the existing 0.25–3 range and translating the stage with the midpoint.
+A second touch fences any uncommitted drag/transform before pinch starts; touch cancellation, capability
+transition, blur, and unmount clear gesture state and local previews. Touch never publishes a presence
+cursor or a durable navigation operation.
+
 ## M3.8 — Performance, visual regression, and final acceptance
 
 **Preconditions**

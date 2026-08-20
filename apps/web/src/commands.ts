@@ -77,6 +77,8 @@ type CommandInput = Readonly<{
   selectedHidden: boolean;
   rotateAvailable: boolean;
   canvasAvailable: boolean;
+  mutationAllowed: boolean;
+  viewOnly?: boolean;
   action: Record<CommandId, () => void>;
 }>;
 const unavailable = (enabled: boolean, reason: string) =>
@@ -102,12 +104,15 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
     ...unavailable(enabled, "This action is not available right now."),
     execute: input.action[id],
   });
-  const selected = input.hasSelection && !input.selectedLocked && !input.selectedHidden;
-  const selectionReason = input.hasSelection
-    ? input.selectedLocked
-      ? "This object is locked in this view."
-      : "This object is hidden in this view."
-    : "Select an object first.";
+  const selected =
+    input.mutationAllowed && input.hasSelection && !input.selectedLocked && !input.selectedHidden;
+  const selectionReason = !input.ready
+    ? "Board is not ready for editing."
+    : input.hasSelection
+      ? input.selectedLocked
+        ? "This object is locked in this view."
+        : "This object is hidden in this view."
+      : "Select an object first.";
   const commands = [
     add(
       "tool.select",
@@ -125,7 +130,7 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       "Add a rectangle with the existing tool action",
       "Tools",
       ["rectangle", "shape"],
-      input.ready,
+      input.mutationAllowed,
       "R",
     ),
     add(
@@ -134,7 +139,7 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       "Add a sticky note with the existing tool action",
       "Tools",
       ["sticky", "note"],
-      input.ready,
+      input.mutationAllowed,
       "N",
     ),
     add("view.zoom-in", "Zoom in", "Increase canvas zoom", "View", ["zoom", "view"]),
@@ -164,7 +169,7 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       "Create a rectangle at the visible board center",
       "Create",
       ["rectangle", "create", "center", "keyboard"],
-      input.ready,
+      input.mutationAllowed,
     ),
     add(
       "create.sticky-center",
@@ -172,7 +177,7 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       "Create a sticky note at the visible board center",
       "Create",
       ["sticky", "note", "create", "center", "keyboard"],
-      input.ready,
+      input.mutationAllowed,
     ),
     add("panel.layers", "Open Layers", "Show board layers", "Panels", ["layers", "objects"]),
     add(
@@ -260,8 +265,14 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
     ),
   ];
   return commands.map((command) =>
-    command.available || command.category !== "Selection"
-      ? command
-      : { ...command, disabledReason: selectionReason },
+    input.viewOnly &&
+    (command.category === "Create" ||
+      command.id === "tool.rectangle" ||
+      command.id === "tool.sticky" ||
+      command.category === "Selection")
+      ? { ...command, available: false, disabledReason: "Use a larger screen to edit." }
+      : command.available || command.category !== "Selection"
+        ? command
+        : { ...command, disabledReason: selectionReason },
   );
 }

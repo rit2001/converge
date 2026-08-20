@@ -18,6 +18,7 @@ function commands() {
     selectedHidden: false,
     rotateAvailable: true,
     canvasAvailable: true,
+    mutationAllowed: true,
     action,
   });
 }
@@ -51,11 +52,12 @@ describe("workspace command registry", () => {
       selectedHidden: false,
       rotateAvailable: false,
       canvasAvailable: false,
+      mutationAllowed: false,
       action,
     });
     expect(catalog.find((command) => command.id === "selection.delete")).toMatchObject({
       available: false,
-      disabledReason: "Select an object first.",
+      disabledReason: "Board is not ready for editing.",
     });
     expect(searchCommands(catalog, "x".repeat(MAX_COMMAND_QUERY_LENGTH + 20))).toEqual([]);
   });

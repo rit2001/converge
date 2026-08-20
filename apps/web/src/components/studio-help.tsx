@@ -60,6 +60,7 @@ export function StudioHelp({
           the canvas to move a selected object with <kbd>Arrow</kbd>, hold <kbd>Shift</kbd> for 10
           units, or hold <kbd>Alt/Option</kbd> with <kbd>Arrow</kbd> to resize.
         </p>
+        <p>On a phone-sized screen, the board stays view-only; use a larger screen to edit.</p>
         <h3>Organize and collaborate</h3>
         <p>
           Layers and “This view” visibility/locking are local. Rotation is shared. Synchronization

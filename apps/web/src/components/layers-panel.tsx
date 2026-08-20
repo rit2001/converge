@@ -149,12 +149,7 @@ export function LayersPanel({
   };
 
   return (
-    <aside
-      id="layers-panel"
-      className="layers-panel"
-      aria-labelledby="layers-panel-title"
-      aria-label="Board objects"
-    >
+    <aside id="layers-panel" className="layers-panel" aria-label="Board objects">
       <header className="layers-panel__header">
         <div>
           <h2 ref={headingRef} id="layers-panel-title" tabIndex={-1}>
