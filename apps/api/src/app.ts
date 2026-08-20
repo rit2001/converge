@@ -4,6 +4,8 @@ import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { Server, type DefaultEventsMap } from "socket.io";
+import { PresenceRuntime, UnavailablePresenceTransport } from "./presence-runtime.js";
+import { RedisPresenceTransport } from "./presence-redis-transport.js";
 import { z } from "zod";
 import {
   noOpTelemetryRecorder,
@@ -333,6 +335,7 @@ export type ApplicationDeliveryMode =
     };
 
 export interface BuildAppOptions {
+  presenceRuntime?: PresenceRuntime;
   synchronizationBatchSize?: number;
   synchronizationHooks?: SynchronizationHooks;
   deliveryCoordinator?: BoardDeliveryCoordinator;
@@ -665,6 +668,15 @@ export async function buildApp(
     cors: { origin: environment.WEB_ORIGIN, credentials: true },
     maxHttpBufferSize: 64 * 1024,
   });
+  const presenceRuntime =
+    options.presenceRuntime ??
+    new PresenceRuntime(
+      environment.API_PRESENCE_ENABLED
+        ? new RedisPresenceTransport(environment.REDIS_URL)
+        : new UnavailablePresenceTransport(),
+      io as never,
+    );
+  presenceRuntime.start();
 
   const boardRoom = (boardId: string): string => `board:${boardId}`;
   const trackedBoards = new Map<string, { references: number; handledDeliverySeq: number }>();
@@ -727,6 +739,7 @@ export async function buildApp(
     await Promise.all(
       targets.map(async (target) => {
         target.data.revokedBoards.add(boardId);
+        presenceRuntime?.unbind(target.id);
         target.emit("board:access-revoked", event);
         await target.leave(room);
         releaseBoardJoin(target.id, boardId);
@@ -929,7 +942,10 @@ export async function buildApp(
     const user = socket.data.principal;
     let windowStarted = Date.now();
     let commandsInWindow = 0;
-    socket.on("disconnect", () => releaseSocketBoards(socket.id));
+    socket.on("disconnect", () => {
+      presenceRuntime?.unbind(socket.id);
+      releaseSocketBoards(socket.id);
+    });
     socket.on("board:join", async (raw, acknowledge) => {
       if (!socketsAreReady()) return;
       if (typeof acknowledge !== "function") {
@@ -996,6 +1012,10 @@ export async function buildApp(
             joinWatermark,
           }),
         );
+        presenceRuntime?.bind(socket as never, request.boardId, {
+          userId: user.id,
+          displayName: user.displayName,
+        });
       } catch (error) {
         if (!socketsAreReady()) return;
         acknowledge(joinBoardAckSchema.parse(failedAck(error)));
@@ -1130,6 +1150,7 @@ export async function buildApp(
     telemetry.setGauge("converge_socket_ready", {}, 0);
     await stopDeliveryRuntimeOnce();
     await stopBoardDeliveryHeadWatchdogOnce();
+    await presenceRuntime?.stop().catch(() => undefined);
     clearTrackedBoards();
     await closeSocketIoOnce();
   });

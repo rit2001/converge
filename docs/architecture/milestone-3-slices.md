@@ -307,6 +307,18 @@ are used. Publishing a validated full upsert/leave delta to `converge:presence:v
 only after the atomic record change, so publish failure cannot corrupt session storage and maps only
 to presence availability.
 
+**M3.5B2B1 runtime status (complete)**
+
+`PresenceRuntime` is independently supervised behind `API_PRESENCE_ENABLED=false` by default.
+When enabled with the existing valid Redis URL, one API instance owns one presence transport and
+runtime. It binds an authenticated socket only after the durable board join/catch-up acknowledgement,
+then asynchronously admits a server-generated presence session. Redis admission, refresh, publish,
+or recovery failures emit only bounded presence-unavailable evidence: they never delay a join or
+change HTTP readiness, socket-editing readiness, delivery consumption, acknowledgement, recovery,
+or pending-command behavior. Disabled deployments create no Redis presence resources and still
+advertise the unavailable presence capability. Per-binding generations fence replaced, revoked,
+disconnected, and stopped sockets before timers or idempotent leave work can act.
+
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and
   render reduced-motion/accessible cursors without exposing user or session IDs.

@@ -3,13 +3,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { PRESENCE_SNAPSHOT_MAX_SESSIONS } from "@converge/protocol";
 import { RedisPresenceTransport, boardKeys } from "./presence-redis-transport.js";
 
-const redisUrl = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
+const redisUrl = process.env.REDIS_URL;
 const board = "10000000-0000-4000-8000-000000000001";
 const principal = { userId: "20000000-0000-4000-8000-000000000002", displayName: "Ada" };
 const transports: RedisPresenceTransport[] = [];
 const session = (value: number) => `${String(value).padStart(8, "0")}-0000-4000-8000-000000000003`;
 
 afterEach(async () => {
+  if (!redisUrl) return;
   await Promise.all(transports.splice(0).map((transport) => transport.stop()));
   const client = createClient({ url: redisUrl });
   await client.connect();
@@ -23,7 +24,7 @@ afterEach(async () => {
   client.destroy();
 });
 
-describe("RedisPresenceTransport", () => {
+describe.skipIf(!redisUrl)("RedisPresenceTransport", () => {
   it("derives isolated hash-tagged presence keys", () => {
     expect(boardKeys(board, session(1))).toMatchObject({
       index: `converge:presence:v1:{${board}}:sessions`,
@@ -32,8 +33,8 @@ describe("RedisPresenceTransport", () => {
   });
 
   it("atomically admits, refreshes, snapshots, leaves, and exchanges validated deltas", async () => {
-    const first = new RedisPresenceTransport(redisUrl);
-    const second = new RedisPresenceTransport(redisUrl);
+    const first = new RedisPresenceTransport(redisUrl!);
+    const second = new RedisPresenceTransport(redisUrl!);
     transports.push(first, second);
     expect((await first.start()).kind).toBe("ok");
     expect((await second.start()).kind).toBe("ok");
@@ -77,7 +78,7 @@ describe("RedisPresenceTransport", () => {
   });
 
   it("enforces capacity while permitting an admitted session to refresh", async () => {
-    const transport = new RedisPresenceTransport(redisUrl);
+    const transport = new RedisPresenceTransport(redisUrl!);
     transports.push(transport);
     expect((await transport.start()).kind).toBe("ok");
     for (let index = 1; index <= PRESENCE_SNAPSHOT_MAX_SESSIONS; index++)
@@ -115,7 +116,7 @@ describe("RedisPresenceTransport", () => {
   }, 15_000);
 
   it("keeps concurrent admissions bounded and cannot resurrect after a concurrent leave", async () => {
-    const transport = new RedisPresenceTransport(redisUrl);
+    const transport = new RedisPresenceTransport(redisUrl!);
     transports.push(transport);
     expect((await transport.start()).kind).toBe("ok");
     const outcomes = await Promise.all(

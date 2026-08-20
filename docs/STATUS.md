@@ -142,3 +142,7 @@ M3.5B2 runtime presence and M3.5B3 roster/cursor UX remain pending.
 M3.5B2A is complete: an uncomposed, separately owned atomic Redis presence transport now provides
 bounded session records, expiry indexes, revisioned tombstones, snapshots, and validated Pub/Sub
 deltas. Socket.IO admission/scheduling and the frontend presence surface remain pending in B2B/B3.
+
+M3.5B2B1 is complete: presence is independently composed behind `API_PRESENCE_ENABLED`, binds only
+after successful board join acknowledgement, and remains isolated from HTTP/socket editing readiness.
+Real multi-instance presence acceptance and frontend rendering remain pending.
