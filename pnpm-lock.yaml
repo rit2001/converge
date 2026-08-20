@@ -295,9 +295,15 @@ importers:
 
   tests/playwright:
     devDependencies:
+      '@converge/api':
+        specifier: workspace:*
+        version: link:../../apps/api
       '@converge/canvas-engine':
         specifier: workspace:*
         version: link:../../packages/canvas-engine
+      '@converge/database':
+        specifier: workspace:*
+        version: link:../../packages/database
       '@converge/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
@@ -307,6 +313,9 @@ importers:
       '@types/node':
         specifier: 22.18.0
         version: 22.18.0
+      redis:
+        specifier: 6.2.0
+        version: 6.2.0
 
 packages:
 

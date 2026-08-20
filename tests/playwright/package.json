@@ -10,9 +10,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "@converge/api": "workspace:*",
     "@converge/canvas-engine": "workspace:*",
+    "@converge/database": "workspace:*",
     "@converge/protocol": "workspace:*",
     "@playwright/test": "1.55.0",
-    "@types/node": "22.18.0"
+    "@types/node": "22.18.0",
+    "redis": "6.2.0"
   }
 }

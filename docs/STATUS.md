@@ -156,3 +156,6 @@ and deltas, resolves authenticated self evidence, and exposes grouped ephemeral 
 M3.5B3B is complete: the header now presents bounded grouped collaborators and the canvas renders
 non-interactive remote cursors from that ephemeral authority. Final M3.5 multi-client browser acceptance
 remains pending.
+M3.5C1 is complete: a test-owned Playwright harness now composes two independently bundled web origins
+with two production-composed API replicas, a disposable database, real Redis presence, distinct principals,
+and a second owner tab. Final M3.5 browser acceptance remains pending.
