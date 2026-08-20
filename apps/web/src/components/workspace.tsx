@@ -20,10 +20,12 @@ import { normalizeRotation } from "../canvas/rotation";
 import { indexedDbPendingOperationStore } from "../pending-db";
 import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
-import { IconButton, Separator, StatusPill, Tooltip } from "./ui/primitives";
+import { IconButton, Separator, Tooltip } from "./ui/primitives";
 import { LayersPanel } from "./layers-panel";
 import { RotationControls } from "./rotation-controls";
-import { toneForSynchronization, WorkspaceEntryStatus } from "./workspace-entry-status";
+import { WorkspaceEntryStatus } from "./workspace-entry-status";
+import { deriveSynchronizationPresentation } from "../synchronization-presentation";
+import { SynchronizationStatus } from "./synchronization-status";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
 
@@ -164,6 +166,13 @@ export function Workspace(): React.JSX.Element {
       !store.lockedObjectIds.has(selectedObject.id),
   );
   const hasLocalViewControls = store.hiddenObjectIds.size > 0 || store.lockedObjectIds.size > 0;
+  const synchronization = deriveSynchronizationPresentation({
+    hasCurrentSession: Boolean(store.sessionToken),
+    hasBoard: Boolean(store.boardId),
+    connection: store.connection,
+    pendingCount: store.pending.length,
+    pendingStatus: store.pendingStatus,
+  });
 
   const closeLayers = (): void => {
     setLayersOpen(false);
@@ -308,11 +317,9 @@ export function Workspace(): React.JSX.Element {
           <strong>{store.name || "Preparing board"}</strong>
         </div>
         <div className="board-header-status">
-          <StatusPill
-            className="connection"
-            label={store.connection}
-            tone={toneForSynchronization(store.connection)}
-            accessibleLabel={`Synchronization status: ${store.connection}`}
+          <SynchronizationStatus
+            presentation={synchronization}
+            pendingCount={store.pending.length}
           />
           <Tooltip label="Open layers">
             <button
@@ -431,10 +438,13 @@ export function Workspace(): React.JSX.Element {
         {store.selectionNotice}
       </output>
       <WorkspaceEntryStatus status={store.connection} hasBoard={Boolean(store.boardId)} />
-      {store.error && (
-        <div className="error-toast" role="alert">
-          {store.error}
-        </div>
+      {(synchronization.state === "locally_preserved" ||
+        synchronization.state === "reconnecting") && (
+        <aside className="synchronization-notice" role="status">
+          {synchronization.pendingPreservedLocally
+            ? "Pending changes are kept on this device while recovery continues."
+            : "Editing is temporarily paused while the board reconnects."}
+        </aside>
       )}
       <aside className="studio-narrow-notice" aria-label="Desktop editor notice">
         <strong>Desktop-first studio</strong>
@@ -456,7 +466,7 @@ export function Workspace(): React.JSX.Element {
           aria-controls="workspace-diagnostics-panel"
           onClick={() => setDiagnostics((value) => !value)}
         >
-          <span>Diagnostics</span>
+          <span>Technical details</span>
           <b aria-hidden="true">{diagnostics ? "−" : "+"}</b>
         </button>
         <dl id="workspace-diagnostics-panel" hidden={!diagnostics}>

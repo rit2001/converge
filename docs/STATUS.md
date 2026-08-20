@@ -129,3 +129,8 @@ real two-client browser acceptance covers authoritative Canvas/Layers selection 
 local hide/lock isolation and recovery, deterministic drag snapping with transient guides, and
 authoritative rotation controls. Multi-select, undo/redo, grouping, durable reorder or rename,
 presence, sharing, history, and palette work remain excluded from M3.4.
+
+M3.5 is in progress. M3.5A is complete: the workspace derives a fail-closed, bounded synchronization
+presentation from existing BoardStore and pending-queue evidence only. It distinguishes connecting,
+restoring, synced, saving, reconnecting, device-local preservation, access removal, blocked recovery,
+and unavailable states without changing transport, persistence, recovery, or protocol behavior.

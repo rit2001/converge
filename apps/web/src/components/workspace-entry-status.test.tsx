@@ -13,7 +13,7 @@ describe("workspace entry status", () => {
     ["catching-up", true, "Catching up", false],
     ["retry-wait", true, "Recovering", false],
     ["authorization-failed", true, "Access revoked", true],
-    ["error", true, "Unavailable", true],
+    ["error", true, "Recovery needs attention", true],
   ] satisfies Array<[SynchronizationStatus, boolean, string, boolean]>)(
     "maps %s directly from the existing synchronization state",
     (status, hasBoard, label, terminal) => {
@@ -26,14 +26,13 @@ describe("workspace entry status", () => {
     expect(renderToStaticMarkup(<WorkspaceEntryStatus status="ready" hasBoard />)).toBe("");
   });
 
-  it("renders recoverable states as polite status and terminal states as an assertive alert", () => {
+  it("reserves the canvas-covering entry surface for terminal states", () => {
     const recovering = renderToStaticMarkup(<WorkspaceEntryStatus status="retry-wait" hasBoard />);
     const terminal = renderToStaticMarkup(
       <WorkspaceEntryStatus status="authorization-failed" hasBoard />,
     );
 
-    expect(recovering).toContain('aria-live="polite"');
-    expect(recovering).toContain('role="status"');
+    expect(recovering).toBe("");
     expect(terminal).toContain('aria-live="assertive"');
     expect(terminal).toContain('role="alert"');
     expect(terminal).toContain('href="/"');

@@ -48,7 +48,7 @@ describe("layered studio shell contract", () => {
   it("keeps home, synchronization, terminal feedback, and diagnostics reachable", () => {
     expect(workspace).toContain('href="/" aria-label="Converge home"');
     expect(workspace).toContain("WorkspaceEntryStatus");
-    expect(workspace).toContain('role="alert"');
+    expect(workspace).toContain("SynchronizationStatus");
     expect(workspace).toContain("aria-expanded={diagnostics}");
     expect(workspace).toContain('aria-controls="workspace-diagnostics-panel"');
     expect(workspace).toContain('event.key === "Escape" && diagnostics');

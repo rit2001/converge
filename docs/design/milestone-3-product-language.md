@@ -89,6 +89,18 @@ presence colors.
 | Recovery blocked    | “This board cannot be verified safely. Editing is disabled.”                                               | “Continue anyway,” silent snapshot skipping, or destructive reset advice |
 | Persistence failure | “Local edit storage is unavailable. Editing is paused.”                                                    | Continuing optimism without persistence                                  |
 
+### M3.5A synchronization language contract
+
+The compact header status is derived only from current client lifecycle and pending-command evidence.
+Priority is terminal/revoked or blocked recovery; missing current session; reconnect or locally
+preserved pending changes; restoration; pending saves; then ready with zero pending commands. Its
+bounded language is: “Connecting…”, “Restoring board…”, “Synced”, “Saving…”, “Reconnecting…”,
+“Changes kept on this device”, “Access removed”, “Recovery needs attention”, and “Temporarily
+unavailable”. “Synced” means only that this current session is ready with no local pending commands;
+it does not claim global replica parity or delivery to collaborators. Terminal and recovery language
+is sanitized, while technical identifiers and raw errors remain in the secondary diagnostics
+disclosure.
+
 Announcements are deduplicated and rate-limited. Ordinary successful commands do not create toasts.
 
 ## Motion language

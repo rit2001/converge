@@ -69,9 +69,10 @@ export function workspaceStatePresentation(
       };
     case "error":
       return {
-        label: "Unavailable",
-        title: "This board cannot be opened safely",
-        description: "Editing remains disabled because the current state could not be verified.",
+        label: "Recovery needs attention",
+        title: "This board cannot be recovered safely",
+        description:
+          "Editing remains disabled because the current board state could not be verified.",
         tone: "danger",
         terminal: true,
       };
@@ -102,7 +103,7 @@ export function WorkspaceEntryStatus({
   hasBoard: boolean;
 }): React.JSX.Element | null {
   const presentation = workspaceStatePresentation(status, hasBoard);
-  if (!presentation) return null;
+  if (!presentation || !presentation.terminal) return null;
 
   return (
     <section
