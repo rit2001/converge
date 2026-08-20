@@ -350,6 +350,19 @@ other tab remains. It deliberately does not duplicate the separate 45-second TTL
 with a long acceptance wait. This acceptance makes no concurrency or capacity claim; B3 frontend UX
 remains pending.
 
+**M3.5B self-session correction (complete)**
+
+Every socket-specific `board:presence-snapshot` now includes required internal
+`selfPresenceSessionId`. The strict snapshot schema requires exactly one participant with that ID;
+that participant is the sole authoritative source of the receiving client's self user identity and
+display name. Redis storage snapshots deliberately omit this socket-specific field. After admission,
+the runtime verifies that the returned admitted participant occurs exactly once in the bounded storage
+snapshot with matching authenticated principal evidence, then adds the session ID and emits the
+snapshot before available. A mismatch emits only presence unavailable and never affects joining or
+editing. Recovery uses the current fresh binding session, so replacement snapshots deterministically
+replace self evidence; other same-user sessions remain valid multi-tab evidence. The ID is protocol
+evidence only and must never become a visible, accessible, telemetry, diagnostic, or log label.
+
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and
   render reduced-motion/accessible cursors without exposing user or session IDs.

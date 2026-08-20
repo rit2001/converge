@@ -234,6 +234,19 @@ describe.sequential("M3.5B2B2 real multi-instance presence", () => {
         .at(-1)
         ?.participants.filter((p) => p.userId === principal.owner.id),
     ).toHaveLength(2);
+    const ownerSnapshot = ownerA.probe.snapshots.entries.at(-1);
+    const ownerTabSnapshot = ownerTabB.probe.snapshots.entries.at(-1);
+    expect(
+      ownerSnapshot?.participants.some(
+        (p) => p.presenceSessionId === ownerSnapshot.selfPresenceSessionId,
+      ),
+    ).toBe(true);
+    expect(
+      ownerTabSnapshot?.participants.some(
+        (p) => p.presenceSessionId === ownerTabSnapshot.selfPresenceSessionId,
+      ),
+    ).toBe(true);
+    expect(ownerSnapshot?.selfPresenceSessionId).not.toBe(ownerTabSnapshot?.selfPresenceSessionId);
     expect(unrelatedB.probe.upserts.entries.some((event) => event.boardId === board.id)).toBe(
       false,
     );

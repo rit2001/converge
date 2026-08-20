@@ -63,6 +63,12 @@ describe("PresenceRuntime", () => {
     await vi.waitFor(() =>
       expect(socket.emit).toHaveBeenCalledWith("board:presence-snapshot", expect.any(Object)),
     );
+    const snapshot = socket.emit.mock.calls.find(
+      ([event]) => event === "board:presence-snapshot",
+    )?.[1] as {
+      selfPresenceSessionId: string;
+    };
+    expect(snapshot.selfPresenceSessionId).toBe(participant.presenceSessionId);
     const update = socket.on.mock.calls.find(([event]) => event === "presence:update")?.[1] as (
       raw: unknown,
     ) => void;

@@ -42,6 +42,7 @@ describe("ephemeral presence protocol", () => {
         schemaVersion: 1,
         boardId: ids.board,
         observedAt,
+        selfPresenceSessionId: ids.session,
         participants: [participant()],
       }).participants,
     ).toHaveLength(1);
@@ -120,6 +121,7 @@ describe("ephemeral presence protocol", () => {
         schemaVersion: 1,
         boardId: ids.board,
         observedAt,
+        selfPresenceSessionId: ids.session,
         participants: sessions,
       }).success,
     ).toBe(true);
@@ -128,6 +130,7 @@ describe("ephemeral presence protocol", () => {
         schemaVersion: 1,
         boardId: ids.board,
         observedAt,
+        selfPresenceSessionId: ids.session,
         participants: [...sessions, participant(ids.secondSession)],
       }).success,
     ).toBe(false);
@@ -137,6 +140,7 @@ describe("ephemeral presence protocol", () => {
           schemaVersion: 1,
           boardId: ids.board,
           observedAt,
+          selfPresenceSessionId: ids.session,
           participants: [participant(), participant(ids.secondSession)],
         })
         .participants.map(({ userId }) => userId),
@@ -156,6 +160,7 @@ describe("ephemeral presence protocol", () => {
         schemaVersion: 1,
         boardId: ids.board,
         observedAt,
+        selfPresenceSessionId: ids.session,
         participants: [],
         redisChannel: "internal",
       }).success,
@@ -178,6 +183,42 @@ describe("ephemeral presence protocol", () => {
         status: "available",
         error: "redis failure",
       }).success,
+    ).toBe(false);
+  });
+
+  it("requires exactly one admitted self session while allowing other tabs for that user", () => {
+    const base = {
+      schemaVersion: 1,
+      boardId: ids.board,
+      observedAt,
+      selfPresenceSessionId: ids.session,
+      participants: [participant(), participant(ids.secondSession)],
+    };
+    expect(boardPresenceSnapshotSchema.safeParse(base).success).toBe(true);
+    expect(
+      boardPresenceSnapshotSchema.safeParse({ ...base, selfPresenceSessionId: ids.secondSession })
+        .success,
+    ).toBe(true);
+    expect(
+      boardPresenceSnapshotSchema.safeParse({
+        ...base,
+        selfPresenceSessionId: ids.secondSession.replace("4", "5"),
+      }).success,
+    ).toBe(false);
+    expect(
+      boardPresenceSnapshotSchema.safeParse({
+        ...base,
+        participants: [participant(ids.secondSession)],
+      }).success,
+    ).toBe(false);
+    expect(
+      boardPresenceSnapshotSchema.safeParse({
+        ...base,
+        participants: [participant(), participant()],
+      }).success,
+    ).toBe(false);
+    expect(
+      boardPresenceSnapshotSchema.safeParse({ ...base, selfPresenceSessionId: "invalid" }).success,
     ).toBe(false);
   });
 });

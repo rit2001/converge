@@ -149,3 +149,5 @@ Its Redis transport reconnection correction is complete: fresh three-client gene
 a bounded full-jitter supervisor and notify the runtime only after a complete resubscription.
 M3.5B2 API/Redis presence is accepted against two independently composed local-delivery APIs, one
 Redis instance, and a disposable migrated database. Frontend presence rendering (M3.5B3) remains pending.
+M3.5B's self-session correction is complete: strict socket-specific snapshots identify the exact
+admitted session without exposing separate principal evidence. M3.5B3A client presence state remains pending.

@@ -167,9 +167,21 @@ export const boardPresenceSnapshotSchema = z
     schemaVersion: z.literal(SCHEMA_VERSION),
     boardId: idSchema,
     observedAt: presenceTimestampSchema,
+    selfPresenceSessionId: idSchema,
     participants: z.array(presenceParticipantSchema).max(PRESENCE_SNAPSHOT_MAX_SESSIONS),
   })
-  .strict();
+  .strict()
+  .superRefine((snapshot, context) => {
+    const matches = snapshot.participants.filter(
+      ({ presenceSessionId }) => presenceSessionId === snapshot.selfPresenceSessionId,
+    );
+    if (matches.length !== 1)
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Snapshot self presence session must appear exactly once",
+        path: ["selfPresenceSessionId"],
+      });
+  });
 
 export const presenceParticipantUpsertSchema = z
   .object({

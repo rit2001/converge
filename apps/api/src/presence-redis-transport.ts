@@ -3,13 +3,11 @@ import { z } from "zod";
 import {
   PRESENCE_SESSION_TTL_MS,
   PRESENCE_SNAPSHOT_MAX_SESSIONS,
-  boardPresenceSnapshotSchema,
   idSchema,
   presenceAvailabilitySchema,
   presenceParticipantLeaveSchema,
   presenceParticipantUpsertSchema,
   presenceUpdateSchema,
-  type BoardPresenceSnapshot,
   type PresenceAvailability,
   type PresenceParticipant,
   type PresenceParticipantLeave,
@@ -20,6 +18,12 @@ import {
 export const PRESENCE_REDIS_CHANNEL = "converge:presence:v1:pubsub";
 export const PRESENCE_REDIS_PREFIX = "converge:presence:v1";
 export type PresenceAvailabilityCode = "PRESENCE_REDIS_UNAVAILABLE" | "PRESENCE_MESSAGE_INVALID";
+export interface PresenceStorageSnapshot {
+  schemaVersion: 1;
+  boardId: string;
+  observedAt: string;
+  participants: PresenceParticipant[];
+}
 export type PresenceOutcome<T> =
   | { kind: "ok"; value: T }
   | { kind: "capacity" }
@@ -50,7 +54,7 @@ export interface PresenceRedisTransport {
   start(): Promise<PresenceOutcome<void>>;
   admit(input: PresenceAdmission): Promise<PresenceOutcome<PresenceParticipant>>;
   refresh(input: PresenceRefresh): Promise<PresenceOutcome<PresenceParticipant>>;
-  snapshot(boardId: string): Promise<PresenceOutcome<BoardPresenceSnapshot>>;
+  snapshot(boardId: string): Promise<PresenceOutcome<PresenceStorageSnapshot>>;
   leave(
     boardId: string,
     presenceSessionId: string,
@@ -441,7 +445,7 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
     });
     return { kind: "ok", value };
   }
-  async snapshot(boardId: string): Promise<PresenceOutcome<BoardPresenceSnapshot>> {
+  async snapshot(boardId: string): Promise<PresenceOutcome<PresenceStorageSnapshot>> {
     const keys = boardKeys(boardId);
     if (!keys) return { kind: "invalid" };
     const reply = await this.eval(
@@ -454,19 +458,15 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
     const observedAt = iso(reply[0]!);
     const participants = reply.slice(1).map(participant);
     if (!observedAt || participants.some((item) => !item)) return { kind: "invalid" };
-    try {
-      return {
-        kind: "ok",
-        value: boardPresenceSnapshotSchema.parse({
-          schemaVersion: 1,
-          boardId,
-          observedAt,
-          participants,
-        }),
-      };
-    } catch {
-      return { kind: "invalid" };
-    }
+    return {
+      kind: "ok",
+      value: {
+        schemaVersion: 1,
+        boardId,
+        observedAt,
+        participants: participants as PresenceParticipant[],
+      },
+    };
   }
   async leave(
     boardId: string,

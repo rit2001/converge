@@ -3,9 +3,9 @@ import {
   PRESENCE_CURSOR_UPDATES_PER_SECOND,
   PRESENCE_HEARTBEAT_INTERVAL_MS,
   PRESENCE_IDLE_AFTER_MS,
+  boardPresenceSnapshotSchema,
   presenceAvailabilitySchema,
   presenceUpdateSchema,
-  type BoardPresenceSnapshot,
   type PresenceParticipant,
   type PresenceParticipantLeave,
   type PresenceUpdate,
@@ -14,6 +14,7 @@ import type {
   PresenceOutcome,
   PresencePrincipalEvidence,
   PresenceRedisTransport,
+  PresenceStorageSnapshot,
 } from "./presence-redis-transport.js";
 
 export interface PresenceRuntimeSocket {
@@ -66,7 +67,7 @@ export class UnavailablePresenceTransport implements PresenceRedisTransport {
   refresh(): Promise<PresenceOutcome<PresenceParticipant>> {
     return Promise.resolve(this.unavailable);
   }
-  snapshot(): Promise<PresenceOutcome<BoardPresenceSnapshot>> {
+  snapshot(): Promise<PresenceOutcome<PresenceStorageSnapshot>> {
     return Promise.resolve(this.unavailable);
   }
   leave(): Promise<PresenceOutcome<PresenceParticipantLeave | null>> {
@@ -154,13 +155,30 @@ export class PresenceRuntime {
       .snapshot(binding.boardId)
       .catch(() => ({ kind: "unavailable" as const, code: "PRESENCE_REDIS_UNAVAILABLE" as const }));
     if (!this.current(binding) || binding.generation !== generation) return;
-    if (snapshot.kind === "ok") binding.socket.emit("board:presence-snapshot", snapshot.value);
+    const self =
+      snapshot.kind === "ok"
+        ? snapshot.value.participants.filter(
+            (participant) => participant.presenceSessionId === outcome.value.presenceSessionId,
+          )
+        : [];
+    const selfMatchesPrincipal =
+      self.length === 1 &&
+      self[0]?.userId === binding.principal.userId &&
+      self[0].displayName === binding.principal.displayName;
+    if (snapshot.kind === "ok" && selfMatchesPrincipal)
+      binding.socket.emit(
+        "board:presence-snapshot",
+        boardPresenceSnapshotSchema.parse({
+          ...snapshot.value,
+          selfPresenceSessionId: outcome.value.presenceSessionId,
+        }),
+      );
     this.emitAvailability(
       binding.socket,
       binding.boardId,
-      snapshot.kind === "ok" ? "available" : "unavailable",
+      snapshot.kind === "ok" && selfMatchesPrincipal ? "available" : "unavailable",
     );
-    this.schedule(binding);
+    if (snapshot.kind === "ok" && selfMatchesPrincipal) this.schedule(binding);
   }
   private update(binding: Binding, raw: unknown): void {
     if (!this.current(binding)) return;
