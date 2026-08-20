@@ -145,4 +145,6 @@ deltas. Socket.IO admission/scheduling and the frontend presence surface remain 
 
 M3.5B2B1 is complete: presence is independently composed behind `API_PRESENCE_ENABLED`, binds only
 after successful board join acknowledgement, and remains isolated from HTTP/socket editing readiness.
-Real multi-instance presence acceptance and frontend rendering remain pending.
+Its Redis transport reconnection correction is complete: fresh three-client generations retry under
+a bounded full-jitter supervisor and notify the runtime only after a complete resubscription. Real
+multi-instance presence acceptance and frontend rendering remain pending.

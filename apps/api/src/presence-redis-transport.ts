@@ -152,13 +152,39 @@ function scriptReply(value: unknown): string[] | null {
 }
 
 type RedisClient = ReturnType<typeof createClient>;
+export const PRESENCE_RECONNECT_BASE_DELAY_MS = 250;
+export const PRESENCE_RECONNECT_MAX_DELAY_MS = 10_000;
+export interface PresenceRedisTransportScheduler {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+export interface PresenceRedisTransportOptions {
+  createClient?: (url: string) => RedisClient;
+  scheduler?: PresenceRedisTransportScheduler;
+  random?: () => number;
+}
+const presenceScheduler: PresenceRedisTransportScheduler = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+type ConnectionCycle = {
+  generation: number;
+  command: RedisClient;
+  publisher: RedisClient;
+  subscriber: RedisClient;
+  failed: boolean;
+  available: boolean;
+};
 export class RedisPresenceTransport implements PresenceRedisTransport {
-  private command: RedisClient | undefined;
-  private publisher: RedisClient | undefined;
-  private subscriber: RedisClient | undefined;
+  private cycle: ConnectionCycle | undefined;
   private started = false;
   private stopped = false;
+  private attempting = false;
+  private generation = 0;
+  private retryAttempt = 0;
+  private retryTimer: unknown;
   private startPromise: Promise<PresenceOutcome<void>> | undefined;
+  private resolveStart: ((outcome: PresenceOutcome<void>) => void) | undefined;
   private stopPromise: Promise<void> | undefined;
   private readonly deltas = new Set<
     (delta: PresenceParticipantUpsert | PresenceParticipantLeave) => void
@@ -166,7 +192,10 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
   private readonly availability = new Set<
     (value: PresenceAvailability, code?: PresenceAvailabilityCode) => void
   >();
-  constructor(private readonly redisUrl: string) {}
+  constructor(
+    private readonly redisUrl: string,
+    private readonly options: PresenceRedisTransportOptions = {},
+  ) {}
   onDelta(
     callback: (delta: PresenceParticipantUpsert | PresenceParticipantLeave) => void,
   ): () => void {
@@ -181,35 +210,114 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
   }
   async start(): Promise<PresenceOutcome<void>> {
     if (this.stopped) return { kind: "unavailable", code: "PRESENCE_REDIS_UNAVAILABLE" };
-    return (this.startPromise ??= this.startOnce());
+    if (this.cycle?.available) return { kind: "ok", value: undefined };
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = new Promise((resolve) => {
+      this.resolveStart = resolve;
+    });
+    this.connect();
+    return this.startPromise;
   }
-  private async startOnce(): Promise<PresenceOutcome<void>> {
+  private create(): RedisClient {
+    return (
+      this.options.createClient ??
+      ((url: string) => createClient({ url, socket: { reconnectStrategy: false } }))
+    )(this.redisUrl);
+  }
+  private connect(): void {
+    if (this.stopped || this.attempting || this.cycle?.available) return;
+    this.attempting = true;
+    const command = this.create();
+    const cycle: ConnectionCycle = {
+      generation: ++this.generation,
+      command,
+      publisher: command.duplicate(),
+      subscriber: command.duplicate(),
+      failed: false,
+      available: false,
+    };
+    this.cycle = cycle;
+    const failed = () => this.fail(cycle);
+    for (const client of [cycle.command, cycle.publisher, cycle.subscriber]) {
+      client.on("error", failed);
+      client.on("end", failed);
+    }
+    void this.connectCycle(cycle);
+  }
+  private async connectCycle(cycle: ConnectionCycle): Promise<void> {
     try {
-      this.command = createClient({ url: this.redisUrl, socket: { reconnectStrategy: false } });
-      this.publisher = this.command.duplicate();
-      this.subscriber = this.command.duplicate();
-      const unavailable = () => this.emitAvailability("PRESENCE_REDIS_UNAVAILABLE");
-      for (const client of [this.command, this.publisher, this.subscriber])
-        client.on("error", unavailable);
-      await Promise.all([
-        this.command.connect(),
-        this.publisher.connect(),
-        this.subscriber.connect(),
+      const connected = await Promise.allSettled([
+        cycle.command.connect(),
+        cycle.publisher.connect(),
+        cycle.subscriber.connect(),
       ]);
-      await this.subscriber.subscribe(PRESENCE_REDIS_CHANNEL, (message) => this.receive(message));
+      if (connected.some((result) => result.status === "rejected"))
+        throw new Error("Redis unavailable");
+      if (!this.current(cycle)) return;
+      await cycle.subscriber.subscribe(PRESENCE_REDIS_CHANNEL, (message) =>
+        this.receive(cycle, message),
+      );
+      if (!this.current(cycle)) return;
+      cycle.available = true;
       this.started = true;
-      return { kind: "ok", value: undefined };
+      this.retryAttempt = 0;
+      this.settleStart({ kind: "ok", value: undefined });
+      this.emitAvailability("available");
     } catch {
-      this.destroy();
-      return { kind: "unavailable", code: "PRESENCE_REDIS_UNAVAILABLE" };
+      this.fail(cycle);
+    } finally {
+      this.attempting = false;
+      if (cycle.failed && !this.stopped) this.scheduleRetry();
     }
   }
-  private emitAvailability(code: PresenceAvailabilityCode): void {
+  private current(cycle: ConnectionCycle): boolean {
+    return !this.stopped && this.cycle?.generation === cycle.generation && !cycle.failed;
+  }
+  private fail(cycle: ConnectionCycle): void {
+    if (!this.current(cycle)) return;
+    cycle.failed = true;
+    if (this.cycle?.generation === cycle.generation) {
+      this.cycle = undefined;
+      this.started = false;
+    }
+    this.destroy(cycle);
+    this.settleStart({ kind: "unavailable", code: "PRESENCE_REDIS_UNAVAILABLE" });
+    this.emitAvailability("unavailable", "PRESENCE_REDIS_UNAVAILABLE");
+    if (!this.attempting) this.scheduleRetry();
+  }
+  private scheduleRetry(): void {
+    if (this.stopped || this.attempting || this.retryTimer !== undefined) return;
+    const maximum = Math.min(
+      PRESENCE_RECONNECT_MAX_DELAY_MS,
+      PRESENCE_RECONNECT_BASE_DELAY_MS * 2 ** Math.min(this.retryAttempt, 5),
+    );
+    const random = this.options.random ?? Math.random;
+    const sampled = random();
+    const boundedRandom = Number.isFinite(sampled) ? Math.min(1, Math.max(0, sampled)) : 0.5;
+    const delay = Math.floor(boundedRandom * maximum);
+    if (!Number.isSafeInteger(delay) || delay < 0 || delay > PRESENCE_RECONNECT_MAX_DELAY_MS)
+      throw new Error("Invalid presence retry delay");
+    this.retryAttempt += 1;
+    this.retryTimer = (this.options.scheduler ?? presenceScheduler).setTimeout(() => {
+      this.retryTimer = undefined;
+      this.connect();
+    }, delay);
+  }
+  private settleStart(outcome: PresenceOutcome<void>): void {
+    const resolve = this.resolveStart;
+    this.resolveStart = undefined;
+    this.startPromise = undefined;
+    resolve?.(outcome);
+  }
+  private emitAvailability(
+    status: "available" | "unavailable",
+    code?: PresenceAvailabilityCode,
+  ): void {
     if (this.stopped) return;
     const value = presenceAvailabilitySchema.parse({
       schemaVersion: 1,
       boardId: "00000000-0000-4000-8000-000000000000",
-      status: "unavailable",
+      status,
     });
     for (const callback of this.availability) {
       try {
@@ -219,17 +327,18 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
       }
     }
   }
-  private receive(message: string): void {
-    if (this.stopped || message.length > 32_768)
-      return this.emitAvailability("PRESENCE_MESSAGE_INVALID");
+  private receive(cycle: ConnectionCycle, message: string): void {
+    if (!this.current(cycle)) return;
+    if (message.length > 32_768)
+      return this.emitAvailability("unavailable", "PRESENCE_MESSAGE_INVALID");
     let raw: unknown;
     try {
       raw = JSON.parse(message);
     } catch {
-      return this.emitAvailability("PRESENCE_MESSAGE_INVALID");
+      return this.emitAvailability("unavailable", "PRESENCE_MESSAGE_INVALID");
     }
     const parsed = pubSubEnvelopeSchema.safeParse(raw);
-    if (!parsed.success) return this.emitAvailability("PRESENCE_MESSAGE_INVALID");
+    if (!parsed.success) return this.emitAvailability("unavailable", "PRESENCE_MESSAGE_INVALID");
     for (const callback of this.deltas) {
       try {
         callback(parsed.data.event);
@@ -239,7 +348,9 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
     }
   }
   private ready(): RedisClient | null {
-    return this.started && this.command?.isReady ? this.command : null;
+    return this.started && this.cycle?.available && this.cycle.command.isReady
+      ? this.cycle.command
+      : null;
   }
   private async eval(script: string, keys: string[], args: string[]): Promise<string[] | null> {
     const client = this.ready();
@@ -247,7 +358,7 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
     try {
       return scriptReply(await client.eval(script, { keys, arguments: args }));
     } catch {
-      this.emitAvailability("PRESENCE_REDIS_UNAVAILABLE");
+      if (this.cycle) this.fail(this.cycle);
       return null;
     }
   }
@@ -399,14 +510,15 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
     }
   }
   private async publish(value: z.infer<typeof pubSubEnvelopeSchema>): Promise<void> {
-    if (!this.publisher?.isReady) {
-      this.emitAvailability("PRESENCE_REDIS_UNAVAILABLE");
+    const cycle = this.cycle;
+    if (!cycle?.available || !cycle.publisher.isReady) {
+      if (cycle) this.fail(cycle);
       return;
     }
     try {
-      await this.publisher.publish(PRESENCE_REDIS_CHANNEL, JSON.stringify(value));
+      await cycle.publisher.publish(PRESENCE_REDIS_CHANNEL, JSON.stringify(value));
     } catch {
-      this.emitAvailability("PRESENCE_REDIS_UNAVAILABLE");
+      this.fail(cycle);
     }
   }
   async stop(): Promise<void> {
@@ -416,16 +528,29 @@ export class RedisPresenceTransport implements PresenceRedisTransport {
   private stopOnce(): Promise<void> {
     this.stopped = true;
     this.started = false;
-    this.destroy();
+    if (this.retryTimer !== undefined)
+      (this.options.scheduler ?? presenceScheduler).clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    const cycle = this.cycle;
+    this.cycle = undefined;
+    if (cycle) {
+      cycle.failed = true;
+      this.destroy(cycle);
+    }
+    this.settleStart({ kind: "unavailable", code: "PRESENCE_REDIS_UNAVAILABLE" });
     this.deltas.clear();
     this.availability.clear();
     return Promise.resolve();
   }
-  private destroy(): void {
-    const clients = [this.subscriber, this.publisher, this.command];
-    this.subscriber = undefined;
-    this.publisher = undefined;
-    this.command = undefined;
-    for (const client of clients) if (client?.isOpen) client.destroy();
+  private destroy(cycle: ConnectionCycle): void {
+    const clients = [cycle.subscriber, cycle.publisher, cycle.command];
+    for (const client of clients)
+      try {
+        client.removeAllListeners("error");
+        client.removeAllListeners("end");
+        client.destroy();
+      } catch {
+        // A partially constructed node-redis client may already be terminal.
+      }
   }
 }

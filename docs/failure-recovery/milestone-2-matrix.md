@@ -224,6 +224,18 @@ owned recorder. Repeated shutdown marks all readiness false before draining, sto
 fences late readiness updates, closes the listener/Redis/database owners, clears deterministic timers,
 and removes the retained test stream.
 
+## M3.5B presence reconnect correction evidence
+
+Presence Redis is a best-effort plane and is deliberately excluded from the M2 delivery readiness
+matrix. A command, publisher, or subscriber loss fences its current three-client connection generation,
+emits only bounded presence-unavailable evidence, and retries with one full-jitter timer. A later
+fully connected and subscribed generation emits available once; stale listeners and Pub/Sub callbacks
+cannot act. Focused deterministic tests cover failed initial connection, repeated loss signals,
+partial-cycle cleanup, and runtime re-admission/fresh snapshot behavior. A real Redis test destroys
+an owned command connection, observes unavailable then fresh availability, and resumes a bounded
+snapshot. HTTP/socket editing readiness, durable commands, outbox, delivery streams, and PostgreSQL
+are not changed by this recovery path. Multi-instance acceptance remains pending.
+
 ## Acceptance rules
 
 - Tests assert at-least-once publication and idempotent effects; they must not assert or describe

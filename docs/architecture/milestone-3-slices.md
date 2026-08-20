@@ -319,6 +319,20 @@ or pending-command behavior. Disabled deployments create no Redis presence resou
 advertise the unavailable presence capability. Per-binding generations fence replaced, revoked,
 disconnected, and stopped sockets before timers or idempotent leave work can act.
 
+**M3.5B2B1 correction — Redis reconnect supervision (complete)**
+
+Each `RedisPresenceTransport` owns a single reconnect supervisor for its three fresh node-redis
+clients (command, publisher, subscriber). Node-redis reconnect remains disabled. The supervisor
+attempts immediately, then retries with full jitter from 0 through `min(250ms × 2^attempt, 10,000ms)`
+until terminal stop; the attempt count resets only after all three clients connect and the subscriber
+has subscribed to the strict presence channel. A connection generation is available only after that
+complete cycle. A client error/end or a proven command/publisher failure fences that generation,
+closes all its clients, emits one bounded unavailable transition, and schedules at most one retry.
+Retired generation callbacks and subscriber messages are ignored. Recovery emits available once so
+the runtime can re-admit current bindings and send fresh snapshots. This remains a presence-only
+supervisor and does not alter HTTP, Socket.IO editing, or durable delivery readiness. M3.5B2B2
+multi-instance acceptance remains pending.
+
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and
   render reduced-motion/accessible cursors without exposing user or session IDs.
