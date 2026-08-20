@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { visibleObjects } from "@converge/canvas-engine";
 import {
@@ -18,7 +19,7 @@ import { useBoardStore } from "../board-store";
 import { indexedDbPendingOperationStore } from "../pending-db";
 import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
-import { Button, StatusPill } from "./ui/primitives";
+import { IconButton, Separator, StatusPill, Tooltip } from "./ui/primitives";
 import { toneForSynchronization, WorkspaceEntryStatus } from "./workspace-entry-status";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
@@ -33,6 +34,43 @@ function commandBase(boardId: string, clientId: string, targetId: string, lastSe
     targetId,
     clientTimestamp: new Date().toISOString(),
   };
+}
+
+function ToolIcon({ name }: { name: "select" | "pan" | "rectangle" | "sticky" | "delete" }) {
+  const shared = { fill: "none", stroke: "currentColor", strokeWidth: 1.75 };
+  if (name === "select")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path {...shared} d="m5 3 14 8-7 2-3 7-4-17Z" />
+      </svg>
+    );
+  if (name === "pan")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path
+          {...shared}
+          d="M8 12V6a2 2 0 0 1 4 0v5m0 1V4a2 2 0 0 1 4 0v8m0 0V7a2 2 0 0 1 4 0v8c0 4-3 6-7 6h-2c-2 0-3-1-4-3l-2-4a2 2 0 0 1 3-2l2 2"
+        />
+      </svg>
+    );
+  if (name === "rectangle")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <rect {...shared} x="4" y="6" width="16" height="12" rx="2" />
+      </svg>
+    );
+  if (name === "sticky")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path {...shared} d="M6 4h12v12l-4 4H6V4Z" />
+        <path {...shared} d="M14 20v-4h4M9 9h6M9 13h4" />
+      </svg>
+    );
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path {...shared} d="M5 7h14M10 11v6m4-6v6M9 7l1-3h4l1 3m-9 0 1 13h10l1-13" />
+    </svg>
+  );
 }
 
 export function Workspace(): React.JSX.Element {
@@ -91,7 +129,7 @@ export function Workspace(): React.JSX.Element {
     });
   }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
-  const [diagnostics, setDiagnostics] = useState(true);
+  const [diagnostics, setDiagnostics] = useState(false);
 
   useEffect(() => {
     return scheduleOwnedSessionStart(
@@ -173,6 +211,12 @@ export function Workspace(): React.JSX.Element {
 
   useEffect(() => {
     const keydown = (event: KeyboardEvent): void => {
+      if (
+        event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLTextAreaElement ||
+        event.target instanceof HTMLSelectElement
+      )
+        return;
       if ((event.key === "Delete" || event.key === "Backspace") && store.selectedId) {
         event.preventDefault();
         remove();
@@ -184,157 +228,202 @@ export function Workspace(): React.JSX.Element {
     return () => window.removeEventListener("keydown", keydown);
   }, [store.selectedId, store.boardId, store.committed.lastSeq]);
 
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape" && diagnostics) {
+        event.preventDefault();
+        setDiagnostics(false);
+      }
+    };
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  }, [diagnostics]);
+
   return (
-    <main className="workspace">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">C</span>
-          <div>
-            <strong>Converge</strong>
-            <span>{store.name}</span>
-          </div>
+    <main className="workspace studio-shell" aria-label="Converge studio">
+      <header className="topbar studio-board-header" aria-label="Board header">
+        <Link className="brand" href="/" aria-label="Converge home">
+          <span className="brand-mark" aria-hidden="true">
+            C
+          </span>
+          <span className="brand-name">Converge</span>
+        </Link>
+        <div className="board-label" aria-label={`Board: ${store.name || "Preparing board"}`}>
+          <span>Board</span>
+          <strong>{store.name || "Preparing board"}</strong>
         </div>
-        <StatusPill
-          className="connection"
-          label={store.connection}
-          tone={toneForSynchronization(store.connection)}
-          accessibleLabel={`Synchronization status: ${store.connection}`}
-        />
-        <Button
-          variant="ghost"
-          className="avatar"
-          aria-label="Development identity"
-          title="Development identity"
-        >
-          LD
-        </Button>
+        <div className="board-header-status">
+          <StatusPill
+            className="connection"
+            label={store.connection}
+            tone={toneForSynchronization(store.connection)}
+            accessibleLabel={`Synchronization status: ${store.connection}`}
+          />
+        </div>
       </header>
-      <aside className="toolbar" aria-label="Canvas tools">
-        <button
-          className={tool === "select" ? "active" : ""}
-          onClick={() => setTool("select")}
-          title="Select (V)"
-        >
-          ↖
-        </button>
-        <button
-          className={tool === "pan" ? "active" : ""}
-          onClick={() => setTool("pan")}
-          title="Pan (H)"
-        >
-          ✋
-        </button>
-        <hr />
-        <button
-          data-testid="add-rectangle"
-          onClick={() => addObject("rectangle")}
-          title="Add rectangle"
-        >
-          ▭
-        </button>
-        <button
-          data-testid="add-sticky"
-          onClick={() => addObject("sticky")}
-          title="Add sticky note"
-        >
-          ▤
-        </button>
-        <hr />
-        <button onClick={remove} disabled={!store.selectedId} title="Delete selected">
-          ⌫
-        </button>
+      <aside className="toolbar studio-tool-dock" aria-label="Primary canvas tools">
+        <div role="toolbar" aria-label="Canvas tools">
+          <Tooltip label="Select (V)">
+            <IconButton
+              className="workspace-tool-button"
+              variant={tool === "select" ? "primary" : "ghost"}
+              aria-label="Select tool"
+              aria-pressed={tool === "select"}
+              aria-keyshortcuts="V"
+              onClick={() => setTool("select")}
+            >
+              <ToolIcon name="select" />
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Pan (H)">
+            <IconButton
+              className="workspace-tool-button"
+              variant={tool === "pan" ? "primary" : "ghost"}
+              aria-label="Pan tool"
+              aria-pressed={tool === "pan"}
+              aria-keyshortcuts="H"
+              onClick={() => setTool("pan")}
+            >
+              <ToolIcon name="pan" />
+            </IconButton>
+          </Tooltip>
+          <Separator />
+          <Tooltip label="Add rectangle">
+            <IconButton
+              className="workspace-tool-button"
+              variant="ghost"
+              aria-label="Add rectangle"
+              data-testid="add-rectangle"
+              onClick={() => addObject("rectangle")}
+            >
+              <ToolIcon name="rectangle" />
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Add sticky note">
+            <IconButton
+              className="workspace-tool-button"
+              variant="ghost"
+              aria-label="Add sticky note"
+              data-testid="add-sticky"
+              onClick={() => addObject("sticky")}
+            >
+              <ToolIcon name="sticky" />
+            </IconButton>
+          </Tooltip>
+          <Separator />
+          <Tooltip label="Delete selected">
+            <IconButton
+              className="workspace-tool-button"
+              variant="ghost"
+              aria-label="Delete selected"
+              disabled={!store.selectedId}
+              onClick={remove}
+            >
+              <ToolIcon name="delete" />
+            </IconButton>
+          </Tooltip>
+        </div>
       </aside>
-      <Canvas
-        objects={store.objects}
-        selectedId={store.selectedId}
-        tool={tool}
-        onSelect={(id) => store.select(id)}
-        onTransform={transform}
-      />
+      <section id="studio-canvas-region" className="studio-canvas-region" aria-label="Board canvas">
+        <Canvas
+          objects={store.objects}
+          selectedId={store.selectedId}
+          tool={tool}
+          onSelect={(id) => store.select(id)}
+          onTransform={transform}
+        />
+      </section>
       <WorkspaceEntryStatus status={store.connection} hasBoard={Boolean(store.boardId)} />
       {store.error && (
         <div className="error-toast" role="alert">
           {store.error}
         </div>
       )}
-      <section className={`diagnostics ${diagnostics ? "open" : ""}`}>
-        <button onClick={() => setDiagnostics((value) => !value)}>
+      <aside className="studio-narrow-notice" aria-label="Desktop editor notice">
+        <strong>Desktop-first studio</strong>
+        <span>Canvas editing is optimized for a larger screen.</span>
+      </aside>
+      <section className={`diagnostics studio-system-details ${diagnostics ? "open" : ""}`}>
+        <button
+          type="button"
+          aria-expanded={diagnostics}
+          aria-controls="workspace-diagnostics-panel"
+          onClick={() => setDiagnostics((value) => !value)}
+        >
           <span>Diagnostics</span>
-          <b>{diagnostics ? "−" : "+"}</b>
+          <b aria-hidden="true">{diagnostics ? "−" : "+"}</b>
         </button>
-        {diagnostics && (
-          <dl>
-            <div>
-              <dt>Board</dt>
-              <dd data-testid="board-id">{store.boardId ?? "none"}</dd>
-            </div>
-            <div>
-              <dt>Connection</dt>
-              <dd>{store.connection}</dd>
-            </div>
-            <div>
-              <dt>Last sequence</dt>
-              <dd data-testid="last-seq">{store.committed.lastSeq}</dd>
-            </div>
-            <div>
-              <dt>Pending</dt>
-              <dd data-testid="pending-count">{store.pending.length}</dd>
-            </div>
-            <div>
-              <dt>Pending recovery</dt>
-              <dd data-testid="pending-status">{store.pendingStatus}</dd>
-            </div>
-            <div>
-              <dt>Sync attempt</dt>
-              <dd data-testid="sync-attempt">{store.synchronizationDiagnostics.attempt}</dd>
-            </div>
-            <div>
-              <dt>Sync retry</dt>
-              <dd data-testid="sync-retry-code">
-                {store.synchronizationDiagnostics.retryScheduled
-                  ? `${store.synchronizationDiagnostics.retryCode ?? "retry"} (${store.synchronizationDiagnostics.retryDelayMs ?? 0}ms)`
-                  : "none"}
-              </dd>
-            </div>
-            <div>
-              <dt>Sync buffer</dt>
-              <dd data-testid="sync-buffer">
-                {store.synchronizationDiagnostics.bufferedCount}/
-                {store.synchronizationDiagnostics.bufferCountLimit} operations,{" "}
-                {store.synchronizationDiagnostics.bufferedBytes}/
-                {store.synchronizationDiagnostics.bufferByteLimit} bytes
-              </dd>
-            </div>
-            <div className="hash">
-              <dt>Committed objects</dt>
-              <dd data-testid="committed-objects">
-                {JSON.stringify(visibleObjects(store.committed))}
-              </dd>
-            </div>
-            <div>
-              <dt>Hash board</dt>
-              <dd data-testid="hash-board-id">{store.authoritativeHash.boardId ?? "none"}</dd>
-            </div>
-            <div>
-              <dt>Hash sequence</dt>
-              <dd data-testid="hash-seq">{store.authoritativeHash.seq ?? "none"}</dd>
-            </div>
-            <div>
-              <dt>Hash session</dt>
-              <dd data-testid="hash-session-generation">
-                {store.authoritativeHash.sessionGeneration ?? "none"}
-              </dd>
-            </div>
-            <div>
-              <dt>Hash status</dt>
-              <dd data-testid="hash-status">{store.authoritativeHash.status}</dd>
-            </div>
-            <div className="hash">
-              <dt>Authoritative hash</dt>
-              <dd data-testid="state-hash">{store.authoritativeHash.value ?? "unavailable"}</dd>
-            </div>
-          </dl>
-        )}
+        <dl id="workspace-diagnostics-panel" hidden={!diagnostics}>
+          <div>
+            <dt>Board</dt>
+            <dd data-testid="board-id">{store.boardId ?? "none"}</dd>
+          </div>
+          <div>
+            <dt>Connection</dt>
+            <dd>{store.connection}</dd>
+          </div>
+          <div>
+            <dt>Last sequence</dt>
+            <dd data-testid="last-seq">{store.committed.lastSeq}</dd>
+          </div>
+          <div>
+            <dt>Pending</dt>
+            <dd data-testid="pending-count">{store.pending.length}</dd>
+          </div>
+          <div>
+            <dt>Pending recovery</dt>
+            <dd data-testid="pending-status">{store.pendingStatus}</dd>
+          </div>
+          <div>
+            <dt>Sync attempt</dt>
+            <dd data-testid="sync-attempt">{store.synchronizationDiagnostics.attempt}</dd>
+          </div>
+          <div>
+            <dt>Sync retry</dt>
+            <dd data-testid="sync-retry-code">
+              {store.synchronizationDiagnostics.retryScheduled
+                ? `${store.synchronizationDiagnostics.retryCode ?? "retry"} (${store.synchronizationDiagnostics.retryDelayMs ?? 0}ms)`
+                : "none"}
+            </dd>
+          </div>
+          <div>
+            <dt>Sync buffer</dt>
+            <dd data-testid="sync-buffer">
+              {store.synchronizationDiagnostics.bufferedCount}/
+              {store.synchronizationDiagnostics.bufferCountLimit} operations,{" "}
+              {store.synchronizationDiagnostics.bufferedBytes}/
+              {store.synchronizationDiagnostics.bufferByteLimit} bytes
+            </dd>
+          </div>
+          <div className="hash">
+            <dt>Committed objects</dt>
+            <dd data-testid="committed-objects">
+              {JSON.stringify(visibleObjects(store.committed))}
+            </dd>
+          </div>
+          <div>
+            <dt>Hash board</dt>
+            <dd data-testid="hash-board-id">{store.authoritativeHash.boardId ?? "none"}</dd>
+          </div>
+          <div>
+            <dt>Hash sequence</dt>
+            <dd data-testid="hash-seq">{store.authoritativeHash.seq ?? "none"}</dd>
+          </div>
+          <div>
+            <dt>Hash session</dt>
+            <dd data-testid="hash-session-generation">
+              {store.authoritativeHash.sessionGeneration ?? "none"}
+            </dd>
+          </div>
+          <div>
+            <dt>Hash status</dt>
+            <dd data-testid="hash-status">{store.authoritativeHash.status}</dd>
+          </div>
+          <div className="hash">
+            <dt>Authoritative hash</dt>
+            <dd data-testid="state-hash">{store.authoritativeHash.value ?? "unavailable"}</dd>
+          </div>
+        </dl>
       </section>
     </main>
   );

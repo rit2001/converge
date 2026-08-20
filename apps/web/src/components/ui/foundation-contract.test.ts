@@ -96,9 +96,10 @@ describe("premium foundation contract", () => {
     expect(styles).toMatch(/\.portal-root\s*>\s*\*\s*{[^}]*pointer-events:\s*auto;/s);
   });
 
-  it("creates exactly one isolated application stacking context", () => {
+  it("creates isolated application and studio-shell stacking contexts", () => {
     expect(styles).toMatch(/#application-root\s*{[^}]*isolation:\s*isolate;/s);
-    expect(styles.match(/isolation:\s*isolate/g)).toHaveLength(1);
+    expect(styles).toMatch(/\.workspace\s*{[^}]*isolation:\s*isolate;/s);
+    expect(styles.match(/isolation:\s*isolate/g)).toHaveLength(2);
   });
 
   it("defines visible focus, reduced-motion, and forced-color behavior", () => {

@@ -150,7 +150,9 @@ export function Canvas({
           />
         </Layer>
       </Stage>
-      <div className="zoom-pill">{Math.round(stage.scale * 100)}%</div>
+      <output className="zoom-pill" aria-label={`Canvas zoom: ${Math.round(stage.scale * 100)}%`}>
+        {Math.round(stage.scale * 100)}%
+      </output>
     </div>
   );
 }
