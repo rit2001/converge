@@ -6,7 +6,7 @@ export default defineConfig({
   testMatch: "m3-5c*.spec.ts",
   timeout: 90_000,
   expect: { timeout: 15_000 },
-  snapshotPathTemplate: "{testDir}/{testFilePath}-snapshots/{arg}{ext}",
+  snapshotPathTemplate: "{testDir}/{testFilePath}-snapshots/{arg}-{platform}{ext}",
   // Each topology owns the same local Redis/PostgreSQL service pair and client-count boundary.
   workers: 1,
   fullyParallel: false,

@@ -114,7 +114,11 @@ test.describe.serial("M3.5C final browser acceptance", () => {
       await expect(rosterB.getByText("You", { exact: true })).toBeVisible();
       await expect(rosterB.getByText(topology.owner.displayName, { exact: true })).toBeVisible();
       await expect(rosterB.getByText("Active", { exact: true }).first()).toBeVisible();
-      await expect(rosterB.getByText("2 active sessions", { exact: true })).toBeVisible();
+      const rows = rosterB.getByRole("listitem");
+      const selfRow = rows.filter({ hasText: "You" });
+      const ownerRow = rows.filter({ hasText: topology.owner.displayName });
+      await expect(ownerRow.getByText("2 active sessions", { exact: true })).toBeVisible();
+      await expect(selfRow.getByText(/active sessions/)).toHaveCount(0);
       const rosterText = await rosterB.innerText();
       expect(rosterText).not.toMatch(
         /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,

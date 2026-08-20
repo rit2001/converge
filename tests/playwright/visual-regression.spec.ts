@@ -40,25 +40,49 @@ async function capture(page: Page, name: string, mask = [] as ReturnType<Page["l
   });
 }
 
-test("accepted M3 surfaces remain visually stable across themes and capabilities", async ({
-  page,
-}) => {
+function observePageErrors(page: Page): { assertClean(): void } {
   const pageErrors: string[] = [];
   const hydrationErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.name));
   page.on("console", (message) => {
     if (/hydration/i.test(message.text())) hydrationErrors.push(message.type());
   });
+  return {
+    assertClean: () => {
+      expect(pageErrors).toEqual([]);
+      expect(hydrationErrors).toEqual([]);
+    },
+  };
+}
+
+async function setInitialPreference(
+  page: Page,
+  preference: "light" | "dark",
+  onboarding: "unseen" | "dismissed",
+): Promise<void> {
+  await page.addInitScript(
+    ({ theme, onboardingState }) => {
+      if (!localStorage.getItem("converge:theme:v1"))
+        localStorage.setItem(
+          "converge:theme:v1",
+          JSON.stringify({ version: 1, preference: theme }),
+        );
+      if (onboardingState === "unseen") localStorage.removeItem("converge:studio-onboarding:v1");
+      else
+        localStorage.setItem(
+          "converge:studio-onboarding:v1",
+          JSON.stringify({ version: 1, state: onboardingState }),
+        );
+    },
+    { theme: preference, onboardingState: onboarding },
+  );
+}
+
+test("accepted landing remains visually stable across themes", async ({ page }) => {
+  const errors = observePageErrors(page);
   await installDeterministicVisualPolicy(page);
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.addInitScript(() => {
-    if (!localStorage.getItem("converge:theme:v1"))
-      localStorage.setItem(
-        "converge:theme:v1",
-        JSON.stringify({ version: 1, preference: "light" }),
-      );
-    localStorage.removeItem("converge:studio-onboarding:v1");
-  });
+  await setInitialPreference(page, "light", "unseen");
 
   await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
@@ -69,10 +93,15 @@ test("accepted M3 surfaces remain visually stable across themes and capabilities
   await page.reload();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await capture(page, "landing-dark-desktop.png");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  errors.assertClean();
+});
 
-  await page.evaluate(() =>
-    localStorage.setItem("converge:theme:v1", JSON.stringify({ version: 1, preference: "light" })),
-  );
+test("accepted Studio overlays remain visually stable across themes", async ({ page }) => {
+  const errors = observePageErrors(page);
+  await installDeterministicVisualPolicy(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await setInitialPreference(page, "light", "unseen");
   await page.goto("/studio");
   await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
   await expect(
@@ -118,8 +147,26 @@ test("accepted M3 surfaces remain visually stable across themes and capabilities
     threshold: 0.15,
   });
   await page.keyboard.press("Escape");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  errors.assertClean();
+});
 
+test("accepted Studio remains visually stable across compact and view-only layouts", async ({
+  page,
+}) => {
+  const errors = observePageErrors(page);
+  await installDeterministicVisualPolicy(page);
   await page.setViewportSize({ width: 1024, height: 768 });
+  await setInitialPreference(page, "dark", "dismissed");
+  await page.goto("/studio");
+  await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
+  await page.getByTestId("add-rectangle").click();
+  await page.getByTestId("add-sticky").click();
+  await page.getByRole("button", { name: "Open layers panel" }).click();
+  const list = page.getByRole("list", { name: "Board objects, top to bottom" });
+  await expect(list.getByRole("listitem")).toHaveCount(2);
+  await list.getByRole("button", { name: /Rectangle, bottom layer, 2 of 2/ }).click();
+  await page.getByRole("button", { name: "Close layers panel" }).click();
   await page.getByRole("button", { name: "Synchronization status: Synced" }).click();
   await expect(page.getByRole("region", { name: "Synchronization details" })).toBeVisible();
   await capture(page, "studio-synchronization-dark-compact.png");
@@ -134,6 +181,5 @@ test("accepted M3 surfaces remain visually stable across themes and capabilities
   await capture(page, "studio-view-only-dark-phone.png");
 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  expect(pageErrors).toEqual([]);
-  expect(hydrationErrors).toEqual([]);
+  errors.assertClean();
 });

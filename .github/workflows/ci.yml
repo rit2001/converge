@@ -12,7 +12,8 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    # Keep screenshot rasterization aligned with the committed Linux baselines.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
