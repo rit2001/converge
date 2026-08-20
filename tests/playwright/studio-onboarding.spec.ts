@@ -35,6 +35,8 @@ test("first-run guidance persists bounded dismissal and Help is keyboard-safe", 
   await expect
     .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth))
     .toBe(true);
-  await expect(page.getByLabel("Desktop editor notice")).toBeVisible();
+  await expect(page.getByLabel("View-only screen notice")).toContainText(
+    "View-only on this screen",
+  );
   expect(errors).toEqual([]);
 });

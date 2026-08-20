@@ -5,9 +5,10 @@ const databaseUrl =
 export default defineConfig({
   testDir: ".",
   testMatch: "*.spec.ts",
-  testIgnore: "m3-5c*.spec.ts",
+  testIgnore: ["m3-5c*.spec.ts", "production-performance-topology.spec.ts"],
   timeout: 30_000,
   expect: { timeout: 10_000 },
+  snapshotPathTemplate: "{testDir}/{testFilePath}-snapshots/{arg}{ext}",
   fullyParallel: false,
   use: { baseURL: "http://127.0.0.1:3000", trace: "retain-on-failure" },
   webServer: [

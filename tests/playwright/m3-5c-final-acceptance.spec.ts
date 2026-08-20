@@ -119,6 +119,16 @@ test.describe.serial("M3.5C final browser acceptance", () => {
       expect(rosterText).not.toMatch(
         /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
       );
+      await b.page.addStyleTag({
+        content:
+          "*,*::before,*::after{animation-duration:0s!important;caret-color:transparent!important;transition-duration:0s!important}",
+      });
+      await expect(b.page).toHaveScreenshot("presence-roster-light-desktop.png", {
+        animations: "disabled",
+        caret: "hide",
+        maxDiffPixelRatio: 0.005,
+        threshold: 0.15,
+      });
 
       const beforeOperation = await durableOperationCount(topology.apiA.pool, topology.boardId);
       await a.page.getByTestId("add-rectangle").click();

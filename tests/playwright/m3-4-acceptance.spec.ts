@@ -170,7 +170,9 @@ test("M3.4 canvas interactions accept two-client local controls and authoritativ
     await expect(pageA.getByRole("button", { name: "Lock Rectangle" })).toBeVisible();
 
     await pageA.setViewportSize({ width: 390, height: 844 });
-    await expect(pageA.getByLabel("Desktop editor notice")).toBeVisible();
+    await expect(pageA.getByLabel("View-only screen notice")).toContainText(
+      "View-only on this screen",
+    );
     await expect
       .poll(() => pageA.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
       .toBe(true);
