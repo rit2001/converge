@@ -16,9 +16,15 @@ export function SynchronizationStatus({
   const trigger = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLElement>(null);
   const announced = useRef<string | null>(null);
+  const [live, setLive] = useState("");
   const announcement = presentation.terminal
     ? `${presentation.label}. ${presentation.next}`
     : presentation.label;
+  useEffect(() => {
+    if (announced.current === announcement) return;
+    announced.current = announcement;
+    setLive(announcement);
+  }, [announcement]);
   useEffect(() => {
     if (!open) return;
     const close = (event: KeyboardEvent): void => {
@@ -41,8 +47,6 @@ export function SynchronizationStatus({
       window.removeEventListener("mousedown", outside);
     };
   }, [open]);
-  const live = announced.current === announcement ? "" : announcement;
-  announced.current = announcement;
   const details =
     open && typeof document !== "undefined"
       ? createPortal(

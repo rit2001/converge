@@ -23,7 +23,7 @@ test("landing remains inert until keyboard entry and studio reload preserves the
   await page.keyboard.press("Enter");
 
   await expect(page).toHaveURL(/\/studio\?board=/);
-  await expect(page.locator("header .connection")).toHaveText("ready");
+  await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
   const studioUrl = page.url();
   expect(
     operationalRequests.filter(
@@ -33,7 +33,7 @@ test("landing remains inert until keyboard entry and studio reload preserves the
 
   await page.reload();
   await expect(page).toHaveURL(studioUrl);
-  await expect(page.locator("header .connection")).toHaveText("ready");
+  await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
   expect(
     operationalRequests.filter(
       ({ method, url }) => method === "POST" && new URL(url).pathname === "/v1/boards",

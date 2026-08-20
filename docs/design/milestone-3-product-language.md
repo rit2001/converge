@@ -1,6 +1,6 @@
 # Milestone 3 product language
 
-Status: implemented through M3.5B3B; final browser acceptance pending.
+Status: accepted through M3.5C.
 
 ## Direction: a calm shared studio
 
@@ -115,6 +115,12 @@ non-interactive remote-only pointers: active/current evidence is visible, idle/u
 evidence is not. Reduced motion renders the latest coordinate immediately.
 
 Announcements are deduplicated and rate-limited. Ordinary successful commands do not create toasts.
+
+M3.5C's real A/A2/B browser acceptance confirms that the synchronization trigger remains “Synced” only
+after the current board session is ready with no pending command, even when presence is unavailable. The
+roster groups same-user tabs, labels the authenticated group “You”, and never exposes identifiers. Remote
+cursors are current, active, non-interactive evidence only; recovery uses a fresh self-session snapshot and
+does not reset synchronization language or editing readiness.
 
 ## Motion language
 

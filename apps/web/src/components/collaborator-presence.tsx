@@ -27,6 +27,7 @@ export function CollaboratorPresence({
   const trigger = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLElement>(null);
   const announcement = useRef("");
+  const [live, setLive] = useState("");
   const snapshot = presence ?? {
     availability: "unavailable" as const,
     current: false,
@@ -72,8 +73,11 @@ export function CollaboratorPresence({
   useEffect(() => {
     if (!available || terminal) setOpen(false);
   }, [available, terminal]);
-  const live = terminal || announcement.current === message ? "" : message;
-  announcement.current = message;
+  useEffect(() => {
+    if (terminal || announcement.current === message) return;
+    announcement.current = message;
+    setLive(message);
+  }, [message, terminal]);
   const visible = collaborators.slice(0, 4);
   const details =
     open && typeof document !== "undefined"

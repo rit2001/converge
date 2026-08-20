@@ -32,6 +32,8 @@ export type DualReplicaBrowserTopology = {
   editor: typeof editor;
   openA(browser: Browser): Promise<{ context: BrowserContext; page: Page }>;
   openB(browser: Browser): Promise<{ context: BrowserContext; page: Page }>;
+  /** Test-owned Redis CLIENT KILL boundary; production recovery owns the reconnection. */
+  interruptApiAPresence(): Promise<void>;
   stop(): Promise<void>;
 };
 export type DualReplicaBrowserTopologyOptions = Readonly<{ failAfterApiA?: boolean }>;
@@ -91,6 +93,22 @@ async function waitForPostgres(): Promise<void> {
     }
   }
   throw new Error("Test PostgreSQL startup timed out");
+}
+async function redisClientIds(redis: RedisClientType): Promise<Set<string>> {
+  const reply: unknown = await redis.sendCommand(["CLIENT", "LIST"]);
+  if (typeof reply !== "string") throw new Error("Expected Redis client list");
+  return new Set([...reply.matchAll(/(?:^|\n)id=(\d+)/g)].map((match) => match[1]!));
+}
+async function waitForRedisClientCount(
+  redis: RedisClientType,
+  minimum: number,
+): Promise<Set<string>> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const ids = await redisClientIds(redis);
+    if (ids.size >= minimum) return ids;
+    await new Promise((resolve) => setTimeout(resolve, 125));
+  }
+  throw new Error("Presence Redis clients did not start");
 }
 function environment(databaseUrl: string, webOrigin: string, principal: typeof owner): Environment {
   return parseEnvironment({
@@ -168,6 +186,7 @@ export async function startDualReplicaBrowserTopology(
   let servicesStarted: Array<"postgres" | "redis"> = [];
   let nextEnv: string | undefined;
   let webTsconfig: string | undefined;
+  let apiAPresenceClientIds: readonly string[] = [];
   const cleanup = async (): Promise<void> => {
     await Promise.allSettled([...contexts].map((context) => context.close()));
     await Promise.allSettled(
@@ -223,10 +242,15 @@ export async function startDualReplicaBrowserTopology(
     redis = createClient({ url: redisUrl });
     redis.on("error", () => undefined);
     await redis.connect();
+    const beforeApiA = await redisClientIds(redis);
     const [webPortA, webPortB] = await Promise.all([port(), port()]);
     const webOriginA = `http://127.0.0.1:${webPortA}`,
       webOriginB = `http://127.0.0.1:${webPortB}`;
     apiA = await apiFor(environment(isolated.toString(), webOriginA, owner));
+    const afterApiA = await waitForRedisClientCount(redis, beforeApiA.size + 3);
+    apiAPresenceClientIds = [...afterApiA].filter((id) => !beforeApiA.has(id));
+    if (apiAPresenceClientIds.length !== 3)
+      throw new Error("Expected three API A presence clients");
     if (options.failAfterApiA) throw new Error("Test topology forced startup failure");
     apiB = await apiFor(environment(isolated.toString(), webOriginB, editor));
     const repository = new BoardRepository(database);
@@ -257,6 +281,11 @@ export async function startDualReplicaBrowserTopology(
       editor,
       openA: (browser) => open(browser, webA!),
       openB: (browser) => open(browser, webB!),
+      interruptApiAPresence: async () => {
+        const clientId = apiAPresenceClientIds[0];
+        if (!clientId || !redis?.isOpen) throw new Error("Presence interruption unavailable");
+        await redis.sendCommand(["CLIENT", "KILL", "ID", clientId]);
+      },
       stop: cleanup,
     };
   } catch (error) {

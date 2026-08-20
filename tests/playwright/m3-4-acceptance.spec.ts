@@ -10,7 +10,7 @@ async function snapshotFor(page: Page, boardId: string): Promise<BoardSnapshot> 
 }
 
 async function waitReady(page: Page): Promise<void> {
-  await expect(page.locator("header .connection")).toHaveText("ready");
+  await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
 }
 
 async function openLayers(page: Page): Promise<void> {

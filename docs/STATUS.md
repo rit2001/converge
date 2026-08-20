@@ -130,7 +130,7 @@ local hide/lock isolation and recovery, deterministic drag snapping with transie
 authoritative rotation controls. Multi-select, undo/redo, grouping, durable reorder or rename,
 presence, sharing, history, and palette work remain excluded from M3.4.
 
-M3.5 is in progress. M3.5A is complete: the workspace derives a fail-closed, bounded synchronization
+M3.5 is complete. M3.5A is complete: the workspace derives a fail-closed, bounded synchronization
 presentation from existing BoardStore and pending-queue evidence only. It distinguishes connecting,
 restoring, synced, saving, reconnecting, device-local preservation, access removal, blocked recovery,
 and unavailable states without changing transport, persistence, recovery, or protocol behavior.
@@ -154,8 +154,10 @@ admitted session without exposing separate principal evidence.
 M3.5B3A is complete: a bounded generation-fenced client presence authority consumes strict snapshots
 and deltas, resolves authenticated self evidence, and exposes grouped ephemeral state without visual UI.
 M3.5B3B is complete: the header now presents bounded grouped collaborators and the canvas renders
-non-interactive remote cursors from that ephemeral authority. Final M3.5 multi-client browser acceptance
-remains pending.
+non-interactive remote cursors from that ephemeral authority.
 M3.5C1 is complete: a test-owned Playwright harness now composes two independently bundled web origins
 with two production-composed API replicas, a disposable database, real Redis presence, distinct principals,
-and a second owner tab. Final M3.5 browser acceptance remains pending.
+and a second owner tab. M3.5C is complete: the real A/A2/B browser acceptance proves independent truthful
+synchronization, grouped self/session evidence, Redis-routed non-interactive cursors, and presence-only
+interruption/recovery without changing durable editing. This is a bounded correctness acceptance, not a
+capacity, load, membership, or exact-presence guarantee.

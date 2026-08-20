@@ -238,6 +238,17 @@ multi-tab session evidence, explicit leave, and a Redis-side API-A-only interrup
 generation recovery while a PostgreSQL command still acknowledges. HTTP/socket editing readiness,
 durable commands, outbox, delivery streams, and PostgreSQL are not changed by this recovery path.
 
+## M3.5C browser interruption/recovery evidence
+
+The final A/A2/B browser acceptance reuses the isolated two-API topology and kills one owned API-A
+presence Redis client through Redis `CLIENT KILL`. Browser A presents only “Presence temporarily unavailable”;
+its semantic synchronization trigger remains independently “Synced”, and a real A durable command still
+receives its PostgreSQL acknowledgement. API B stays presence-available. The production reconnect supervisor
+creates a fresh generation, re-admits only current bindings, emits a fresh self-specific snapshot, and resumes
+cross-replica cursor evidence without duplicate grouped users or a delivery/readiness transition. The test
+uses no Socket.IO Redis adapter, in-process cross-API bridge, durable presence fallback, or production test
+hook.
+
 ## Acceptance rules
 
 - Tests assert at-least-once publication and idempotent effects; they must not assert or describe

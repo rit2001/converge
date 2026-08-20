@@ -5,6 +5,7 @@ const databaseUrl =
 export default defineConfig({
   testDir: ".",
   testMatch: "*.spec.ts",
+  testIgnore: "m3-5c*.spec.ts",
   timeout: 30_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,

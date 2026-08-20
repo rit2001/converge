@@ -401,7 +401,13 @@ distinct compiled `NEXT_PUBLIC_API_URL` values; no source, `.env`, production AP
 or in-process presence bridge is changed. It supplies browser A, a separate A tab, and B for one repository-
 authorized board, captures only Socket.IO wire evidence for self-session assertions, and fences/cleans every
 browser, process, database, Redis key, and test directory on success or a forced partial startup failure.
-M3.5C visual acceptance remains pending.
+M3.5C visual acceptance is complete. One serial final browser topology reuses those exact API/web/browser
+owners to prove A/A2/B self-session grouping, independent “Synced” presentation, a PostgreSQL-acknowledged
+operation, Redis Pub/Sub cursor routing and cursor-null clearing, keyboard roster focus recovery, responsive
+header behavior, and API-A-only Redis presence interruption/recovery. The test-owned Redis `CLIENT KILL`
+boundary observes unavailable then a fresh self-specific snapshot and resumed cross-replica cursor evidence;
+it does not add a production recovery hook. Presence remains independent from editing readiness and durable
+operation counts. The acceptance makes no capacity, load, exact-membership, or exact-presence claim.
 
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and

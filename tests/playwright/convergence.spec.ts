@@ -31,7 +31,7 @@ async function expectClientAtSnapshot(
   snapshot: BoardSnapshot,
   expectedHash: string,
 ): Promise<void> {
-  await expect(page.locator("header .connection")).toHaveText("ready");
+  await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
   await expect(page.getByTestId("board-id")).toHaveText(snapshot.id);
   await expect(page.getByTestId("last-seq")).toHaveText(String(snapshot.lastSeq));
   await expect(page.getByTestId("hash-board-id")).toHaveText(snapshot.id);
@@ -90,7 +90,7 @@ test("two independent clients converge after editing the same board", async ({ b
   const contextA = await browser.newContext();
   const pageA = await contextA.newPage();
   await pageA.goto("/studio");
-  await expect(pageA.locator("header .connection")).toHaveText("ready");
+  await expect(pageA.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
   await expect.poll(() => new URL(pageA.url()).searchParams.get("board")).not.toBeNull();
   const sharedUrl = pageA.url();
   const boardId = new URL(sharedUrl).searchParams.get("board");
@@ -99,7 +99,7 @@ test("two independent clients converge after editing the same board", async ({ b
   const contextB = await browser.newContext();
   const pageB = await contextB.newPage();
   await pageB.goto(sharedUrl);
-  await expect(pageB.locator("header .connection")).toHaveText("ready");
+  await expect(pageB.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
 
   await Promise.all([
     pageA.getByTestId("add-rectangle").click(),
@@ -126,7 +126,7 @@ test("a disconnected client catches up on reconnect without a trigger mutation",
   const contextA = await browser.newContext();
   const pageA = await contextA.newPage();
   await pageA.goto("/studio");
-  await expect(pageA.locator("header .connection")).toHaveText("ready");
+  await expect(pageA.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
   await expect.poll(() => new URL(pageA.url()).searchParams.get("board")).not.toBeNull();
   const boardId = new URL(pageA.url()).searchParams.get("board");
   expect(boardId).not.toBeNull();
@@ -134,10 +134,12 @@ test("a disconnected client catches up on reconnect without a trigger mutation",
   const contextB = await browser.newContext();
   const pageB = await contextB.newPage();
   await pageB.goto(pageA.url());
-  await expect(pageB.locator("header .connection")).toHaveText("ready");
+  await expect(pageB.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
 
   await contextA.setOffline(true);
-  await expect(pageA.locator("header .connection")).toHaveText("disconnected");
+  await expect(
+    pageA.getByRole("button", { name: "Synchronization status: Reconnecting…" }),
+  ).toBeVisible();
   await pageB.getByTestId("add-rectangle").click();
   await pageB.getByTestId("add-sticky").click();
   await expect(pageB.getByTestId("pending-count")).toHaveText("0");
@@ -163,7 +165,7 @@ test("overlapping objects retain their topmost creation order after reload and r
   const contextA = await browser.newContext();
   const pageA = await contextA.newPage();
   await pageA.goto("/studio");
-  await expect(pageA.locator("header .connection")).toHaveText("ready");
+  await expect(pageA.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
   await expect.poll(() => new URL(pageA.url()).searchParams.get("board")).not.toBeNull();
   const boardId = new URL(pageA.url()).searchParams.get("board");
   expect(boardId).not.toBeNull();
@@ -196,7 +198,9 @@ test("overlapping objects retain their topmost creation order after reload and r
   expectStickyPixel(await canvasPixel(pageB, 285, 195));
 
   await contextB.setOffline(true);
-  await expect(pageB.locator("header .connection")).toHaveText("disconnected");
+  await expect(
+    pageB.getByRole("button", { name: "Synchronization status: Reconnecting…" }),
+  ).toBeVisible();
   await contextB.setOffline(false);
   await expectClientAtSnapshot(pageB, snapshot, expectedHash);
   expectStickyPixel(await canvasPixel(pageB, 285, 195));
