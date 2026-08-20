@@ -31,6 +31,11 @@ import { CommandPalette } from "./command-palette";
 import { createWorkspaceCommands, type CommandId } from "../commands";
 import { StudioHelp } from "./studio-help";
 import { ShareDialog } from "./share-dialog";
+import {
+  CanvasActionAnnouncer,
+  nextCanvasAnnouncement,
+  type CanvasAnnouncement,
+} from "../canvas-action-announcer";
 import { readOnboarding, writeOnboarding, type OnboardingState } from "../onboarding";
 import type { PresenceSnapshot, PresenceStore } from "../presence-store";
 
@@ -171,6 +176,10 @@ export function Workspace({
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [canvasAnnouncement, setCanvasAnnouncement] = useState<CanvasAnnouncement>({
+    generation: 0,
+    message: "",
+  });
   const [onboarding, setOnboarding] = useState<OnboardingState>("unseen");
   const [viewportCommand, setViewportCommand] = useState<{
     id: number;
@@ -235,6 +244,8 @@ export function Workspace({
 
   const submit = (command: DurableCommand): Promise<boolean> =>
     session.current?.submit(command) ?? Promise.resolve(false);
+  const announce = (message: string): void =>
+    setCanvasAnnouncement((current) => nextCanvasAnnouncement(current, message));
   const addObject = (kind: "rectangle" | "sticky"): void => {
     if (!store.boardId) return;
     const targetId = crypto.randomUUID();
@@ -270,7 +281,10 @@ export function Workspace({
       type: "object.create",
       payload,
     }).then((persisted) => {
-      if (persisted && session.current === activeSession) store.select(targetId);
+      if (persisted && session.current === activeSession) {
+        store.select(targetId);
+        announce(`${kind === "sticky" ? "Sticky note" : "Rectangle"} created.`);
+      }
     });
   };
   const transform = (
@@ -282,6 +296,15 @@ export function Workspace({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.transform",
       payload,
+    }).then((persisted) => {
+      if (persisted)
+        announce(
+          payload.rotation !== undefined
+            ? "Object rotated."
+            : payload.width !== undefined
+              ? "Object resized."
+              : "Object moved.",
+        );
     });
   };
   const rotateSelected = (rotation: number): void => {
@@ -291,10 +314,12 @@ export function Workspace({
   const toggleHiddenSelected = (): void => {
     if (!selectedObject || !rotationAvailable) return;
     store.setObjectHidden(selectedObject.id, true);
+    announce("Object hidden in this view.");
   };
   const toggleLockedSelected = (): void => {
     if (!selectedObject || !rotationAvailable) return;
     store.setObjectLocked(selectedObject.id, true);
+    announce("Object locked in this view.");
   };
   const issueViewport = (action: "in" | "out" | "reset"): void =>
     setViewportCommand((current) => ({ id: (current?.id ?? 0) + 1, action }));
@@ -306,6 +331,8 @@ export function Workspace({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.delete",
       payload: {},
+    }).then((persisted) => {
+      if (persisted) announce("Object deleted.");
     });
   };
 
@@ -594,7 +621,10 @@ export function Workspace({
           rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}`}
           presence={presence}
           onPresencePointer={publishPresencePointer}
-          onSelect={(id) => store.select(id)}
+          onSelect={(id) => {
+            store.select(id);
+            if (id) announce("Object selected.");
+          }}
           onTransform={transform}
           viewportCommand={viewportCommand}
           creationTool={creationTool}
@@ -653,6 +683,7 @@ export function Workspace({
             <button onClick={() => dismissOnboarding("dismissed")}>Not now</button>
           </aside>
         )}
+      <CanvasActionAnnouncer announcement={canvasAnnouncement} />
       <output className="ui-visually-hidden" aria-live="polite" aria-atomic="true">
         {store.selectionNotice}
       </output>

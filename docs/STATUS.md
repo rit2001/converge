@@ -173,3 +173,6 @@ history remain pending.
 M3.6 is complete. M3.7 is next; user-facing version history is explicitly deferred until its authorized
 forward-only list/preview/restore backend contract exists. `/recovery` remains automatic verified recovery,
 not interactive history.
+M3.7A is complete: Layers is the labelled semantic “Board objects” Canvas alternative with bounded
+geometry/state descriptions, and completed local canvas actions use a generation-fenced polite announcer.
+Keyboard manipulation, touch policy, theme, and manual accessibility certification remain pending.
