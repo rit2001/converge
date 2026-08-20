@@ -29,6 +29,8 @@ import { SynchronizationStatus } from "./synchronization-status";
 import { CollaboratorPresence } from "./collaborator-presence";
 import { CommandPalette } from "./command-palette";
 import { createWorkspaceCommands, type CommandId } from "../commands";
+import { StudioHelp } from "./studio-help";
+import { readOnboarding, writeOnboarding, type OnboardingState } from "../onboarding";
 import type { PresenceSnapshot, PresenceStore } from "../presence-store";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
@@ -159,6 +161,8 @@ export function Workspace(): React.JSX.Element {
   const [diagnostics, setDiagnostics] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [onboarding, setOnboarding] = useState<OnboardingState>("unseen");
   const [viewportCommand, setViewportCommand] = useState<{
     id: number;
     action: "in" | "out" | "reset";
@@ -188,6 +192,11 @@ export function Workspace(): React.JSX.Element {
     pendingStatus: store.pendingStatus,
   });
   const terminal = store.connection === "authorization-failed" || store.connection === "error";
+  useEffect(() => setOnboarding(readOnboarding(window.localStorage)), []);
+  const dismissOnboarding = (state: Exclude<OnboardingState, "unseen">): void => {
+    setOnboarding(state);
+    writeOnboarding(window.localStorage, state);
+  };
   const presence = usePresenceSnapshot(presenceStore);
   const publishPresencePointer = useCallback(
     (cursor: { x: number; y: number } | null) => presenceStore?.publish(cursor, "active"),
@@ -307,6 +316,10 @@ export function Workspace(): React.JSX.Element {
       "panel.collaborators": () =>
         document.querySelector<HTMLButtonElement>('[aria-label^="Collaborators:"]')?.click(),
       "panel.diagnostics": () => setDiagnostics(true),
+      "panel.help": () => {
+        setPaletteOpen(false);
+        setHelpOpen(true);
+      },
       "selection.delete": remove,
       "selection.hide": toggleHiddenSelected,
       "selection.lock": toggleLockedSelected,
@@ -350,11 +363,18 @@ export function Workspace(): React.JSX.Element {
       if (event.isComposing || editable(event.target)) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
+        setHelpOpen(false);
         setPaletteOpen(true);
         return;
       }
       if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return;
       if (paletteOpen) return;
+      if (event.key === "?") {
+        event.preventDefault();
+        setPaletteOpen(false);
+        setHelpOpen(true);
+        return;
+      }
       const id =
         event.key.toLowerCase() === "v"
           ? "tool.select"
@@ -381,6 +401,13 @@ export function Workspace(): React.JSX.Element {
     document.addEventListener("keydown", keydown);
     return () => document.removeEventListener("keydown", keydown);
   }, [commands, diagnostics, layersOpen, paletteOpen]);
+
+  useEffect(() => {
+    if (terminal) {
+      setPaletteOpen(false);
+      setHelpOpen(false);
+    }
+  }, [terminal]);
 
   useEffect(() => {
     if (terminal) setPaletteOpen(false);
@@ -413,6 +440,18 @@ export function Workspace(): React.JSX.Element {
               onClick={() => setPaletteOpen(true)}
             >
               ⌘
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Open studio help (?)">
+            <IconButton
+              variant="ghost"
+              aria-label="Open studio help"
+              onClick={() => {
+                setPaletteOpen(false);
+                setHelpOpen(true);
+              }}
+            >
+              ?
             </IconButton>
           </Tooltip>
           <SynchronizationStatus
@@ -552,6 +591,23 @@ export function Workspace(): React.JSX.Element {
         commands={commands}
         onClose={() => setPaletteOpen(false)}
       />
+      <StudioHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
+      {store.connection === "ready" &&
+        store.objects.length === 0 &&
+        store.pending.length === 0 &&
+        onboarding === "unseen" &&
+        !paletteOpen &&
+        !helpOpen &&
+        !terminal && (
+          <aside className="studio-welcome" aria-label="First-run studio guidance">
+            <h2>Your shared canvas is ready</h2>
+            <p>Objects are durable; collaboration status is visible in the header.</p>
+            <button onClick={() => setCreationTool("sticky")}>Add a sticky note</button>
+            <button onClick={() => setCreationTool("rectangle")}>Add a rectangle</button>
+            <button onClick={() => setPaletteOpen(true)}>Open command palette</button>
+            <button onClick={() => dismissOnboarding("dismissed")}>Not now</button>
+          </aside>
+        )}
       <output className="ui-visually-hidden" aria-live="polite" aria-atomic="true">
         {store.selectionNotice}
       </output>

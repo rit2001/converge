@@ -10,6 +10,7 @@ export const COMMAND_IDS = [
   "panel.synchronization",
   "panel.collaborators",
   "panel.diagnostics",
+  "panel.help",
   "selection.delete",
   "selection.hide",
   "selection.lock",
@@ -160,6 +161,15 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       "Show secondary technical details",
       "Panels",
       ["diagnostics", "technical"],
+    ),
+    add(
+      "panel.help",
+      "Open studio help",
+      "Show implemented tools and shortcuts",
+      "Panels",
+      ["help", "shortcuts"],
+      true,
+      "?",
     ),
     add(
       "selection.delete",

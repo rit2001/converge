@@ -165,3 +165,5 @@ capacity, load, membership, or exact-presence guarantee.
 M3.6A is complete: a bounded typed command registry, one guarded document-level keyboard dispatcher,
 and an accessible modal command palette expose only implemented workspace actions. The palette has no
 history, sharing, onboarding, command persistence, protocol, or durable-command bypass behavior.
+M3.6B is complete: v1 local-only first-run guidance and reopenable Studio help explain only implemented
+canvas, local-view, synchronization, and ephemeral-presence behavior; share and history remain pending.
