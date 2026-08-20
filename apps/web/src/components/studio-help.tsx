@@ -55,6 +55,11 @@ export function StudioHelp({
           <kbd>Ctrl/⌘ K</kbd> Command palette · <kbd>Delete</kbd> eligible selection · Shift rotates
           by 15° · Alt/Option bypasses snapping.
         </p>
+        <p>
+          In the command palette, create a rectangle or sticky note at the viewport center. Focus
+          the canvas to move a selected object with <kbd>Arrow</kbd>, hold <kbd>Shift</kbd> for 10
+          units, or hold <kbd>Alt/Option</kbd> with <kbd>Arrow</kbd> to resize.
+        </p>
         <h3>Organize and collaborate</h3>
         <p>
           Layers and “This view” visibility/locking are local. Rotation is shared. Synchronization

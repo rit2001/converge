@@ -6,6 +6,7 @@ import type Konva from "konva";
 import type { CanvasObject } from "@converge/protocol";
 import { normalizeRotation, rotationLabel, rotationPreviewAngle } from "../canvas/rotation";
 import { CANVAS_GRID_SPACING, type AlignmentGuide, snapObjectPosition } from "../canvas/snapping";
+import { keyboardObjectPatch, viewportCenter } from "../canvas/keyboard-manipulation";
 import type { PresenceSnapshot } from "../presence-store";
 
 const EMPTY_OBJECT_IDS: ReadonlySet<string> = new Set();
@@ -33,6 +34,10 @@ interface Props {
   viewportCommand?: { id: number; action: "in" | "out" | "reset" } | undefined;
   creationTool?: "rectangle" | "sticky" | null;
   onCreateFromCanvas?: (kind: "rectangle" | "sticky") => void;
+  keyboardEditingEnabled?: boolean;
+  canvasFocusRequest?: number;
+  onViewportCenterChange?: (center: { x: number; y: number }) => void;
+  onKeyboardRejected?: (message: string) => void;
 }
 
 export function Canvas({
@@ -50,6 +55,10 @@ export function Canvas({
   viewportCommand,
   creationTool = null,
   onCreateFromCanvas,
+  keyboardEditingEnabled = false,
+  canvasFocusRequest = 0,
+  onViewportCenterChange,
+  onKeyboardRejected,
 }: Props): React.JSX.Element {
   const [viewport, setViewport] = useState({ width: 900, height: 600 });
   const [stage, setStage] = useState({ x: 0, y: 0, scale: 1 });
@@ -142,6 +151,14 @@ export function Canvas({
     });
   }, [viewportCommand, viewport.height, viewport.width]);
   useEffect(() => {
+    onViewportCenterChange?.(viewportCenter(stage, viewport));
+  }, [onViewportCenterChange, stage, viewport]);
+  useEffect(() => {
+    if (canvasFocusRequest <= 0) return;
+    const frame = requestAnimationFrame(() => container.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [canvasFocusRequest]);
+  useEffect(() => {
     const transformer = transformerRef.current;
     const node =
       selectedId && !lockedObjectIds.has(selectedId)
@@ -231,6 +248,41 @@ export function Canvas({
     <div
       className="canvas-shell"
       ref={container}
+      tabIndex={0}
+      aria-label="Canvas editing surface"
+      aria-describedby="canvas-editing-instructions"
+      onKeyDown={(event) => {
+        if (
+          event.repeat ||
+          event.ctrlKey ||
+          event.metaKey ||
+          !keyboardEditingEnabled ||
+          !selectedId ||
+          hiddenObjectIds.has(selectedId) ||
+          lockedObjectIds.has(selectedId) ||
+          !(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"] as const).includes(
+            event.key as never,
+          )
+        )
+          return;
+        const object = objects.find((candidate) => candidate.id === selectedId);
+        if (!object) return;
+        const patch = keyboardObjectPatch(
+          object,
+          event.key as "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown",
+          { altKey: event.altKey, shiftKey: event.shiftKey },
+        );
+        if (!patch) {
+          onKeyboardRejected?.(
+            event.altKey
+              ? "Object size is already at its allowed limit."
+              : "Object position is already at its allowed limit.",
+          );
+          return;
+        }
+        event.preventDefault();
+        onTransform(selectedId, patch);
+      }}
       style={
         {
           "--canvas-grid-size": `${CANVAS_GRID_SPACING * stage.scale}px`,
@@ -238,6 +290,10 @@ export function Canvas({
         } as React.CSSProperties
       }
     >
+      <span id="canvas-editing-instructions" className="ui-visually-hidden">
+        Focus the canvas to move a selected object with arrow keys. Hold Shift for ten units or
+        Alt/Option to resize.
+      </span>
       <Stage
         ref={stageRef}
         width={viewport.width}

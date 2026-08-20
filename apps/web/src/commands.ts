@@ -6,6 +6,9 @@ export const COMMAND_IDS = [
   "view.zoom-in",
   "view.zoom-out",
   "view.reset-zoom",
+  "view.focus-canvas",
+  "create.rectangle-center",
+  "create.sticky-center",
   "panel.layers",
   "panel.synchronization",
   "panel.collaborators",
@@ -20,7 +23,7 @@ export const COMMAND_IDS = [
   "selection.reset-rotation",
 ] as const;
 export type CommandId = (typeof COMMAND_IDS)[number];
-export type CommandCategory = "Tools" | "View" | "Panels" | "Selection";
+export type CommandCategory = "Tools" | "View" | "Panels" | "Selection" | "Create";
 export type WorkspaceCommand = Readonly<{
   id: CommandId;
   label: string;
@@ -73,6 +76,7 @@ type CommandInput = Readonly<{
   selectedLocked: boolean;
   selectedHidden: boolean;
   rotateAvailable: boolean;
+  canvasAvailable: boolean;
   action: Record<CommandId, () => void>;
 }>;
 const unavailable = (enabled: boolean, reason: string) =>
@@ -143,6 +147,32 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       ["zoom", "reset"],
       true,
       "0",
+    ),
+    add(
+      "view.focus-canvas",
+      "Focus canvas",
+      input.hasSelection
+        ? "Focus canvas to edit the selected object"
+        : "Focus the canvas editing surface",
+      "View",
+      ["canvas", "focus", "keyboard"],
+      input.canvasAvailable,
+    ),
+    add(
+      "create.rectangle-center",
+      "Create rectangle at viewport center",
+      "Create a rectangle at the visible board center",
+      "Create",
+      ["rectangle", "create", "center", "keyboard"],
+      input.ready,
+    ),
+    add(
+      "create.sticky-center",
+      "Create sticky note at viewport center",
+      "Create a sticky note at the visible board center",
+      "Create",
+      ["sticky", "note", "create", "center", "keyboard"],
+      input.ready,
     ),
     add("panel.layers", "Open Layers", "Show board layers", "Panels", ["layers", "objects"]),
     add(

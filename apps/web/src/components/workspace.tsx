@@ -185,6 +185,8 @@ export function Workspace({
     id: number;
     action: "in" | "out" | "reset";
   }>();
+  const [canvasFocusRequest, setCanvasFocusRequest] = useState(0);
+  const [viewportCenter, setViewportCenter] = useState({ x: 450, y: 300 });
   const layersTrigger = useRef<HTMLButtonElement>(null);
   const rotationControlsHadFocus = useRef(false);
   const selectedObjectLocked = Boolean(
@@ -251,21 +253,24 @@ export function Workspace({
     store.objects.find((object) => object.id === id)?.kind === "sticky"
       ? "Sticky note"
       : "Rectangle";
-  const addObject = (kind: "rectangle" | "sticky"): void => {
+  const addObject = (kind: "rectangle" | "sticky", center?: { x: number; y: number }): void => {
     if (!store.boardId) return;
     const targetId = crypto.randomUUID();
-    const position = {
+    const defaultPosition = {
       x: 120 + store.objects.length * 24,
       y: 100 + store.objects.length * 20,
     };
+    const size = kind === "sticky" ? { width: 200, height: 160 } : { width: 180, height: 110 };
+    const position = center
+      ? { x: center.x - size.width / 2, y: center.y - size.height / 2 }
+      : defaultPosition;
     const payload =
       kind === "sticky"
         ? {
             id: targetId,
             kind,
             ...position,
-            width: 200,
-            height: 160,
+            ...size,
             rotation: 0,
             fill: "#fde68a",
             text: "New note",
@@ -274,8 +279,7 @@ export function Workspace({
             id: targetId,
             kind,
             ...position,
-            width: 180,
-            height: 110,
+            ...size,
             rotation: 0,
             fill: "#818cf8",
             text: "" as const,
@@ -297,6 +301,7 @@ export function Workspace({
     payload: { x?: number; y?: number; width?: number; height?: number; rotation?: number },
   ): void => {
     if (!store.boardId || store.lockedObjectIds.has(targetId)) return;
+    const object = store.objects.find((candidate) => candidate.id === targetId);
     const actionLabel = objectActionLabel(targetId);
     const activeSession = session.current;
     void submit({
@@ -308,9 +313,9 @@ export function Workspace({
         announce(
           payload.rotation !== undefined
             ? `${actionLabel} rotated.`
-            : payload.width !== undefined
-              ? `${actionLabel} resized.`
-              : `${actionLabel} moved.`,
+            : payload.width !== undefined || payload.height !== undefined
+              ? `${actionLabel} resized to width ${Math.round(payload.width ?? object?.width ?? 0)}, height ${Math.round(payload.height ?? object?.height ?? 0)}.`
+              : `${actionLabel} moved to x ${Math.round(payload.x ?? object?.x ?? 0)}, y ${Math.round(payload.y ?? object?.y ?? 0)}.`,
         );
     });
   };
@@ -354,6 +359,9 @@ export function Workspace({
       "view.zoom-in": () => issueViewport("in"),
       "view.zoom-out": () => issueViewport("out"),
       "view.reset-zoom": () => issueViewport("reset"),
+      "view.focus-canvas": () => setCanvasFocusRequest((value) => value + 1),
+      "create.rectangle-center": () => addObject("rectangle", viewportCenter),
+      "create.sticky-center": () => addObject("sticky", viewportCenter),
       "panel.layers": () => setLayersOpen(true),
       "panel.synchronization": () =>
         document
@@ -386,6 +394,7 @@ export function Workspace({
       selectedLocked: selectedObjectLocked,
       selectedHidden: Boolean(selectedObject && store.hiddenObjectIds.has(selectedObject.id)),
       rotateAvailable: rotationAvailable,
+      canvasAvailable: store.connection === "ready" && Boolean(store.boardId),
       action,
     });
   }, [
@@ -397,6 +406,7 @@ export function Workspace({
     store.hiddenObjectIds,
     store.lockedObjectIds,
     store.committed.lastSeq,
+    viewportCenter,
   ]);
   useEffect(() => {
     const editable = (target: EventTarget | null): boolean =>
@@ -458,6 +468,7 @@ export function Workspace({
       setPaletteOpen(false);
       setHelpOpen(false);
       setShareOpen(false);
+      requestAnimationFrame(() => layersTrigger.current?.focus());
     }
   }, [terminal]);
 
@@ -635,6 +646,10 @@ export function Workspace({
             if (id) announce("Object selected.");
           }}
           onTransform={transform}
+          keyboardEditingEnabled={rotationAvailable}
+          canvasFocusRequest={canvasFocusRequest}
+          onViewportCenterChange={setViewportCenter}
+          onKeyboardRejected={announce}
           viewportCommand={viewportCommand}
           creationTool={creationTool}
           onCreateFromCanvas={(kind) => {

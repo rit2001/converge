@@ -178,3 +178,6 @@ geometry/state descriptions, and completed local canvas actions use one generati
 announcer. Automated axe coverage has no critical or serious WCAG A/AA violations on the landing,
 studio, object navigator, palette, Help, and Share surfaces; it supplements, but is not, full manual
 accessibility certification. Keyboard manipulation, touch policy, and theme work remain pending.
+M3.7B is complete: keyboard-only users can create supported objects at the visible viewport center and,
+after focusing the labelled Canvas editing surface, move or resize one visible unlocked selection through
+the existing authoritative transform path. Touch policy and theme work remain pending.

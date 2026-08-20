@@ -2011,6 +2011,11 @@ button {
   white-space: nowrap;
   color: var(--color-text-muted, #475569);
 }
+
+.canvas-shell:focus-visible {
+  outline: 3px solid var(--color-border-focus, #5146d8);
+  outline-offset: -3px;
+}
 .studio-welcome {
   position: fixed;
   z-index: var(--layer-popover, 700);

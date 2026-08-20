@@ -588,6 +588,20 @@ accessibility certification; manual keyboard, forced-colors, reduced-motion, nar
 zoom inspection remains part of release review. Keyboard object manipulation/creation, touch editing
 policy, and theme switching remain later M3.7 work.
 
+### M3.7B keyboard canvas contract
+
+The Canvas editing surface is a native focusable region, not a fabricated widget role. Its instructions
+describe the supported one-object actions: arrows move one world unit, Shift+arrows move ten, and
+Alt/Option+arrows resize by one or ten. This operates only for a current, visible, unlocked selection
+when the board is ready; it ignores repeats and Ctrl/Meta combinations. Movement bypasses positional
+snapping. Resize preserves the existing anchor and rotation and rejects, without a command, values beyond
+the protocol coordinate or size bounds.
+
+The palette offers Focus canvas plus direct rectangle/sticky creation at the current visible world-space
+center. Each accepted action uses the normal create/transform submission boundary and produces one
+completion announcement after acknowledgement. No keyboard mutation has a separate queue, protocol, or
+optimistic identity heuristic. Locked/hidden, terminal, stale, and unavailable state remain fenced.
+
 ## M3.8 — Performance, visual regression, and final acceptance
 
 **Preconditions**

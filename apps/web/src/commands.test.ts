@@ -17,6 +17,7 @@ function commands() {
     selectedLocked: false,
     selectedHidden: false,
     rotateAvailable: true,
+    canvasAvailable: true,
     action,
   });
 }
@@ -49,6 +50,7 @@ describe("workspace command registry", () => {
       selectedLocked: false,
       selectedHidden: false,
       rotateAvailable: false,
+      canvasAvailable: false,
       action,
     });
     expect(catalog.find((command) => command.id === "selection.delete")).toMatchObject({
@@ -56,5 +58,13 @@ describe("workspace command registry", () => {
       disabledReason: "Select an object first.",
     });
     expect(searchCommands(catalog, "x".repeat(MAX_COMMAND_QUERY_LENGTH + 20))).toEqual([]);
+  });
+  it("keeps direct keyboard creation and canvas focus in the bounded catalog", () => {
+    const catalog = commands();
+    expect(catalog.find((command) => command.id === "view.focus-canvas")?.available).toBe(true);
+    expect(searchCommands(catalog, "viewport center").map((command) => command.id)).toEqual([
+      "create.rectangle-center",
+      "create.sticky-center",
+    ]);
   });
 });
