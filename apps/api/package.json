@@ -9,6 +9,7 @@
     "./delivery-consumer": "./src/delivery-consumer.ts",
     "./delivery-runtime": "./src/delivery-runtime.ts",
     "./redis-delivery-transport": "./src/redis-delivery-transport.ts",
+    "./presence-redis-transport": "./src/presence-redis-transport.ts",
     "./env": "./src/env.ts"
   },
   "scripts": {

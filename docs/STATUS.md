@@ -138,3 +138,7 @@ and unavailable states without changing transport, persistence, recovery, or pro
 M3.5B1 is complete: the strict, versioned ephemeral presence schemas and multi-replica Redis
 Pub/Sub-plus-TTL architecture are defined with bounded, lossy semantics and no durable-plane impact.
 M3.5B2 runtime presence and M3.5B3 roster/cursor UX remain pending.
+
+M3.5B2A is complete: an uncomposed, separately owned atomic Redis presence transport now provides
+bounded session records, expiry indexes, revisioned tombstones, snapshots, and validated Pub/Sub
+deltas. Socket.IO admission/scheduling and the frontend presence surface remain pending in B2B/B3.

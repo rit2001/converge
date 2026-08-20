@@ -291,6 +291,22 @@ whether their own edit is local, acknowledged, reconnecting, recovered, or termi
   generate presence-session UUIDs server-side, write expiring records, publish deltas, read bounded
   late-join snapshots, and preserve session-generation fencing. It must remain fully isolated from
   durable editing and delivery readiness.
+
+**M3.5B2A transport status (complete)**
+
+The standalone `RedisPresenceTransport` uses three separately owned Redis connections (command,
+publisher, subscriber) and does not compose into `buildApp` or Socket.IO. For board `B` and presence
+session `S`, it stores JSON state at `converge:presence:v1:{B}:session:S`, a ZSET expiry index at
+`converge:presence:v1:{B}:sessions`, and a bounded TTL tombstone at
+`converge:presence:v1:{B}:tombstone:S`; braces keep all board mutation keys in one cluster slot.
+Atomic Lua admission/refresh/leave scripts obtain Redis `TIME`, enforce the 100-active-session limit,
+increment safe revisions, update the index/record TTL, and create revisioned leave tombstones. A
+bounded snapshot script drops logically expired index members and returns at most 100 strictly
+validated full states. Physical records and inactive indexes expire by TTL; no keyspace notifications
+are used. Publishing a validated full upsert/leave delta to `converge:presence:v1:pubsub` happens
+only after the atomic record change, so publish failure cannot corrupt session storage and maps only
+to presence availability.
+
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and
   render reduced-motion/accessible cursors without exposing user or session IDs.
