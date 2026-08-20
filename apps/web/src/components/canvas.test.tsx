@@ -86,6 +86,9 @@ interface RenderedGroupProps {
   width: number;
   height: number;
   rotation?: number;
+  draggable: boolean;
+  onClick: () => void;
+  onDragEnd: (event: { target: { x: () => number; y: () => number } }) => void;
   onTransformEnd: (event: {
     target: {
       x: () => number;
@@ -101,6 +104,7 @@ function renderCanvas(
   selectedId: string | null = null,
   onTransform: (id: string, patch: object) => void = vi.fn(),
   onSelect: (id: string | null) => void = vi.fn(),
+  lockedObjectIds: ReadonlySet<string> = new Set(),
 ): RenderedGroupProps[] {
   vi.mocked(Group).mockClear();
   vi.mocked(Transformer).mockClear();
@@ -109,6 +113,7 @@ function renderCanvas(
     createElement(Canvas, {
       objects,
       selectedId,
+      lockedObjectIds,
       tool: "select",
       onSelect,
       onTransform,
@@ -224,5 +229,30 @@ describe("canvas selection boundary", () => {
     onPointerDown({ target: stage });
 
     expect(onSelect).toHaveBeenCalledWith(null);
+  });
+
+  it("blocks locked-object selection, dragging, and transforms", () => {
+    const onSelect = vi.fn();
+    const onTransform = vi.fn();
+    const [group] = renderCanvas(
+      [rectangle],
+      rectangle.id,
+      onTransform,
+      onSelect,
+      new Set([rectangle.id]),
+    );
+
+    expect(group).toMatchObject({ draggable: false });
+    expect(vi.mocked(Transformer).mock.calls[0]?.[0]).toMatchObject({ rotateEnabled: false });
+    group?.onClick();
+    group?.onDragEnd({ target: { x: () => 70, y: () => 80 } });
+    const scaleX = vi.fn().mockReturnValue(1.5);
+    const scaleY = vi.fn().mockReturnValue(2);
+    group?.onTransformEnd({
+      target: { x: () => 70, y: () => 80, scaleX, scaleY },
+    });
+
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onTransform).not.toHaveBeenCalled();
   });
 });

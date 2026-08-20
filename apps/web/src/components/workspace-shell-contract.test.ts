@@ -67,5 +67,7 @@ describe("layered studio shell contract", () => {
     );
     expect(workspace).toContain("Desktop-first studio");
     expect(workspace).toContain("optimized for a larger screen");
+    expect(workspace).toContain("Restore local layers");
+    expect(workspace).toContain("store.clearLocalViewControls()");
   });
 });

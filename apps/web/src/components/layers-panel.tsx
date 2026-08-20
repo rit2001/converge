@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import type { CanvasObject } from "@converge/protocol";
+import { IconButton, Tooltip } from "./ui/primitives";
 
 export interface LayerEntry {
   object: CanvasObject;
@@ -60,15 +61,38 @@ function ObjectTypeIcon({ kind }: { kind: CanvasObject["kind"] }): React.JSX.Ele
   );
 }
 
+function ViewControlIcon({ kind }: { kind: "visibility" | "lock" }): React.JSX.Element {
+  const shared = { fill: "none", stroke: "currentColor", strokeWidth: 1.75 };
+  return kind === "visibility" ? (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path {...shared} d="M3 12s3.5-5 9-5 9 5 9 5-3.5 5-9 5-9-5-9-5Z" />
+      <circle {...shared} cx="12" cy="12" r="2.5" />
+    </svg>
+  ) : (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <rect {...shared} x="5" y="10" width="14" height="10" rx="2" />
+      <path {...shared} d="M8 10V7a4 4 0 0 1 8 0v3" />
+    </svg>
+  );
+}
+
 export function LayersPanel({
   objects,
   selectedId,
+  hiddenObjectIds,
+  lockedObjectIds,
   onSelect,
+  onToggleHidden,
+  onToggleLocked,
   onClose,
 }: {
   objects: CanvasObject[];
   selectedId: string | null;
+  hiddenObjectIds: ReadonlySet<string>;
+  lockedObjectIds: ReadonlySet<string>;
   onSelect: (id: string) => void;
+  onToggleHidden: (id: string) => void;
+  onToggleLocked: (id: string) => void;
   onClose: () => void;
 }): React.JSX.Element {
   const entries = layerEntries(objects);
@@ -88,6 +112,10 @@ export function LayersPanel({
         <div>
           <h2 id="layers-panel-title">Layers</h2>
           <p aria-label={`${entries.length} objects`}>{entries.length} objects</p>
+          <p className="layers-panel__view-note">
+            <strong>This view</strong> only. Visibility and locks are local and aren’t shared with
+            collaborators.
+          </p>
         </div>
         <button
           className="ui-button ui-button--ghost ui-button--icon"
@@ -112,6 +140,8 @@ export function LayersPanel({
         <ul className="layers-panel__list" aria-label="Board layers, top to bottom">
           {entries.map((entry, index) => {
             const selected = selectedId === entry.object.id;
+            const hidden = hiddenObjectIds.has(entry.object.id);
+            const locked = lockedObjectIds.has(entry.object.id);
             const accessibleLabel = `${entry.label}, ${entry.position === 1 ? "top" : entry.position === entry.total ? "bottom" : "layer"} layer, ${entry.position} of ${entry.total}`;
             return (
               <li key={entry.object.id}>
@@ -123,6 +153,8 @@ export function LayersPanel({
                   type="button"
                   aria-label={accessibleLabel}
                   aria-pressed={selected}
+                  data-hidden={hidden || undefined}
+                  data-locked={locked || undefined}
                   onClick={() => onSelect(entry.object.id)}
                   onKeyDown={(event) => moveFocus(event, index)}
                 >
@@ -130,8 +162,45 @@ export function LayersPanel({
                     <ObjectTypeIcon kind={entry.object.kind} />
                   </span>
                   <span className="layers-panel__label">{entry.label}</span>
-                  {selected && <span className="layers-panel__selected">Selected</span>}
+                  <span className="layers-panel__state">
+                    {hidden && <span>Hidden</span>}
+                    {locked && <span>Locked</span>}
+                    {selected && <span className="layers-panel__selected">Selected</span>}
+                  </span>
                 </button>
+                <div
+                  className="layers-panel__controls"
+                  aria-label={`${entry.label} local controls`}
+                >
+                  <Tooltip label={`${hidden ? "Show" : "Hide"} ${entry.label}`}>
+                    <IconButton
+                      className="layers-panel__control"
+                      variant="ghost"
+                      aria-label={`${hidden ? "Show" : "Hide"} ${entry.label}`}
+                      aria-pressed={!hidden}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onToggleHidden(entry.object.id);
+                      }}
+                    >
+                      <ViewControlIcon kind="visibility" />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip label={`${locked ? "Unlock" : "Lock"} ${entry.label}`}>
+                    <IconButton
+                      className="layers-panel__control"
+                      variant="ghost"
+                      aria-label={`${locked ? "Unlock" : "Lock"} ${entry.label}`}
+                      aria-pressed={locked}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onToggleLocked(entry.object.id);
+                      }}
+                    >
+                      <ViewControlIcon kind="lock" />
+                    </IconButton>
+                  </Tooltip>
+                </div>
               </li>
             );
           })}

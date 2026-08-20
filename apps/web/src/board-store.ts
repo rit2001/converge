@@ -66,6 +66,8 @@ export interface BoardStore {
   objects: CanvasObject[];
   selectedId: string | null;
   selectionNotice: string | null;
+  hiddenObjectIds: ReadonlySet<string>;
+  lockedObjectIds: ReadonlySet<string>;
   connection: SynchronizationStatus;
   pendingStatus: PendingRecoveryStatus;
   synchronizationDiagnostics: SynchronizationDiagnostics;
@@ -105,6 +107,9 @@ export interface BoardStore {
     message?: string | null,
   ): void;
   select(id: string | null): void;
+  setObjectHidden(id: string, hidden: boolean): void;
+  setObjectLocked(id: string, locked: boolean): void;
+  clearLocalViewControls(): void;
   addPersistedPending(token: BoardSessionToken, command: DurableCommand): boolean;
   removePending(token: BoardSessionToken, opId: string, error?: string): void;
   ingest(token: BoardSessionToken, operation: CommittedOperation): IngestResult | "stale";
@@ -131,10 +136,37 @@ function derive(committed: BoardState, pending: DurableCommand[]): CanvasObject[
   return visibleObjects(optimisticState(committed, pending));
 }
 
+export function visibleInLocalView(
+  objects: CanvasObject[],
+  hiddenObjectIds: ReadonlySet<string>,
+): CanvasObject[] {
+  return objects.filter((object) => !hiddenObjectIds.has(object.id));
+}
+
 function currentSelection(objects: CanvasObject[], selectedId: string | null) {
   if (!selectedId || objects.some((object) => object.id === selectedId))
     return { selectedId, selectionNotice: null };
   return { selectedId: null, selectionNotice: "Selected object was removed from the board." };
+}
+
+function localViewState(
+  objects: CanvasObject[],
+  selectedId: string | null,
+  hiddenObjectIds: ReadonlySet<string>,
+  lockedObjectIds: ReadonlySet<string>,
+) {
+  const activeIds = new Set(objects.map((object) => object.id));
+  const hidden = new Set([...hiddenObjectIds].filter((id) => activeIds.has(id)));
+  const locked = new Set([...lockedObjectIds].filter((id) => activeIds.has(id)));
+  const selection = currentSelection(objects, selectedId);
+  return {
+    ...selection,
+    ...(selection.selectedId && hidden.has(selection.selectedId)
+      ? { selectedId: null, selectionNotice: null }
+      : {}),
+    hiddenObjectIds: hidden,
+    lockedObjectIds: locked,
+  };
 }
 
 function cloneBoardState(state: BoardState): BoardState {
@@ -238,6 +270,8 @@ export function createBoardStore(
       objects: [],
       selectedId: null,
       selectionNotice: null,
+      hiddenObjectIds: new Set(),
+      lockedObjectIds: new Set(),
       connection: "disconnected",
       pendingStatus: "idle",
       synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -257,6 +291,8 @@ export function createBoardStore(
           objects: [],
           selectedId: null,
           selectionNotice: null,
+          hiddenObjectIds: new Set(),
+          lockedObjectIds: new Set(),
           connection: "connecting",
           pendingStatus: "idle",
           synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -280,7 +316,12 @@ export function createBoardStore(
           committed,
           pending,
           objects,
-          ...currentSelection(objects, get().selectedId),
+          ...localViewState(
+            objects,
+            get().selectedId,
+            get().hiddenObjectIds,
+            get().lockedObjectIds,
+          ),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -305,7 +346,12 @@ export function createBoardStore(
           name: snapshot.name,
           committed,
           objects,
-          ...currentSelection(objects, current.selectedId),
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -330,7 +376,12 @@ export function createBoardStore(
           name: boardName,
           committed,
           objects,
-          ...currentSelection(objects, current.selectedId),
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -357,6 +408,8 @@ export function createBoardStore(
           objects: [],
           selectedId: null,
           selectionNotice: null,
+          hiddenObjectIds: new Set(),
+          lockedObjectIds: new Set(),
           connection: "authorization-failed",
           synchronizationDiagnostics: {
             ...get().synchronizationDiagnostics,
@@ -390,6 +443,8 @@ export function createBoardStore(
           objects: [],
           selectedId: null,
           selectionNotice: null,
+          hiddenObjectIds: new Set(),
+          lockedObjectIds: new Set(),
           connection: "disconnected",
           pendingStatus: "idle",
           synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -423,8 +478,38 @@ export function createBoardStore(
       },
       select(selectedId) {
         const current = get();
+        if (selectedId && current.hiddenObjectIds.has(selectedId)) {
+          set({ selectedId: null, selectionNotice: null });
+          return;
+        }
         const selection = currentSelection(current.objects, selectedId);
         set({ ...selection, selectionNotice: selectedId ? null : selection.selectionNotice });
+      },
+      setObjectHidden(id, hidden) {
+        const current = get();
+        if (!current.objects.some((object) => object.id === id)) return;
+        const hiddenObjectIds = new Set(current.hiddenObjectIds);
+        if (hidden) hiddenObjectIds.add(id);
+        else hiddenObjectIds.delete(id);
+        set({
+          ...localViewState(
+            current.objects,
+            current.selectedId,
+            hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
+        });
+      },
+      setObjectLocked(id, locked) {
+        const current = get();
+        if (!current.objects.some((object) => object.id === id)) return;
+        const lockedObjectIds = new Set(current.lockedObjectIds);
+        if (locked) lockedObjectIds.add(id);
+        else lockedObjectIds.delete(id);
+        set({ lockedObjectIds });
+      },
+      clearLocalViewControls() {
+        set({ hiddenObjectIds: new Set(), lockedObjectIds: new Set() });
       },
       addPersistedPending(sessionToken, command) {
         const current = get();
@@ -435,7 +520,12 @@ export function createBoardStore(
         set({
           pending,
           objects,
-          ...currentSelection(objects, current.selectedId),
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           error: null,
         });
         return true;
@@ -448,7 +538,12 @@ export function createBoardStore(
         set({
           pending,
           objects,
-          ...currentSelection(objects, current.selectedId),
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           ...(error === undefined ? {} : { error }),
         });
       },
@@ -500,7 +595,12 @@ export function createBoardStore(
           appliedOpIds,
           appliedSeqOpIds,
           objects,
-          ...currentSelection(objects, current.selectedId),
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           ...(advanced && current.boardId
             ? {
                 authoritativeHash: {

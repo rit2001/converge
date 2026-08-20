@@ -8,6 +8,7 @@ import type { CanvasObject } from "@converge/protocol";
 interface Props {
   objects: CanvasObject[];
   selectedId: string | null;
+  lockedObjectIds?: ReadonlySet<string>;
   tool: "select" | "pan";
   onSelect: (id: string | null) => void;
   onTransform: (
@@ -19,6 +20,7 @@ interface Props {
 export function Canvas({
   objects,
   selectedId,
+  lockedObjectIds = new Set(),
   tool,
   onSelect,
   onTransform,
@@ -44,10 +46,13 @@ export function Canvas({
   }, []);
   useEffect(() => {
     const transformer = transformerRef.current;
-    const node = selectedId ? stageRef.current?.findOne(`#object-${selectedId}`) : undefined;
+    const node =
+      selectedId && !lockedObjectIds.has(selectedId)
+        ? stageRef.current?.findOne(`#object-${selectedId}`)
+        : undefined;
     transformer?.nodes(node ? [node] : []);
     transformer?.getLayer()?.batchDraw();
-  }, [selectedId, objects]);
+  }, [selectedId, objects, lockedObjectIds]);
 
   return (
     <div className="canvas-shell" ref={container}>
@@ -88,54 +93,62 @@ export function Canvas({
         }}
       >
         <Layer>
-          {objects.map((object) => (
-            <Group
-              key={object.id}
-              id={`object-${object.id}`}
-              x={object.x}
-              y={object.y}
-              width={object.width}
-              height={object.height}
-              rotation={object.rotation}
-              draggable={tool === "select"}
-              onClick={() => onSelect(object.id)}
-              onTap={() => onSelect(object.id)}
-              onDragEnd={(event) =>
-                onTransform(object.id, { x: event.target.x(), y: event.target.y() })
-              }
-              onTransformEnd={(event) => {
-                const node = event.target;
-                const width = Math.max(8, object.width * node.scaleX());
-                const height = Math.max(8, object.height * node.scaleY());
-                node.scaleX(1);
-                node.scaleY(1);
-                onTransform(object.id, { x: node.x(), y: node.y(), width, height });
-              }}
-            >
-              <Rect
+          {objects.map((object) => {
+            const locked = lockedObjectIds.has(object.id);
+            return (
+              <Group
+                key={object.id}
+                id={`object-${object.id}`}
+                x={object.x}
+                y={object.y}
                 width={object.width}
                 height={object.height}
-                fill={object.fill}
-                cornerRadius={object.kind === "sticky" ? 4 : 12}
-                shadowColor="#0f172a"
-                shadowBlur={selectedId === object.id ? 16 : 8}
-                shadowOpacity={0.16}
-                shadowOffsetY={4}
-              />
-              {object.kind === "sticky" && (
-                <Text
-                  text={object.text}
+                rotation={object.rotation}
+                draggable={tool === "select" && !locked}
+                onClick={() => {
+                  if (!locked) onSelect(object.id);
+                }}
+                onTap={() => {
+                  if (!locked) onSelect(object.id);
+                }}
+                onDragEnd={(event) =>
+                  !locked && onTransform(object.id, { x: event.target.x(), y: event.target.y() })
+                }
+                onTransformEnd={(event) => {
+                  if (locked) return;
+                  const node = event.target;
+                  const width = Math.max(8, object.width * node.scaleX());
+                  const height = Math.max(8, object.height * node.scaleY());
+                  node.scaleX(1);
+                  node.scaleY(1);
+                  onTransform(object.id, { x: node.x(), y: node.y(), width, height });
+                }}
+              >
+                <Rect
                   width={object.width}
                   height={object.height}
-                  padding={18}
-                  fontSize={18}
-                  fontFamily="Inter, sans-serif"
-                  fill="#312e1f"
-                  wrap="word"
+                  fill={object.fill}
+                  cornerRadius={object.kind === "sticky" ? 4 : 12}
+                  shadowColor="#0f172a"
+                  shadowBlur={selectedId === object.id ? 16 : 8}
+                  shadowOpacity={0.16}
+                  shadowOffsetY={4}
                 />
-              )}
-            </Group>
-          ))}
+                {object.kind === "sticky" && (
+                  <Text
+                    text={object.text}
+                    width={object.width}
+                    height={object.height}
+                    padding={18}
+                    fontSize={18}
+                    fontFamily="Inter, sans-serif"
+                    fill="#312e1f"
+                    wrap="word"
+                  />
+                )}
+              </Group>
+            );
+          })}
           <Transformer
             ref={transformerRef}
             rotateEnabled={false}

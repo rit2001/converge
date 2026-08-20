@@ -15,7 +15,7 @@ import {
   type BoardSessionHandle,
   type BoardSessionToken,
 } from "../board-session";
-import { useBoardStore } from "../board-store";
+import { useBoardStore, visibleInLocalView } from "../board-store";
 import { indexedDbPendingOperationStore } from "../pending-db";
 import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
@@ -146,6 +146,14 @@ export function Workspace(): React.JSX.Element {
   const [diagnostics, setDiagnostics] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
   const layersTrigger = useRef<HTMLButtonElement>(null);
+  const canvasObjects = useMemo(
+    () => visibleInLocalView(store.objects, store.hiddenObjectIds),
+    [store.hiddenObjectIds, store.objects],
+  );
+  const selectedObjectLocked = Boolean(
+    store.selectedId && store.lockedObjectIds.has(store.selectedId),
+  );
+  const hasLocalViewControls = store.hiddenObjectIds.size > 0 || store.lockedObjectIds.size > 0;
 
   const closeLayers = (): void => {
     setLayersOpen(false);
@@ -211,7 +219,7 @@ export function Workspace(): React.JSX.Element {
     targetId: string,
     payload: { x: number; y: number; width?: number; height?: number },
   ): void => {
-    if (!store.boardId) return;
+    if (!store.boardId || store.lockedObjectIds.has(targetId)) return;
     void submit({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.transform",
@@ -219,7 +227,7 @@ export function Workspace(): React.JSX.Element {
     });
   };
   const remove = (): void => {
-    if (!store.boardId || !store.selectedId) return;
+    if (!store.boardId || !store.selectedId || store.lockedObjectIds.has(store.selectedId)) return;
     const targetId = store.selectedId;
     store.select(null);
     void submit({
@@ -237,7 +245,11 @@ export function Workspace(): React.JSX.Element {
         event.target instanceof HTMLSelectElement
       )
         return;
-      if ((event.key === "Delete" || event.key === "Backspace") && store.selectedId) {
+      if (
+        (event.key === "Delete" || event.key === "Backspace") &&
+        store.selectedId &&
+        !store.lockedObjectIds.has(store.selectedId)
+      ) {
         event.preventDefault();
         remove();
       }
@@ -246,7 +258,7 @@ export function Workspace(): React.JSX.Element {
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [store.selectedId, store.boardId, store.committed.lastSeq]);
+  }, [store.selectedId, store.boardId, store.committed.lastSeq, store.lockedObjectIds]);
 
   useEffect(() => {
     const keydown = (event: KeyboardEvent): void => {
@@ -352,7 +364,7 @@ export function Workspace(): React.JSX.Element {
               className="workspace-tool-button"
               variant="ghost"
               aria-label="Delete selected"
-              disabled={!store.selectedId}
+              disabled={!store.selectedId || selectedObjectLocked}
               onClick={remove}
             >
               <ToolIcon name="delete" />
@@ -362,8 +374,9 @@ export function Workspace(): React.JSX.Element {
       </aside>
       <section id="studio-canvas-region" className="studio-canvas-region" aria-label="Board canvas">
         <Canvas
-          objects={store.objects}
+          objects={canvasObjects}
           selectedId={store.selectedId}
+          lockedObjectIds={store.lockedObjectIds}
           tool={tool}
           onSelect={(id) => store.select(id)}
           onTransform={transform}
@@ -373,7 +386,11 @@ export function Workspace(): React.JSX.Element {
         <LayersPanel
           objects={store.objects}
           selectedId={store.selectedId}
+          hiddenObjectIds={store.hiddenObjectIds}
+          lockedObjectIds={store.lockedObjectIds}
           onSelect={(id) => store.select(id)}
+          onToggleHidden={(id) => store.setObjectHidden(id, !store.hiddenObjectIds.has(id))}
+          onToggleLocked={(id) => store.setObjectLocked(id, !store.lockedObjectIds.has(id))}
           onClose={closeLayers}
         />
       )}
@@ -389,6 +406,15 @@ export function Workspace(): React.JSX.Element {
       <aside className="studio-narrow-notice" aria-label="Desktop editor notice">
         <strong>Desktop-first studio</strong>
         <span>Canvas editing is optimized for a larger screen.</span>
+        {hasLocalViewControls && (
+          <button
+            className="studio-narrow-reset"
+            type="button"
+            onClick={() => store.clearLocalViewControls()}
+          >
+            Restore local layers
+          </button>
+        )}
       </aside>
       <section className={`diagnostics studio-system-details ${diagnostics ? "open" : ""}`}>
         <button

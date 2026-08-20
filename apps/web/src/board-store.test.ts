@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { CommittedOperation, DurableCommand } from "@converge/protocol";
 import { emptyBoardState } from "@converge/canvas-engine";
 import type { BoardSessionToken } from "./board-session";
-import { createBoardStore, useBoardStore } from "./board-store";
+import { createBoardStore, useBoardStore, visibleInLocalView } from "./board-store";
 
 const boardId = "10000000-0000-4000-8000-000000000001";
 const clientId = "20000000-0000-4000-8000-000000000001";
@@ -164,6 +164,72 @@ describe("local controlled selection", () => {
     useBoardStore.getState().beginSession(replacement, "10000000-0000-4000-8000-000000000002");
 
     expect(useBoardStore.getState()).toMatchObject({ selectedId: null, objects: [] });
+  });
+
+  it("keeps hide and lock identities local, clears hidden selection, and never adds pending work", () => {
+    useBoardStore.getState().ingest(token, created);
+    useBoardStore.getState().select(objectId);
+
+    useBoardStore.getState().setObjectHidden(objectId, true);
+    useBoardStore.getState().setObjectLocked(objectId, true);
+
+    expect(useBoardStore.getState()).toMatchObject({ selectedId: null, pending: [] });
+    expect(useBoardStore.getState().hiddenObjectIds).toEqual(new Set([objectId]));
+    expect(useBoardStore.getState().lockedObjectIds).toEqual(new Set([objectId]));
+    expect(useBoardStore.getState().objects).toHaveLength(1);
+  });
+
+  it("keeps remote authoritative updates while an object is hidden and locked", () => {
+    useBoardStore.getState().ingest(token, created);
+    useBoardStore.getState().setObjectHidden(objectId, true);
+    useBoardStore.getState().setObjectLocked(objectId, true);
+
+    useBoardStore.getState().ingest(token, transformed);
+
+    expect(useBoardStore.getState().objects[0]).toMatchObject({ id: objectId, x: 90 });
+    expect(useBoardStore.getState().hiddenObjectIds).toEqual(new Set([objectId]));
+    expect(useBoardStore.getState().lockedObjectIds).toEqual(new Set([objectId]));
+    expect(
+      visibleInLocalView(
+        useBoardStore.getState().objects,
+        useBoardStore.getState().hiddenObjectIds,
+      ),
+    ).toEqual([]);
+
+    useBoardStore.getState().setObjectHidden(objectId, false);
+    expect(
+      visibleInLocalView(
+        useBoardStore.getState().objects,
+        useBoardStore.getState().hiddenObjectIds,
+      )[0],
+    ).toMatchObject({ id: objectId, x: 90 });
+  });
+
+  it("prunes local view identities after a remote deletion and replacement session", () => {
+    useBoardStore.getState().ingest(token, created);
+    useBoardStore.getState().setObjectHidden(objectId, true);
+    useBoardStore.getState().setObjectLocked(objectId, true);
+
+    useBoardStore.getState().ingest(token, deleted);
+
+    expect(useBoardStore.getState().hiddenObjectIds).toEqual(new Set());
+    expect(useBoardStore.getState().lockedObjectIds).toEqual(new Set());
+    const replacement = nextToken();
+    useBoardStore.getState().beginSession(replacement, "10000000-0000-4000-8000-000000000003");
+    expect(useBoardStore.getState().hiddenObjectIds).toEqual(new Set());
+    expect(useBoardStore.getState().lockedObjectIds).toEqual(new Set());
+  });
+
+  it("can clear local view controls without mutating authoritative or pending state", () => {
+    useBoardStore.getState().ingest(token, created);
+    useBoardStore.getState().setObjectHidden(objectId, true);
+    useBoardStore.getState().setObjectLocked(objectId, true);
+
+    useBoardStore.getState().clearLocalViewControls();
+
+    expect(useBoardStore.getState()).toMatchObject({ pending: [], objects: [{ id: objectId }] });
+    expect(useBoardStore.getState().hiddenObjectIds).toEqual(new Set());
+    expect(useBoardStore.getState().lockedObjectIds).toEqual(new Set());
   });
 });
 
