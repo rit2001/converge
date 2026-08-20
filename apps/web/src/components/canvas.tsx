@@ -255,7 +255,15 @@ export function Canvas({
     updateCanvasStrokes();
     const forcedColors = window.matchMedia("(forced-colors: active)");
     forcedColors.addEventListener("change", updateCanvasStrokes);
-    return () => forcedColors.removeEventListener("change", updateCanvasStrokes);
+    const observer = new MutationObserver(updateCanvasStrokes);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+    return () => {
+      forcedColors.removeEventListener("change", updateCanvasStrokes);
+      observer.disconnect();
+    };
   }, []);
 
   useEffect(

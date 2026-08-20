@@ -15,6 +15,9 @@ export const COMMAND_IDS = [
   "panel.diagnostics",
   "panel.help",
   "panel.share",
+  "theme.system",
+  "theme.light",
+  "theme.dark",
   "selection.delete",
   "selection.hide",
   "selection.lock",
@@ -78,6 +81,7 @@ type CommandInput = Readonly<{
   rotateAvailable: boolean;
   canvasAvailable: boolean;
   mutationAllowed: boolean;
+  themePreference?: "system" | "light" | "dark";
   viewOnly?: boolean;
   action: Record<CommandId, () => void>;
 }>;
@@ -106,6 +110,7 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
   });
   const selected =
     input.mutationAllowed && input.hasSelection && !input.selectedLocked && !input.selectedHidden;
+  const themePreference = input.themePreference ?? "system";
   const selectionReason = !input.ready
     ? "Board is not ready for editing."
     : input.hasSelection
@@ -214,6 +219,30 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       "Panels",
       ["share", "link"],
       input.ready,
+    ),
+    add(
+      "theme.system",
+      "Use system theme",
+      "Follow this device",
+      "View",
+      ["theme", "system"],
+      themePreference !== "system",
+    ),
+    add(
+      "theme.light",
+      "Use light theme",
+      "Use the light appearance",
+      "View",
+      ["theme", "light"],
+      themePreference !== "light",
+    ),
+    add(
+      "theme.dark",
+      "Use dark theme",
+      "Use the dark appearance",
+      "View",
+      ["theme", "dark"],
+      themePreference !== "dark",
     ),
     add(
       "selection.delete",

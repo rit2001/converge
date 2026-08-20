@@ -185,3 +185,6 @@ M3.7C1 is complete: responsive capability is local UI policy—full editor on de
 tablet/narrow desktop, and view-only below 640 CSS pixels (plus coarse-pointer short landscape). Phone
 view-only retains synchronization, inspection, pan, and zoom while fencing durable mutation; theme
 preference remains pending.
+M3.7C2 completes M3.7: System, Light, and Dark are supported as a versioned device-local preference.
+They change only semantic presentation tokens and Canvas UI overlays, never board data, sessions, or
+network behavior. Automated checks support, but do not claim, full manual accessibility certification.

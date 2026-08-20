@@ -32,21 +32,22 @@ Tokens use semantic names, not component names or raw values in components.
 
 ## Theme strategy
 
-Tokens must support light and dark from M3.1. Human approval chooses either:
+M3.7C2 ships System, Light, and Dark preferences. System is the default and follows the device;
+Light and Dark are explicit local overrides. Only the bounded device-local record
+`converge:theme:v1` (`{version:1, preference}`) is persisted. The effective theme is applied to the
+root before hydration, then follows system changes only while System remains selected.
 
-1. ship both themes in M3 with system preference and explicit override; or
-2. ship a fully polished light theme first while every component uses theme-safe tokens, then accept
-   dark mode in M3.7 before milestone completion.
+Theme switching must not reconstruct the board session, Konva stage, presence state, or command
+state. Canvas object colors remain content and are not automatically inverted. Semantic CSS tokens
+carry chrome, status, focus, collaborator, and dialog colors; a bounded Canvas resolver refreshes
+only UI-owned drawing colors such as grids, selection/rotation controls, guides, and presence cursor
+labels. Forced colors remains authoritative where the browser supports it.
 
-Theme switching must not reconstruct the board session or Konva stage. Persist only the preference,
-not board data. Canvas object colors remain content and are not automatically inverted.
-
-M3.1 resolves the initial delivery choice in favor of a polished light shipping theme. The semantic
-token contract includes dark-compatible values, but no automatic activation or theme switcher is
-shipped in this slice. The existing privacy-safe system font stack remains in use and no icon, font,
-animation, or UI-framework dependency is added. Alpha is limited to focus rings, subtle selection,
-shadows, and small floating chrome where the opaque fallback preserves contrast; large editor
-surfaces and authoritative state indicators remain opaque.
+The existing privacy-safe system font stack remains in use and no icon, font, animation, or
+UI-framework dependency is added. Alpha is limited to focus rings, subtle selection, shadows, and
+small floating chrome where the opaque fallback preserves contrast; large editor surfaces and
+authoritative state indicators remain opaque. Appearance is available from Help and the command
+palette, never from a networked account setting.
 
 ## Surface language
 

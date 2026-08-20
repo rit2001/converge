@@ -617,6 +617,24 @@ A second touch fences any uncommitted drag/transform before pinch starts; touch 
 transition, blur, and unmount clear gesture state and local previews. Touch never publishes a presence
 cursor or a durable navigation operation.
 
+### M3.7C2 theme-preference policy
+
+M3.7C2 completes M3.7 with a versioned browser-local preference: `system`, `light`, or `dark`.
+`system` is the default and resolves from `prefers-color-scheme`; explicit choices do not follow later
+system changes. The bounded `converge:theme:v1` record is strictly parsed and written only for an
+explicit choice. Invalid or unavailable storage fails safely to System, and standard storage events
+synchronize another tab without any board, account, network, or analytics state.
+
+A static bounded initializer applies `data-theme`, `data-theme-preference`, and `color-scheme` to the
+root before hydration. All chrome colors use semantic light/dark token families. A theme change
+refreshes Canvas-owned UI colors (background/grid, selection/rotation controls, alignment feedback,
+and presence labels) once, without rebuilding a board store/session or mutating object data. Help has
+the accessible native Appearance radio group and the palette exposes the same three actions.
+
+Light and dark automated axe/contrast checks are repeatable release evidence, not a claim of full
+manual accessibility certification. Keyboard manipulation, touch policy, and theme work are complete;
+M3.8 is the next milestone.
+
 ## M3.8 — Performance, visual regression, and final acceptance
 
 **Preconditions**

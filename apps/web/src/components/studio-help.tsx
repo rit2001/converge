@@ -2,6 +2,7 @@
 import { createPortal } from "react-dom";
 import { useEffect, useRef } from "react";
 import * as React from "react";
+import { useTheme, type ThemePreference } from "../theme-provider";
 export function StudioHelp({
   open,
   onClose,
@@ -9,6 +10,7 @@ export function StudioHelp({
   open: boolean;
   onClose: () => void;
 }): React.JSX.Element | null {
+  const theme = useTheme();
   const close = useRef<HTMLButtonElement>(null);
   const previous = useRef<HTMLElement | null>(null);
   useEffect(() => {
@@ -61,6 +63,22 @@ export function StudioHelp({
           units, or hold <kbd>Alt/Option</kbd> with <kbd>Arrow</kbd> to resize.
         </p>
         <p>On a phone-sized screen, the board stays view-only; use a larger screen to edit.</p>
+        <fieldset>
+          <legend>Appearance</legend>
+          <p>System follows this device.</p>
+          {(["system", "light", "dark"] as const).map((preference) => (
+            <label key={preference}>
+              <input
+                type="radio"
+                name="theme-preference"
+                checked={theme.preference === preference}
+                onChange={() => theme.setPreference(preference as ThemePreference)}
+              />
+              {preference[0]?.toUpperCase()}
+              {preference.slice(1)}
+            </label>
+          ))}
+        </fieldset>
         <h3>Organize and collaborate</h3>
         <p>
           Layers and “This view” visibility/locking are local. Rotation is shared. Synchronization

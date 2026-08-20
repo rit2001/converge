@@ -39,6 +39,7 @@ import {
 import { readOnboarding, writeOnboarding, type OnboardingState } from "../onboarding";
 import type { PresenceSnapshot, PresenceStore } from "../presence-store";
 import { useEditorCapability } from "../editor-capability";
+import { useTheme } from "../theme-provider";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
 
@@ -172,6 +173,7 @@ export function Workspace({
   }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
   const capability = useEditorCapability();
+  const theme = useTheme();
   const [creationTool, setCreationTool] = useState<"rectangle" | "sticky" | null>(null);
   const [diagnostics, setDiagnostics] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
@@ -389,6 +391,9 @@ export function Workspace({
         setHelpOpen(false);
         setShareOpen(true);
       },
+      "theme.system": () => theme.setPreference("system"),
+      "theme.light": () => theme.setPreference("light"),
+      "theme.dark": () => theme.setPreference("dark"),
       "selection.delete": remove,
       "selection.hide": toggleHiddenSelected,
       "selection.lock": toggleLockedSelected,
@@ -407,6 +412,7 @@ export function Workspace({
       canvasAvailable: store.connection === "ready" && Boolean(store.boardId),
       mutationAllowed,
       viewOnly: capability === "view_only",
+      themePreference: theme.preference,
       action,
     });
   }, [
@@ -420,6 +426,7 @@ export function Workspace({
     store.committed.lastSeq,
     viewportCenter,
     mutationAllowed,
+    theme.preference,
   ]);
   useEffect(() => {
     const editable = (target: EventTarget | null): boolean =>

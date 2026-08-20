@@ -69,4 +69,30 @@ describe("workspace command registry", () => {
       "create.sticky-center",
     ]);
   });
+  it("exposes the same bounded appearance actions and marks the current preference unavailable", () => {
+    const action = COMMAND_IDS.reduce<Record<(typeof COMMAND_IDS)[number], () => void>>(
+      (result, id) => ({ ...result, [id]: vi.fn() }),
+      {} as Record<(typeof COMMAND_IDS)[number], () => void>,
+    );
+    const catalog = createWorkspaceCommands({
+      ready: true,
+      hasSelection: false,
+      selectedLocked: false,
+      selectedHidden: false,
+      rotateAvailable: false,
+      canvasAvailable: true,
+      mutationAllowed: true,
+      themePreference: "dark",
+      action,
+    });
+    expect(searchCommands(catalog, "theme").map((command) => command.id)).toEqual([
+      "theme.system",
+      "theme.light",
+      "theme.dark",
+    ]);
+    expect(catalog.find((command) => command.id === "theme.dark")).toMatchObject({
+      available: false,
+    });
+    expect(catalog.find((command) => command.id === "theme.light")?.available).toBe(true);
+  });
 });
