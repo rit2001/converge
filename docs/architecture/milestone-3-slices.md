@@ -377,7 +377,20 @@ revision/canonical-session cursor deterministically, and labels only the authent
 Outbound evidence is strict `presence:update` only, deduplicated and limited to 20 Hz with latest-value
 coalescing; it never uses a durable command path. BoardTransport registers strict presence listeners
 before connection, fences callbacks by its current board session, and clears the store/listeners at
-terminal close. B3 roster and cursor rendering remain pending.
+terminal close.
+
+**M3.5B3B premium roster and cursor UX (complete)**
+
+The workspace presents at most four generated-initial avatars in the header, with the authenticated
+group first, active peers before idle peers, and a bounded overflow count. Its portal panel uses only
+display names, “You”, Active/Idle, and a useful tab count; unavailable evidence is explicitly labelled
+“Presence temporarily unavailable”, and expired last-known evidence disappears with the store. Canvas
+cursors render only current available active remote groups in a non-interactive Konva presence layer.
+They are culled outside the transformed viewport, use palette tokens, and share a single short
+requestAnimationFrame interpolation loop; reduced-motion and large jumps render immediately. Mouse and
+pen coordinates are converted through the stage pan/zoom transform and passed to the existing 20 Hz
+publisher; leave, blur, hidden documents, cancellation, and unmount clear with cursor null. Presence
+does not affect synchronization or editing readiness. Final multi-client browser acceptance remains pending.
 
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and

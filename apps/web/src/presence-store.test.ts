@@ -70,6 +70,13 @@ describe("PresenceStore", () => {
     });
     expect(state.collaborators.find((item) => !item.self)?.displayName).toBe("Same name");
   });
+  it("keeps presentation referentially stable until presence evidence changes", () => {
+    const store = new PresenceStore(boardId, token);
+    store.receiveSnapshot(snapshot());
+    expect(store.snapshot()).toBe(store.snapshot());
+    store.receiveAvailability({ schemaVersion: 1, boardId, status: "unavailable" });
+    expect(store.snapshot().availability).toBe("unavailable");
+  });
   it("fails closed for contradictory self evidence and tombstones prevent resurrection", () => {
     const store = new PresenceStore(boardId, token);
     store.receiveSnapshot(snapshot([participant()], tab));

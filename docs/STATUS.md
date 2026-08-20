@@ -137,7 +137,7 @@ and unavailable states without changing transport, persistence, recovery, or pro
 
 M3.5B1 is complete: the strict, versioned ephemeral presence schemas and multi-replica Redis
 Pub/Sub-plus-TTL architecture are defined with bounded, lossy semantics and no durable-plane impact.
-M3.5B2 runtime presence and M3.5B3 roster/cursor UX remain pending.
+M3.5B2 runtime presence is accepted; final M3.5 multi-client browser acceptance remains pending.
 
 M3.5B2A is complete: an uncomposed, separately owned atomic Redis presence transport now provides
 bounded session records, expiry indexes, revisioned tombstones, snapshots, and validated Pub/Sub
@@ -148,9 +148,11 @@ after successful board join acknowledgement, and remains isolated from HTTP/sock
 Its Redis transport reconnection correction is complete: fresh three-client generations retry under
 a bounded full-jitter supervisor and notify the runtime only after a complete resubscription.
 M3.5B2 API/Redis presence is accepted against two independently composed local-delivery APIs, one
-Redis instance, and a disposable migrated database. Frontend presence rendering (M3.5B3) remains pending.
+Redis instance, and a disposable migrated database.
 M3.5B's self-session correction is complete: strict socket-specific snapshots identify the exact
-admitted session without exposing separate principal evidence. M3.5B3A client presence state remains pending.
+admitted session without exposing separate principal evidence.
 M3.5B3A is complete: a bounded generation-fenced client presence authority consumes strict snapshots
 and deltas, resolves authenticated self evidence, and exposes grouped ephemeral state without visual UI.
-Avatar roster and live cursor rendering remain pending.
+M3.5B3B is complete: the header now presents bounded grouped collaborators and the canvas renders
+non-interactive remote cursors from that ephemeral authority. Final M3.5 multi-client browser acceptance
+remains pending.

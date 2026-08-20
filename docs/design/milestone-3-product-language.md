@@ -1,6 +1,6 @@
 # Milestone 3 product language
 
-Status: proposed; visual approval required before implementation.
+Status: implemented through M3.5B3B; final browser acceptance pending.
 
 ## Direction: a calm shared studio
 
@@ -103,10 +103,16 @@ disclosure.
 
 ### M3.5B presence language contract
 
-The future ephemeral presence surface uses only “Live collaborators”, “Presence temporarily
-unavailable”, “Active”, “Idle”, and “You”. It must never say “Everyone is synced”, “All
+The ephemeral presence surface uses only “Live collaborators”, “Presence temporarily
+unavailable”, “Active”, “Idle”, “You”, “Only you here”, and explicitly labelled “Last known” evidence.
+It must never say “Everyone is synced”, “All
 collaborators are online”, or imply exact membership, durable cursor history, or board-save
 readiness. User IDs, presence-session IDs, and connection diagnostics are never product text.
+
+The compact header stack shows at most four generated-initial identities, preserves access to the
+complete grouped list, and collapses to a count trigger on narrow screens. Cursors are restrained,
+non-interactive remote-only pointers: active/current evidence is visible, idle/unavailable/expired
+evidence is not. Reduced motion renders the latest coordinate immediately.
 
 Announcements are deduplicated and rate-limited. Ordinary successful commands do not create toasts.
 

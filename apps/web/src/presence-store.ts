@@ -46,6 +46,8 @@ export type PresencePresentation = Readonly<{
   cursor: PresenceParticipant["cursor"];
   paletteToken: (typeof COLLABORATOR_PALETTE)[number];
   current: boolean;
+  sessionCount: number;
+  activeSessionCount: number;
 }>;
 export type PresenceSnapshot = Readonly<{
   availability: "available" | "unavailable";
@@ -87,6 +89,8 @@ export class PresenceStore {
   private queued: PresenceUpdate | null = null;
   private lastPublicationAt = -Infinity;
   private publisher: ((update: PresenceUpdate) => void) | null = null;
+  private readonly listeners = new Set<() => void>();
+  private cachedSnapshot: PresenceSnapshot | null = null;
 
   constructor(
     readonly boardId: string,
@@ -96,6 +100,10 @@ export class PresenceStore {
 
   setPublisher(publisher: ((update: PresenceUpdate) => void) | null): void {
     this.publisher = publisher;
+  }
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
   receiveSnapshot(raw: unknown): void {
     if (this.closed) return;
@@ -121,6 +129,7 @@ export class PresenceStore {
     this.selfObservedAt = observed;
     this.availability = "available";
     this.scheduleExpiry();
+    this.notify();
   }
   receiveUpsert(raw: unknown): void {
     if (this.closed) return;
@@ -128,6 +137,7 @@ export class PresenceStore {
     if (!parsed.success || parsed.data.boardId !== this.boardId) return;
     this.upsert(parsed.data.participant);
     this.scheduleExpiry();
+    this.notify();
   }
   receiveLeave(raw: unknown): void {
     if (this.closed) return;
@@ -146,6 +156,7 @@ export class PresenceStore {
       });
     this.boundTombstones();
     this.scheduleExpiry();
+    this.notify();
   }
   receiveAvailability(raw: unknown): void {
     if (this.closed) return;
@@ -155,6 +166,7 @@ export class PresenceStore {
       this.availability = "unavailable";
       this.clearPublication();
     } else if (this.selfSessionId !== null) this.availability = "available";
+    this.notify();
   }
   publish(cursor: PresenceUpdate["cursor"], activity: PresenceActivity): void {
     if (this.closed || this.availability !== "available" || this.selfSessionId === null) return;
@@ -196,8 +208,10 @@ export class PresenceStore {
     this.clearPublication();
     if (this.expiryTimer !== undefined) this.scheduler.clearTimeout(this.expiryTimer);
     this.expiryTimer = undefined;
+    this.notify();
   }
   snapshot(): PresenceSnapshot {
+    if (this.cachedSnapshot) return this.cachedSnapshot;
     const current = this.availability === "available" && this.selfSessionId !== null;
     const groups = new Map<string, Session[]>();
     for (const session of this.sessions.values()) {
@@ -220,18 +234,21 @@ export class PresenceStore {
           cursor: displayed.cursor,
           paletteToken: palette(userId),
           current,
+          sessionCount: sessions.length,
+          activeSessionCount: active.length,
         });
       })
       .sort(
         (left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key),
       );
-    return Object.freeze({
+    this.cachedSnapshot = Object.freeze({
       availability: this.availability,
       current,
       selfUserId: this.selfUserId,
       selfPresenceSessionId: this.selfSessionId,
       collaborators,
     });
+    return this.cachedSnapshot;
   }
   private upsert(participant: PresenceParticipant): void {
     const observed = time(participant.observedAt),
@@ -281,6 +298,7 @@ export class PresenceStore {
   private failClosed(): void {
     this.availability = "unavailable";
     this.clearPublication();
+    this.notify();
   }
   private boundTombstones(): void {
     if (this.tombstones.size <= PRESENCE_TOMBSTONE_LIMIT) return;
@@ -307,9 +325,20 @@ export class PresenceStore {
           () => {
             this.expiryTimer = undefined;
             this.scheduleExpiry();
+            this.notify();
           },
           Math.max(0, next - now),
         )
       : undefined;
+  }
+  private notify(): void {
+    this.cachedSnapshot = null;
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch {
+        /* a visual listener must not affect presence */
+      }
+    }
   }
 }

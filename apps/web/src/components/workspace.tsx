@@ -2,7 +2,7 @@
 
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { visibleObjects } from "@converge/canvas-engine";
 import {
   boardSnapshotSchema,
@@ -26,6 +26,8 @@ import { RotationControls } from "./rotation-controls";
 import { WorkspaceEntryStatus } from "./workspace-entry-status";
 import { deriveSynchronizationPresentation } from "../synchronization-presentation";
 import { SynchronizationStatus } from "./synchronization-status";
+import { CollaboratorPresence } from "./collaborator-presence";
+import type { PresenceSnapshot, PresenceStore } from "../presence-store";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
 
@@ -94,6 +96,7 @@ function ToolIcon({
 export function Workspace(): React.JSX.Element {
   const store = useBoardStore();
   const clientId = useMemo(() => crypto.randomUUID(), []);
+  const [presenceStore, setPresenceStore] = useState<PresenceStore | null>(null);
   const session = useRef<BoardSessionHandle | null>(null);
   const sessions = useMemo(() => {
     const loadSnapshot = async (boardId: string, signal: AbortSignal): Promise<BoardSnapshot> => {
@@ -140,10 +143,13 @@ export function Workspace(): React.JSX.Element {
         }
       },
       updateBoardLocation: (boardId) => window.history.replaceState({}, "", `?board=${boardId}`),
-      createTransport: (boardId: string, token: BoardSessionToken) =>
-        new BoardTransport(boardId, clientId, token, {
+      createTransport: (boardId: string, token: BoardSessionToken) => {
+        const transport = new BoardTransport(boardId, clientId, token, {
           pendingStore: indexedDbPendingOperationStore,
-        }),
+        });
+        setPresenceStore(transport.presence);
+        return transport;
+      },
     });
   }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
@@ -173,6 +179,11 @@ export function Workspace(): React.JSX.Element {
     pendingCount: store.pending.length,
     pendingStatus: store.pendingStatus,
   });
+  const presence = usePresenceSnapshot(presenceStore);
+  const publishPresencePointer = useCallback(
+    (cursor: { x: number; y: number } | null) => presenceStore?.publish(cursor, "active"),
+    [presenceStore],
+  );
 
   const closeLayers = (): void => {
     setLayersOpen(false);
@@ -321,6 +332,10 @@ export function Workspace(): React.JSX.Element {
             presentation={synchronization}
             pendingCount={store.pending.length}
           />
+          <CollaboratorPresence
+            presence={presence}
+            terminal={store.connection === "authorization-failed" || store.connection === "error"}
+          />
           <Tooltip label="Open layers">
             <button
               ref={layersTrigger}
@@ -418,6 +433,8 @@ export function Workspace(): React.JSX.Element {
           tool={tool}
           rotationEnabled={rotationAvailable}
           rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}`}
+          presence={presence}
+          onPresencePointer={publishPresencePointer}
           onSelect={(id) => store.select(id)}
           onTransform={transform}
         />
@@ -542,5 +559,13 @@ export function Workspace(): React.JSX.Element {
         </dl>
       </section>
     </main>
+  );
+}
+
+function usePresenceSnapshot(presence: PresenceStore | null): PresenceSnapshot | null {
+  return useSyncExternalStore(
+    (listener) => presence?.subscribe(listener) ?? (() => undefined),
+    () => presence?.snapshot() ?? null,
+    () => null,
   );
 }

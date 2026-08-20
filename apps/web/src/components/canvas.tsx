@@ -6,6 +6,7 @@ import type Konva from "konva";
 import type { CanvasObject } from "@converge/protocol";
 import { normalizeRotation, rotationLabel, rotationPreviewAngle } from "../canvas/rotation";
 import { CANVAS_GRID_SPACING, type AlignmentGuide, snapObjectPosition } from "../canvas/snapping";
+import type { PresenceSnapshot } from "../presence-store";
 
 const EMPTY_OBJECT_IDS: ReadonlySet<string> = new Set();
 
@@ -27,6 +28,8 @@ interface Props {
   ) => void;
   rotationEnabled?: boolean;
   rotationFence?: string;
+  presence?: PresenceSnapshot | null;
+  onPresencePointer?: (cursor: { x: number; y: number } | null) => void;
 }
 
 export function Canvas({
@@ -39,6 +42,8 @@ export function Canvas({
   onTransform,
   rotationEnabled = false,
   rotationFence = "initial",
+  presence = null,
+  onPresencePointer,
 }: Props): React.JSX.Element {
   const [viewport, setViewport] = useState({ width: 900, height: 600 });
   const [stage, setStage] = useState({ x: 0, y: 0, scale: 1 });
@@ -184,6 +189,20 @@ export function Canvas({
     [],
   );
 
+  useEffect(() => {
+    const clear = (): void => onPresencePointer?.(null);
+    const visibility = (): void => {
+      if (document.hidden) clear();
+    };
+    window.addEventListener("blur", clear);
+    document.addEventListener("visibilitychange", visibility);
+    return () => {
+      window.removeEventListener("blur", clear);
+      document.removeEventListener("visibilitychange", visibility);
+      clear();
+    };
+  }, [onPresencePointer]);
+
   return (
     <div
       className="canvas-shell"
@@ -213,7 +232,19 @@ export function Canvas({
           cancelledDragId.current = activeDragId.current;
           clearGuides();
           fenceRotationPreview();
+          onPresencePointer?.(null);
         }}
+        onPointerMove={(event) => {
+          const pointerType = event.evt.pointerType;
+          if (pointerType !== "mouse" && pointerType !== "pen") return;
+          const point = stageRef.current?.getPointerPosition();
+          if (!point) return;
+          onPresencePointer?.({
+            x: (point.x - stage.x) / stage.scale,
+            y: (point.y - stage.y) / stage.scale,
+          });
+        }}
+        onPointerLeave={() => onPresencePointer?.(null)}
         onPointerDown={(event) => {
           if (event.target === event.target.getStage()) onSelect(null);
         }}
@@ -409,12 +440,142 @@ export function Canvas({
             }
           />
         </Layer>
+        <PresenceLayer presence={presence} stage={stage} viewport={viewport} />
       </Stage>
       <output className="zoom-pill" aria-label={`Canvas zoom: ${Math.round(stage.scale * 100)}%`}>
         {Math.round(stage.scale * 100)}%
       </output>
     </div>
   );
+}
+
+function PresenceLayer({
+  presence,
+  stage,
+  viewport,
+}: {
+  presence: PresenceSnapshot | null;
+  stage: { x: number; y: number; scale: number };
+  viewport: { width: number; height: number };
+}): React.JSX.Element {
+  const reducedMotion = useReducedMotion();
+  const [colors, setColors] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const update = (): void => {
+      const styles = getComputedStyle(document.documentElement);
+      setColors(
+        Object.fromEntries(
+          Array.from({ length: 8 }, (_, index) => {
+            const token = `collaborator-${index + 1}`;
+            return [token, styles.getPropertyValue(`--color-${token}`).trim() || "CanvasText"];
+          }),
+        ),
+      );
+    };
+    update();
+    const media = window.matchMedia("(forced-colors: active)");
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  const targets = useMemo(() => {
+    if (!presence || !presence.current || presence.availability !== "available") return [];
+    const margin = 96 / stage.scale;
+    const left = -stage.x / stage.scale - margin;
+    const top = -stage.y / stage.scale - margin;
+    const right = left + viewport.width / stage.scale + margin * 2;
+    const bottom = top + viewport.height / stage.scale + margin * 2;
+    return presence.collaborators.filter(
+      (person) =>
+        !person.self &&
+        person.activity === "active" &&
+        person.cursor !== null &&
+        person.cursor.x >= left &&
+        person.cursor.x <= right &&
+        person.cursor.y >= top &&
+        person.cursor.y <= bottom,
+    );
+  }, [presence, stage, viewport]);
+  const targetRef = useRef(targets);
+  const displayed = useRef(new Map<string, { x: number; y: number }>());
+  const [points, setPoints] = useState(() => new Map<string, { x: number; y: number }>());
+  useEffect(() => {
+    targetRef.current = targets;
+  }, [targets]);
+  useEffect(() => {
+    let frame = 0;
+    let cancelled = false;
+    const targetIds = new Set(targets.map((item) => item.key));
+    for (const id of displayed.current.keys()) if (!targetIds.has(id)) displayed.current.delete(id);
+    const tick = (): void => {
+      if (cancelled) return;
+      let moving = false;
+      const next = new Map<string, { x: number; y: number }>();
+      for (const item of targetRef.current) {
+        const target = item.cursor!;
+        const previous = displayed.current.get(item.key) ?? target;
+        const jump = Math.hypot(target.x - previous.x, target.y - previous.y) > 800;
+        const fraction = reducedMotion || jump ? 1 : 0.55;
+        const point = {
+          x: previous.x + (target.x - previous.x) * fraction,
+          y: previous.y + (target.y - previous.y) * fraction,
+        };
+        if (Math.abs(target.x - point.x) > 0.1 || Math.abs(target.y - point.y) > 0.1) moving = true;
+        displayed.current.set(item.key, point);
+        next.set(item.key, point);
+      }
+      setPoints(next);
+      if (moving) frame = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [reducedMotion, targets]);
+  return (
+    <Layer name="canvas-presence" listening={false}>
+      {targets.map((person) => {
+        const point = points.get(person.key) ?? person.cursor!;
+        const color = colors[person.paletteToken] ?? "CanvasText";
+        const name =
+          person.displayName.length > 24
+            ? `${person.displayName.slice(0, 23)}…`
+            : person.displayName;
+        return (
+          <Group key={person.key} x={point.x} y={point.y} listening={false}>
+            <Line
+              points={[0, 0, 0, 18, 5, 13, 9, 21, 12, 19, 8, 11, 15, 11]}
+              closed
+              fill={color}
+              stroke={color}
+              listening={false}
+            />
+            <Text
+              text={name}
+              x={14}
+              y={14}
+              padding={4}
+              fontSize={12 / stage.scale}
+              fill={color}
+              listening={false}
+            />
+          </Group>
+        );
+      })}
+    </Layer>
+  );
+}
+
+function useReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(false);
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = (): void => setReduced(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return reduced;
 }
 
 export function AlignmentGuides({

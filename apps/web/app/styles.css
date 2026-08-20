@@ -1228,6 +1228,131 @@ button {
   justify-self: end;
 }
 
+.collaborator-trigger {
+  display: inline-flex;
+  min-height: var(--control-height-compact, 36px);
+  align-items: center;
+  gap: var(--space-1, 4px);
+  padding: var(--space-1, 4px) var(--space-2, 8px);
+  border: 1px solid var(--color-border-default, #d9dde5);
+  border-radius: var(--radius-round, 999px);
+  background: var(--color-surface-primary, #fff);
+  color: var(--color-text-primary, #1e2230);
+  cursor: pointer;
+}
+
+.collaborator-trigger:focus-visible {
+  outline: var(--focus-ring-width, 2px) solid var(--focus-ring-color, #5146d8);
+  outline-offset: var(--focus-ring-offset, 2px);
+}
+.collaborator-stack {
+  display: flex;
+  padding-left: var(--space-1, 4px);
+}
+.collaborator-avatar {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  margin-left: -5px;
+  border: 2px solid var(--color-surface-primary, #fff);
+  border-radius: var(--radius-round, 999px);
+  background: currentColor;
+  color: var(--color-collaborator-on-color, #fff);
+  font-size: 0.625rem;
+  font-weight: var(--font-weight-bold, 750);
+}
+.collaborator-avatar--collaborator-1 {
+  background: var(--color-collaborator-1);
+}
+.collaborator-avatar--collaborator-2 {
+  background: var(--color-collaborator-2);
+}
+.collaborator-avatar--collaborator-3 {
+  background: var(--color-collaborator-3);
+}
+.collaborator-avatar--collaborator-4 {
+  background: var(--color-collaborator-4);
+}
+.collaborator-avatar--collaborator-5 {
+  background: var(--color-collaborator-5);
+}
+.collaborator-avatar--collaborator-6 {
+  background: var(--color-collaborator-6);
+}
+.collaborator-avatar--collaborator-7 {
+  background: var(--color-collaborator-7);
+}
+.collaborator-avatar--collaborator-8 {
+  background: var(--color-collaborator-8);
+}
+.collaborator-trigger__count {
+  min-width: 1ch;
+  font-size: var(--font-size-small, 0.8125rem);
+  font-weight: var(--font-weight-semibold, 650);
+}
+.collaborator-overflow {
+  font-size: var(--font-size-caption, 0.75rem);
+  color: var(--color-text-secondary, #545b6e);
+}
+.collaborator-details {
+  position: fixed;
+  z-index: var(--layer-popover, 600);
+  top: calc(var(--space-4, 16px) + 52px);
+  right: var(--space-4, 16px);
+  width: min(320px, calc(100vw - var(--space-6, 24px)));
+  padding: var(--space-4, 16px);
+  border: 1px solid var(--color-border-default, #d9dde5);
+  border-radius: var(--radius-panel, 14px);
+  background: var(--color-surface-elevated, #fff);
+  box-shadow: var(--shadow-panel, 0 12px 32px rgb(30 34 48 / 12%));
+}
+.collaborator-details h2 {
+  margin: 0 0 var(--space-3, 12px);
+  font-size: var(--font-size-medium, 1rem);
+}
+.collaborator-details p {
+  margin: 0;
+  color: var(--color-text-secondary, #545b6e);
+  font-size: var(--font-size-small, 0.8125rem);
+}
+.collaborator-unavailable {
+  color: var(--color-text-muted, #6b7280) !important;
+}
+.collaborator-details ul {
+  display: grid;
+  gap: var(--space-2, 8px);
+  margin: var(--space-3, 12px) 0 0;
+  padding: 0;
+  list-style: none;
+}
+.collaborator-details li {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  gap: var(--space-2, 8px);
+  align-items: center;
+  font-size: var(--font-size-small, 0.8125rem);
+}
+.collaborator-details li .collaborator-avatar {
+  margin: 0;
+}
+.collaborator-details strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.collaborator-details em,
+.collaborator-details small {
+  display: block;
+  color: var(--color-text-muted, #6b7280);
+  font-size: var(--font-size-caption, 0.75rem);
+  font-style: normal;
+}
+.collaborator-details li > span:last-of-type {
+  color: var(--color-text-secondary, #545b6e);
+}
+
 .layers-trigger svg,
 .layers-panel svg {
   width: var(--icon-size-medium, 20px);
@@ -1722,6 +1847,15 @@ button {
 }
 
 @media (max-width: 600px) {
+  .collaborator-trigger {
+    padding-inline: var(--space-2, 8px);
+  }
+  .collaborator-stack .collaborator-avatar:not(:first-child) {
+    display: none;
+  }
+  .collaborator-overflow {
+    display: none;
+  }
   .studio-narrow-notice {
     position: absolute;
     z-index: var(--layer-chrome, 500);
@@ -1841,5 +1975,12 @@ button {
   .brand-mark {
     background: currentColor;
     forced-color-adjust: none;
+  }
+
+  .collaborator-trigger,
+  .collaborator-details,
+  .collaborator-avatar {
+    border: 1px solid CanvasText;
+    forced-color-adjust: auto;
   }
 }
