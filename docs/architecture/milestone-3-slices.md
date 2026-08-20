@@ -637,6 +637,19 @@ M3.8 is the next milestone.
 
 ## M3.8 — Performance, visual regression, and final acceptance
 
+### M3.8A1 production-topology smoke
+
+The performance topology owns one disposable migrated PostgreSQL database, one production-composed
+API with local durable delivery and presence disabled, one dynamic production Next build/start, and
+one authenticated Chromium context. It seeds exactly 100 alternating rectangle/sticky create
+operations through `BoardRepository.commitOperation`, preserving heads, projections, receipts, and
+outbox evidence. The public synchronized status and ordered Layers list prove readiness and projection
+cardinality. Forced partial startup and normal teardown both remove the database, build directory,
+processes, browser contexts, and any PostgreSQL service started by the harness.
+
+This is a deterministic harness smoke, not accepted performance evidence, capacity evidence, or an
+SLA. The official 100/500/1,000-object measurement and sanitized result artifacts remain pending.
+
 **Preconditions**
 
 - M3.1–M3.7A complete.

@@ -188,3 +188,7 @@ preference remains pending.
 M3.7C2 completes M3.7: System, Light, and Dark are supported as a versioned device-local preference.
 They change only semantic presentation tokens and Canvas UI overlays, never board data, sessions, or
 network behavior. Automated checks support, but do not claim, full manual accessibility certification.
+M3.8A1 production-topology smoke is complete: a test-owned single-replica harness uses local durable
+delivery, disabled presence, a disposable migrated PostgreSQL database, dynamic ports, an isolated
+production Next build/start, and an authoritative deterministic 100-object fixture. It is harness
+correctness evidence only; the official 100/500/1,000 local reference measurement remains pending.
