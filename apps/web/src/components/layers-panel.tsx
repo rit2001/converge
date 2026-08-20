@@ -10,6 +10,33 @@ export interface LayerEntry {
   position: number;
   total: number;
 }
+const MAX_DESCRIPTION = 360;
+function safeText(value: string): string {
+  const collapsed = Array.from(value, (character) =>
+    character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127 ? " " : character,
+  )
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+  const graphemes =
+    typeof Intl.Segmenter === "function"
+      ? [...new Intl.Segmenter().segment(collapsed)].map((part) => part.segment)
+      : Array.from(collapsed);
+  return graphemes.slice(0, 64).join("") + (graphemes.length > 64 ? "…" : "");
+}
+export function objectDescription(
+  entry: LayerEntry,
+  state: { selected: boolean; hidden: boolean; locked: boolean },
+): string {
+  const object = entry.object;
+  const type = object.kind === "sticky" ? "Sticky note" : "Rectangle";
+  const note = object.kind === "sticky" ? `, ${safeText(object.text) || "empty note"}` : "";
+  const rotation = Object.is(-0, object.rotation)
+    ? 0
+    : Math.round(((object.rotation % 360) + 360) % 360);
+  const values = `${type}${note}, position ${Math.round(object.x)} by ${Math.round(object.y)}, size ${Math.round(object.width)} by ${Math.round(object.height)}, rotation ${rotation} degrees, layer ${entry.position} of ${entry.total}${state.selected ? ", selected" : ""}${state.hidden ? ", hidden in this view" : ""}${state.locked ? ", locked in this view" : ""}.`;
+  return values.slice(0, MAX_DESCRIPTION);
+}
 
 /**
  * Board order is bottom-to-top for Konva rendering. The Layers surface presents
@@ -107,7 +134,12 @@ export function LayersPanel({
   };
 
   return (
-    <aside id="layers-panel" className="layers-panel" aria-labelledby="layers-panel-title">
+    <aside
+      id="layers-panel"
+      className="layers-panel"
+      aria-labelledby="layers-panel-title"
+      aria-label="Board objects"
+    >
       <header className="layers-panel__header">
         <div>
           <h2 id="layers-panel-title">Layers</h2>
@@ -133,16 +165,17 @@ export function LayersPanel({
           <span className="layers-panel__empty-icon" aria-hidden="true">
             <ObjectTypeIcon kind="rectangle" />
           </span>
-          <p>Your board is ready for its first idea.</p>
+          <p>No objects on this board.</p>
           <span>Add a rectangle or sticky note from the tool dock.</span>
         </div>
       ) : (
-        <ul className="layers-panel__list" aria-label="Board layers, top to bottom">
+        <ol className="layers-panel__list" aria-label="Board objects, top to bottom">
           {entries.map((entry, index) => {
             const selected = selectedId === entry.object.id;
             const hidden = hiddenObjectIds.has(entry.object.id);
             const locked = lockedObjectIds.has(entry.object.id);
             const accessibleLabel = `${entry.label}, ${entry.position === 1 ? "top" : entry.position === entry.total ? "bottom" : "layer"} layer, ${entry.position} of ${entry.total}`;
+            const descriptionId = `layer-description-${entry.position}`;
             return (
               <li key={entry.object.id}>
                 <button
@@ -152,6 +185,7 @@ export function LayersPanel({
                   className="layers-panel__row ui-focus-ring"
                   type="button"
                   aria-label={accessibleLabel}
+                  aria-describedby={descriptionId}
                   aria-pressed={selected}
                   data-hidden={hidden || undefined}
                   data-locked={locked || undefined}
@@ -168,6 +202,9 @@ export function LayersPanel({
                     {selected && <span className="layers-panel__selected">Selected</span>}
                   </span>
                 </button>
+                <span id={descriptionId} className="ui-visually-hidden">
+                  {objectDescription(entry, { selected, hidden, locked })}
+                </span>
                 <div
                   className="layers-panel__controls"
                   aria-label={`${entry.label} local controls`}
@@ -204,7 +241,7 @@ export function LayersPanel({
               </li>
             );
           })}
-        </ul>
+        </ol>
       )}
     </aside>
   );

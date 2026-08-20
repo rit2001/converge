@@ -44,7 +44,8 @@ describe("LayersPanel", () => {
       />,
     );
 
-    expect(markup).toContain('aria-label="Board layers, top to bottom"');
+    expect(markup).toContain('aria-label="Board objects, top to bottom"');
+    expect(markup).toContain('aria-label="Board objects"');
     expect(markup).toContain('aria-label="Sticky note, top layer, 1 of 2"');
     expect(markup).toContain('aria-label="Rectangle, bottom layer, 2 of 2"');
     expect(markup).toContain('aria-pressed="true"');
@@ -74,7 +75,7 @@ describe("LayersPanel", () => {
     );
 
     expect(markup).toContain("0 objects");
-    expect(markup).toContain("Your board is ready for its first idea.");
+    expect(markup).toContain("No objects on this board.");
   });
 
   it("labels local visibility and lock toggles without exposing identifiers", () => {
