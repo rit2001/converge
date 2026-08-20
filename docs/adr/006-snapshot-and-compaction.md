@@ -244,6 +244,23 @@ Snapshots are recovery checkpoints, not automatically user-visible versions. A f
 may pin one. Restoring a version materializes its state as a new forward operation and new delivery
 event at the current heads; it never rewinds a floor or sequence and never mutates an old snapshot.
 
+## M3.6C2 decision: recovery is not user-facing history
+
+`board_snapshots` are immutable, verified recovery artifacts. `GET /v1/boards/:boardId/recovery`
+selects current bounded material for reconstruction (a verified snapshot plus contiguous tail); it is
+not a version listing, audit trail, preview, or restore API. Fallback to an earlier verified snapshot
+exists only for corruption recovery. Compaction floors may remove covered operation history, and current
+snapshot timestamps/heads provide no retention or complete-audit promise.
+
+M3 renders no History control, including disabled or “Coming soon” variants, and will not repurpose
+`/recovery`. A future backend milestone must first define: an authorized cursor-paginated list with opaque
+version IDs, exact board/operation/delivery heads, server timestamp, verification state, and retention;
+an authorized immutable snapshot-plus-contiguous-tail preview independently reducer/hash verified; and a
+restore that is a new idempotent forward authoritative mutation. Restore must never decrement/rewrite heads
+or mutate snapshots, and must preserve replay receipts, outbox/delivery ordering, membership policy,
+watchdogs, bounded payloads, and deterministic conflict behavior if the current head changes. Retention
+must define visible versions, deletion/legal expectations, compaction, and corrupt-invalidated behavior.
+
 ## Alternatives rejected
 
 ### Keep the log forever

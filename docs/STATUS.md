@@ -170,3 +170,6 @@ canvas, local-view, synchronization, and ephemeral-presence behavior; share and 
 M3.6C1 is complete: canonical authenticated `/studio/[boardId]` links and a local clipboard Share dialog
 preserve existing access checks. Links grant no access; invitations, member administration, and version
 history remain pending.
+M3.6 is complete. M3.7 is next; user-facing version history is explicitly deferred until its authorized
+forward-only list/preview/restore backend contract exists. `/recovery` remains automatic verified recovery,
+not interactive history.

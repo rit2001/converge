@@ -460,6 +460,12 @@ the wrong lifecycle boundary.
 
 - M3.3–M3.5 accepted.
 
+**M3.6C2 history decision (complete)**
+
+M3.6 closes without a History UI or API. Verified snapshots and `/recovery` remain bounded automatic
+reconstruction material, never an audit/version browser. Historical list, immutable preview, and restore
+require a future authorized forward-only backend contract; no disabled placeholder is rendered.
+
 **M3.6A command palette (complete)**
 
 The workspace owns one static typed command registry for implemented tools, viewport, panel, and
