@@ -53,12 +53,16 @@ export function ShareDialog({
         </label>
         <button
           ref={copy}
-          onClick={() =>
+          onClick={() => {
+            if (!navigator.clipboard) {
+              setMessage("Copy failed. Select the link manually.");
+              return;
+            }
             void navigator.clipboard
-              ?.writeText(url)
+              .writeText(url)
               .then(() => setMessage("Link copied."))
-              .catch(() => setMessage("Copy failed. Select the link manually."))
-          }
+              .catch(() => setMessage("Copy failed. Select the link manually."));
+          }}
         >
           Copy link
         </button>
