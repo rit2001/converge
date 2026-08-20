@@ -229,6 +229,15 @@ ends.
 Protocol/canvas/web tests as affected, integration only if durable evolution occurs, Playwright canvas
 interaction flows, production build, profiling at 100/500 objects, Prettier, and diff check.
 
+**Acceptance status (2026-08-20)**
+
+Complete. A bounded two-context Playwright acceptance flow creates supported objects through the UI;
+checks Canvas/Layers selection, authoritative stacking order, keyboard activation and focus return;
+proves local hide/lock isolation and reload recovery; exercises snapped and Option/Alt-bypassed drags;
+and verifies authoritative accessible rotation convergence. It also checks 1440×900, 1024×768, and
+390×844 layouts plus forced-colors and reduced-motion media modes. This acceptance adds no
+multi-selection, undo/redo, grouping, durable reorder/rename, or M3.5+ capability.
+
 **Commit**
 
 `feat(web): refine canvas tools and layers`

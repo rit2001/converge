@@ -124,4 +124,8 @@ centralized workspace layers and portal hosts, accessible UI primitives, and tok
 workspace connection chrome. It adds no dependency and changes no synchronization, protocol,
 database, canvas-authority, route, or deployment behavior. Complete workspace composition, landing
 and board-entry surfaces, canvas-tool redesign, collaboration presence, product dialogs, theme
-switching, responsive policy, and performance acceptance remain in M3.2–M3.8.
+switching, responsive policy, and performance acceptance remain in M3.2–M3.8. M3.4 is complete:
+real two-client browser acceptance covers authoritative Canvas/Layers selection and order, explicitly
+local hide/lock isolation and recovery, deterministic drag snapping with transient guides, and
+authoritative rotation controls. Multi-select, undo/redo, grouping, durable reorder or rename,
+presence, sharing, history, and palette work remain excluded from M3.4.
