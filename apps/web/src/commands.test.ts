@@ -25,9 +25,7 @@ describe("workspace command registry", () => {
   it("has one stable implemented command catalog without speculative features", () => {
     const catalog = commands();
     expect(catalog.map((command) => command.id)).toEqual(COMMAND_IDS);
-    expect(catalog.map((command) => command.label).join(" ")).not.toMatch(
-      /undo|share|history|group/i,
-    );
+    expect(catalog.map((command) => command.label).join(" ")).not.toMatch(/undo|history|group/i);
   });
   it("ranks exact, label prefix, keyword prefix, and substring matches deterministically", () => {
     const catalog = commands();

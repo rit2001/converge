@@ -11,6 +11,7 @@ export const COMMAND_IDS = [
   "panel.collaborators",
   "panel.diagnostics",
   "panel.help",
+  "panel.share",
   "selection.delete",
   "selection.hide",
   "selection.lock",
@@ -170,6 +171,14 @@ export function createWorkspaceCommands(input: CommandInput): WorkspaceCommand[]
       ["help", "shortcuts"],
       true,
       "?",
+    ),
+    add(
+      "panel.share",
+      "Share board",
+      "Copy an access-preserving board link",
+      "Panels",
+      ["share", "link"],
+      input.ready,
     ),
     add(
       "selection.delete",

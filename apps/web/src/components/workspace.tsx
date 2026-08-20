@@ -30,6 +30,7 @@ import { CollaboratorPresence } from "./collaborator-presence";
 import { CommandPalette } from "./command-palette";
 import { createWorkspaceCommands, type CommandId } from "../commands";
 import { StudioHelp } from "./studio-help";
+import { ShareDialog } from "./share-dialog";
 import { readOnboarding, writeOnboarding, type OnboardingState } from "../onboarding";
 import type { PresenceSnapshot, PresenceStore } from "../presence-store";
 
@@ -97,7 +98,9 @@ function ToolIcon({
   );
 }
 
-export function Workspace(): React.JSX.Element {
+export function Workspace({
+  requestedBoardId,
+}: { requestedBoardId?: string } = {}): React.JSX.Element {
   const store = useBoardStore();
   const clientId = useMemo(() => crypto.randomUUID(), []);
   const [presenceStore, setPresenceStore] = useState<PresenceStore | null>(null);
@@ -146,7 +149,12 @@ export function Workspace(): React.JSX.Element {
           throw new Error("LOCAL_PERSISTENCE_ERROR: Pending storage is unavailable");
         }
       },
-      updateBoardLocation: (boardId) => window.history.replaceState({}, "", `?board=${boardId}`),
+      updateBoardLocation: (boardId) =>
+        window.history.replaceState(
+          {},
+          "",
+          requestedBoardId ? `/studio/${boardId}` : `?board=${boardId}`,
+        ),
       createTransport: (boardId: string, token: BoardSessionToken) => {
         const transport = new BoardTransport(boardId, clientId, token, {
           pendingStore: indexedDbPendingOperationStore,
@@ -162,6 +170,7 @@ export function Workspace(): React.JSX.Element {
   const [layersOpen, setLayersOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [onboarding, setOnboarding] = useState<OnboardingState>("unseen");
   const [viewportCommand, setViewportCommand] = useState<{
     id: number;
@@ -211,7 +220,8 @@ export function Workspace(): React.JSX.Element {
   useEffect(() => {
     return scheduleOwnedSessionStart(
       () => {
-        const boardId = new URLSearchParams(window.location.search).get("board");
+        const boardId =
+          requestedBoardId ?? new URLSearchParams(window.location.search).get("board");
         const handle = sessions.start(boardId);
         session.current = handle;
         return handle;
@@ -221,7 +231,7 @@ export function Workspace(): React.JSX.Element {
         if (session.current === handle) session.current = null;
       },
     );
-  }, [sessions]);
+  }, [requestedBoardId, sessions]);
 
   const submit = (command: DurableCommand): Promise<boolean> =>
     session.current?.submit(command) ?? Promise.resolve(false);
@@ -320,6 +330,11 @@ export function Workspace(): React.JSX.Element {
         setPaletteOpen(false);
         setHelpOpen(true);
       },
+      "panel.share": () => {
+        setPaletteOpen(false);
+        setHelpOpen(false);
+        setShareOpen(true);
+      },
       "selection.delete": remove,
       "selection.hide": toggleHiddenSelected,
       "selection.lock": toggleLockedSelected,
@@ -406,6 +421,7 @@ export function Workspace(): React.JSX.Element {
     if (terminal) {
       setPaletteOpen(false);
       setHelpOpen(false);
+      setShareOpen(false);
     }
   }, [terminal]);
 
@@ -452,6 +468,20 @@ export function Workspace(): React.JSX.Element {
               }}
             >
               ?
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Share board">
+            <IconButton
+              variant="ghost"
+              aria-label="Share board"
+              disabled={!store.boardId || terminal}
+              onClick={() => {
+                setPaletteOpen(false);
+                setHelpOpen(false);
+                setShareOpen(true);
+              }}
+            >
+              ↗
             </IconButton>
           </Tooltip>
           <SynchronizationStatus
@@ -592,6 +622,7 @@ export function Workspace(): React.JSX.Element {
         onClose={() => setPaletteOpen(false)}
       />
       <StudioHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
+      <ShareDialog boardId={store.boardId} open={shareOpen} onClose={() => setShareOpen(false)} />
       {store.connection === "ready" &&
         store.objects.length === 0 &&
         store.pending.length === 0 &&

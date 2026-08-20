@@ -30,7 +30,7 @@ describe("landing and studio route ownership", () => {
     expect(workspace.match(/sessions\.start\(/g)).toHaveLength(1);
     expect(workspace.match(/sessions\.stop\(/g)).toHaveLength(1);
     expect(workspace).toContain('new URLSearchParams(window.location.search).get("board")');
-    expect(workspace).toContain('window.history.replaceState({}, "", `?board=${boardId}`)');
+    expect(workspace).toContain("requestedBoardId ? `/studio/${boardId}` : `?board=${boardId}`");
   });
 
   it("keeps route-level preparing and failure boundaries owned by studio", () => {

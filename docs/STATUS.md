@@ -167,3 +167,6 @@ and an accessible modal command palette expose only implemented workspace action
 history, sharing, onboarding, command persistence, protocol, or durable-command bypass behavior.
 M3.6B is complete: v1 local-only first-run guidance and reopenable Studio help explain only implemented
 canvas, local-view, synchronization, and ephemeral-presence behavior; share and history remain pending.
+M3.6C1 is complete: canonical authenticated `/studio/[boardId]` links and a local clipboard Share dialog
+preserve existing access checks. Links grant no access; invitations, member administration, and version
+history remain pending.
