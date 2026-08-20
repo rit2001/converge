@@ -274,6 +274,36 @@ whether their own edit is local, acknowledged, reconnecting, recovered, or termi
 - Add collaborator presence summary that never serves as membership authorization evidence.
 - Add deterministic revoked and `RECOVERY_BLOCKED` acceptance UX.
 
+**B1/B2/B3 presence breakdown**
+
+- **M3.5B1 — architecture and protocol (complete):** Separate strict, versioned lossy-presence
+  schemas and event maps from durable delivery. Presence uses the proposed `converge:presence:v1:*`
+  Redis key namespace and `converge:presence:v1:pubsub` Pub/Sub channel, with per-API publisher and
+  subscriber resources; no Socket.IO Redis adapter, durable stream, consumer cursor, PostgreSQL,
+  outbox, snapshot, recovery, IndexedDB, or compaction participation. Redis ACLs grant the presence
+  principal only bounded key and Pub/Sub access in that namespace, never delivery-stream access.
+  Startup/reconnect failure is reported as presence unavailable and never changes HTTP/socket editing
+  readiness; shutdown closes the dedicated subscriber then publisher and expires only locally-owned
+  session keys. B2 must implement bounded 20 Hz cursor publication, 15 s heartbeat, 45 s TTL, 30 s
+  idle transition, 100-session snapshots, immediate graceful leave, and TTL crash cleanup without
+  keyspace notifications. Capacity admission disables only that socket's presence.
+- **M3.5B2 — API/Redis ephemeral plane:** Authorize board admission from the authenticated socket,
+  generate presence-session UUIDs server-side, write expiring records, publish deltas, read bounded
+  late-join snapshots, and preserve session-generation fencing. It must remain fully isolated from
+  durable editing and delivery readiness.
+- **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
+  self is “You”), use the most recently active session cursor, tolerate unavailable presence, and
+  render reduced-motion/accessible cursors without exposing user or session IDs.
+
+**Presence ordering contract**
+
+Every upsert carries complete participant state and a monotonically increasing per-session revision.
+Clients retain only the greatest revision per presence-session ID; snapshot/live overlap is resolved
+the same way. Leave or expiry carries its own revision tombstone, so older upserts cannot resurrect a
+departed session. Concurrent tabs never supersede one another on the wire; grouping happens only in
+the product UI. Presence is best-effort and loss never blocks durable acknowledgements, recovery,
+snapshots, compaction, or editing.
+
 **Likely files**
 
 - `apps/web/src/transport.ts`, `board-store.ts`, `board-session.ts`, `workspace/status/*`,

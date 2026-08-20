@@ -134,3 +134,7 @@ M3.5 is in progress. M3.5A is complete: the workspace derives a fail-closed, bou
 presentation from existing BoardStore and pending-queue evidence only. It distinguishes connecting,
 restoring, synced, saving, reconnecting, device-local preservation, access removal, blocked recovery,
 and unavailable states without changing transport, persistence, recovery, or protocol behavior.
+
+M3.5B1 is complete: the strict, versioned ephemeral presence schemas and multi-replica Redis
+Pub/Sub-plus-TTL architecture are defined with bounded, lossy semantics and no durable-plane impact.
+M3.5B2 runtime presence and M3.5B3 roster/cursor UX remain pending.

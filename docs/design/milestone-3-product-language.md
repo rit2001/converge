@@ -101,6 +101,13 @@ it does not claim global replica parity or delivery to collaborators. Terminal a
 is sanitized, while technical identifiers and raw errors remain in the secondary diagnostics
 disclosure.
 
+### M3.5B presence language contract
+
+The future ephemeral presence surface uses only “Live collaborators”, “Presence temporarily
+unavailable”, “Active”, “Idle”, and “You”. It must never say “Everyone is synced”, “All
+collaborators are online”, or imply exact membership, durable cursor history, or board-save
+readiness. User IDs, presence-session IDs, and connection diagnostics are never product text.
+
 Announcements are deduplicated and rate-limited. Ordinary successful commands do not create toasts.
 
 ## Motion language

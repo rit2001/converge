@@ -3,6 +3,13 @@ import { z } from "zod";
 export const SCHEMA_VERSION = 1 as const;
 export const MAX_SYNC_BATCH_SIZE = 100 as const;
 export const DELIVERY_ENVELOPE_MAX_BYTES = 128 * 1024;
+/** Future B2 runtime limits; these are product-plane bounds, not editing-capacity limits. */
+export const PRESENCE_CURSOR_UPDATES_PER_SECOND = 20 as const;
+export const PRESENCE_HEARTBEAT_INTERVAL_MS = 15_000 as const;
+export const PRESENCE_SESSION_TTL_MS = 45_000 as const;
+export const PRESENCE_IDLE_AFTER_MS = 30_000 as const;
+export const PRESENCE_SNAPSHOT_MAX_SESSIONS = 100 as const;
+export const AUTHENTICATED_DISPLAY_NAME_MAX_LENGTH = 100 as const;
 
 export const idSchema = z.string().uuid();
 export const sequenceSchema = z.number().int().nonnegative().safe();
@@ -123,6 +130,73 @@ export const ephemeralEventTypeSchema = z.enum([
   "stroke.preview",
   "text.preview",
 ]);
+
+/**
+ * Presence is a deliberately separate, lossy plane. These messages never become durable commands,
+ * delivery envelopes, recovery material, or pending commands.
+ */
+export const presenceCursorSchema = z.object({ x: finiteNumber, y: finiteNumber }).strict();
+export const presenceActivitySchema = z.enum(["active", "idle"]);
+export const presenceRevisionSchema = z.number().int().nonnegative().safe();
+const presenceTimestampSchema = z.string().datetime({ offset: true }).max(40);
+
+export const presenceUpdateSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    cursor: presenceCursorSchema.nullable(),
+    activity: presenceActivitySchema,
+  })
+  .strict();
+
+export const presenceParticipantSchema = z
+  .object({
+    presenceSessionId: idSchema,
+    userId: idSchema,
+    displayName: z.string().min(1).max(AUTHENTICATED_DISPLAY_NAME_MAX_LENGTH),
+    revision: presenceRevisionSchema,
+    activity: presenceActivitySchema,
+    cursor: presenceCursorSchema.nullable(),
+    observedAt: presenceTimestampSchema,
+    expiresAt: presenceTimestampSchema,
+  })
+  .strict();
+
+export const boardPresenceSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    observedAt: presenceTimestampSchema,
+    participants: z.array(presenceParticipantSchema).max(PRESENCE_SNAPSHOT_MAX_SESSIONS),
+  })
+  .strict();
+
+export const presenceParticipantUpsertSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    participant: presenceParticipantSchema,
+  })
+  .strict();
+
+export const presenceParticipantLeaveSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    presenceSessionId: idSchema,
+    revision: presenceRevisionSchema,
+    reason: z.enum(["left", "expired"]),
+    observedAt: presenceTimestampSchema,
+  })
+  .strict();
+
+export const presenceAvailabilitySchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    boardId: idSchema,
+    status: z.enum(["available", "unavailable"]),
+  })
+  .strict();
 
 const committedFields = {
   seq: sequenceSchema.positive(),
@@ -695,6 +769,14 @@ export type MembershipRevokedDeliveryEnvelope = z.infer<
 >;
 export type DeliveryEnvelope = z.infer<typeof deliveryEnvelopeSchema>;
 export type DeliveryStreamFields = z.infer<typeof deliveryStreamFieldsSchema>;
+export type PresenceCursor = z.infer<typeof presenceCursorSchema>;
+export type PresenceActivity = z.infer<typeof presenceActivitySchema>;
+export type PresenceUpdate = z.infer<typeof presenceUpdateSchema>;
+export type PresenceParticipant = z.infer<typeof presenceParticipantSchema>;
+export type BoardPresenceSnapshot = z.infer<typeof boardPresenceSnapshotSchema>;
+export type PresenceParticipantUpsert = z.infer<typeof presenceParticipantUpsertSchema>;
+export type PresenceParticipantLeave = z.infer<typeof presenceParticipantLeaveSchema>;
+export type PresenceAvailability = z.infer<typeof presenceAvailabilitySchema>;
 
 export interface ClientToServerEvents {
   "board:join": (request: JoinBoardRequest, acknowledge: (ack: JoinBoardAck) => void) => void;
@@ -703,4 +785,15 @@ export interface ClientToServerEvents {
 export interface ServerToClientEvents {
   "operation:committed": (operation: CommittedOperation) => void;
   "board:access-revoked": (event: BoardAccessRevokedEvent) => void;
+}
+
+/** B2 runtime will compose these with Socket.IO; B1 intentionally does not register handlers. */
+export interface PresenceClientToServerEvents {
+  "presence:update": (update: PresenceUpdate) => void;
+}
+export interface PresenceServerToClientEvents {
+  "board:presence-snapshot": (snapshot: BoardPresenceSnapshot) => void;
+  "presence:participant-upsert": (upsert: PresenceParticipantUpsert) => void;
+  "presence:participant-leave": (leave: PresenceParticipantLeave) => void;
+  "presence:availability": (availability: PresenceAvailability) => void;
 }
