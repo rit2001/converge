@@ -233,8 +233,10 @@ fully connected and subscribed generation emits available once; stale listeners 
 cannot act. Focused deterministic tests cover failed initial connection, repeated loss signals,
 partial-cycle cleanup, and runtime re-admission/fresh snapshot behavior. A real Redis test destroys
 an owned command connection, observes unavailable then fresh availability, and resumes a bounded
-snapshot. HTTP/socket editing readiness, durable commands, outbox, delivery streams, and PostgreSQL
-are not changed by this recovery path. Multi-instance acceptance remains pending.
+snapshot. The accepted two-API topology additionally proves cross-replica room routing, late snapshots,
+multi-tab session evidence, explicit leave, and a Redis-side API-A-only interruption followed by fresh
+generation recovery while a PostgreSQL command still acknowledges. HTTP/socket editing readiness,
+durable commands, outbox, delivery streams, and PostgreSQL are not changed by this recovery path.
 
 ## Acceptance rules
 

@@ -333,6 +333,23 @@ the runtime can re-admit current bindings and send fresh snapshots. This remains
 supervisor and does not alter HTTP, Socket.IO editing, or durable delivery readiness. M3.5B2B2
 multi-instance acceptance remains pending.
 
+**M3.5B2B2 multi-instance acceptance (complete)**
+
+The final bounded topology uses one disposable migrated PostgreSQL database, one real Redis instance,
+and two independently production-composed local-delivery APIs on dynamic ports. Each API owns its
+three presence Redis clients; Socket.IO retains its local default adapter, and no delivery stream,
+consumer group, or in-process cross-API bridge participates. Real authenticated owner/editor sockets
+plus an owner second tab join one board, while a viewer joins another board. The acceptance proves
+late snapshot contents, cross-replica Pub/Sub upserts, session-level multi-tab wire evidence,
+primary-board room isolation, strict malformed/wrong-board rejection, rate-coalesced cursor final
+state, and revision advancement. Killing only API A's owned Redis presence connection emits bounded
+unavailable without changing local HTTP/socket editing availability; an authoritative PostgreSQL
+command still acknowledges. Fresh A Redis clients subscribe, current bindings re-admit with fresh
+snapshots, and cross-replica updates resume. Explicit disconnect yields one effective leave while the
+other tab remains. It deliberately does not duplicate the separate 45-second TTL crash-expiry contract
+with a long acceptance wait. This acceptance makes no concurrency or capacity claim; B3 frontend UX
+remains pending.
+
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and
   render reduced-motion/accessible cursors without exposing user or session IDs.
