@@ -1,6 +1,6 @@
 # Milestone 3 product language
 
-Status: accepted through M3.5C.
+Status: accepted through M3.7A.
 
 ## Direction: a calm shared studio
 
@@ -66,8 +66,18 @@ surfaces and authoritative state indicators remain opaque.
   or in a deliberate side panel, not both without hierarchy.
 - Layers panel uses thumbnails/icons, generated type labels, durable order, and clear local-versus-
   durable affordances.
+- The labelled “Board objects” list is the semantic alternative to direct canvas inspection. Its compact
+  rows keep descriptions available to assistive technology; object identifiers are never product text.
 - Diagnostics move behind a development/operator affordance and never expose IDs/hashes in ordinary
   product UI.
+
+### Canvas action feedback
+
+Completed local object actions use one polite, bounded announcement region. Create, select, delete,
+move, resize, rotate, and local hide/show/lock/unlock announce only after their truthful completion
+boundary. Pointer movement, alignment guides, retry callbacks, duplicate delivery, and collaborator
+cursor updates do not announce. Automated accessibility scans support this contract but do not replace
+manual accessibility review.
 
 ### Collaboration colors
 

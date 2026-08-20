@@ -173,6 +173,8 @@ history remain pending.
 M3.6 is complete. M3.7 is next; user-facing version history is explicitly deferred until its authorized
 forward-only list/preview/restore backend contract exists. `/recovery` remains automatic verified recovery,
 not interactive history.
-M3.7A is complete: Layers is the labelled semantic “Board objects” Canvas alternative with bounded
-geometry/state descriptions, and completed local canvas actions use a generation-fenced polite announcer.
-Keyboard manipulation, touch policy, theme, and manual accessibility certification remain pending.
+M3.7A is accepted: Layers is the labelled semantic “Board objects” Canvas alternative with bounded
+geometry/state descriptions, and completed local canvas actions use one generation-fenced polite
+announcer. Automated axe coverage has no critical or serious WCAG A/AA violations on the landing,
+studio, object navigator, palette, Help, and Share surfaces; it supplements, but is not, full manual
+accessibility certification. Keyboard manipulation, touch policy, and theme work remain pending.

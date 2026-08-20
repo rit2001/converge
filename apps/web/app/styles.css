@@ -1979,7 +1979,7 @@ button {
   padding: 0;
   margin: var(--space-2, 8px) 0 0;
 }
-.command-palette li button {
+.command-palette li[role="option"] {
   width: 100%;
   display: flex;
   justify-content: space-between;
@@ -1990,18 +1990,20 @@ button {
   border-radius: var(--radius-sm, 6px);
   background: transparent;
   color: inherit;
+  cursor: pointer;
 }
-.command-palette li.active button,
-.command-palette li button:hover {
+.command-palette li[role="option"].active,
+.command-palette li[role="option"]:hover {
   background: var(--color-surface-hover, #eef2ff);
 }
-.command-palette li button:disabled {
+.command-palette li[aria-disabled="true"] {
   opacity: 0.62;
+  cursor: default;
 }
 .command-palette small,
 .command-palette em {
   display: block;
-  color: var(--color-text-muted, #475569);
+  color: var(--color-text-secondary, #475569);
   font-style: normal;
 }
 .command-palette kbd {

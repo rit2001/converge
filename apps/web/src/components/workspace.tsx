@@ -244,8 +244,13 @@ export function Workspace({
 
   const submit = (command: DurableCommand): Promise<boolean> =>
     session.current?.submit(command) ?? Promise.resolve(false);
-  const announce = (message: string): void =>
+  const announce = useCallback((message: string): void => {
     setCanvasAnnouncement((current) => nextCanvasAnnouncement(current, message));
+  }, []);
+  const objectActionLabel = (id: string): string =>
+    store.objects.find((object) => object.id === id)?.kind === "sticky"
+      ? "Sticky note"
+      : "Rectangle";
   const addObject = (kind: "rectangle" | "sticky"): void => {
     if (!store.boardId) return;
     const targetId = crypto.randomUUID();
@@ -292,18 +297,20 @@ export function Workspace({
     payload: { x?: number; y?: number; width?: number; height?: number; rotation?: number },
   ): void => {
     if (!store.boardId || store.lockedObjectIds.has(targetId)) return;
+    const actionLabel = objectActionLabel(targetId);
+    const activeSession = session.current;
     void submit({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.transform",
       payload,
     }).then((persisted) => {
-      if (persisted)
+      if (persisted && session.current === activeSession)
         announce(
           payload.rotation !== undefined
-            ? "Object rotated."
+            ? `${actionLabel} rotated.`
             : payload.width !== undefined
-              ? "Object resized."
-              : "Object moved.",
+              ? `${actionLabel} resized.`
+              : `${actionLabel} moved.`,
         );
     });
   };
@@ -314,25 +321,27 @@ export function Workspace({
   const toggleHiddenSelected = (): void => {
     if (!selectedObject || !rotationAvailable) return;
     store.setObjectHidden(selectedObject.id, true);
-    announce("Object hidden in this view.");
+    announce(`${objectActionLabel(selectedObject.id)} hidden in this view.`);
   };
   const toggleLockedSelected = (): void => {
     if (!selectedObject || !rotationAvailable) return;
     store.setObjectLocked(selectedObject.id, true);
-    announce("Object locked in this view.");
+    announce(`${objectActionLabel(selectedObject.id)} locked in this view.`);
   };
   const issueViewport = (action: "in" | "out" | "reset"): void =>
     setViewportCommand((current) => ({ id: (current?.id ?? 0) + 1, action }));
   const remove = (): void => {
     if (!store.boardId || !store.selectedId || store.lockedObjectIds.has(store.selectedId)) return;
     const targetId = store.selectedId;
+    const actionLabel = objectActionLabel(targetId);
     store.select(null);
+    const activeSession = session.current;
     void submit({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.delete",
       payload: {},
     }).then((persisted) => {
-      if (persisted) announce("Object deleted.");
+      if (persisted && session.current === activeSession) announce(`${actionLabel} deleted.`);
     });
   };
 
@@ -640,9 +649,20 @@ export function Workspace({
           selectedId={store.selectedId}
           hiddenObjectIds={store.hiddenObjectIds}
           lockedObjectIds={store.lockedObjectIds}
-          onSelect={(id) => store.select(id)}
-          onToggleHidden={(id) => store.setObjectHidden(id, !store.hiddenObjectIds.has(id))}
-          onToggleLocked={(id) => store.setObjectLocked(id, !store.lockedObjectIds.has(id))}
+          onSelect={(id) => {
+            store.select(id);
+            announce(`${objectActionLabel(id)} selected.`);
+          }}
+          onToggleHidden={(id) => {
+            const hidden = !store.hiddenObjectIds.has(id);
+            store.setObjectHidden(id, hidden);
+            announce(`${objectActionLabel(id)} ${hidden ? "hidden" : "shown"} in this view.`);
+          }}
+          onToggleLocked={(id) => {
+            const locked = !store.lockedObjectIds.has(id);
+            store.setObjectLocked(id, locked);
+            announce(`${objectActionLabel(id)} ${locked ? "locked" : "unlocked"} in this view.`);
+          }}
           onClose={closeLayers}
         />
       )}
@@ -684,9 +704,6 @@ export function Workspace({
           </aside>
         )}
       <CanvasActionAnnouncer announcement={canvasAnnouncement} />
-      <output className="ui-visually-hidden" aria-live="polite" aria-atomic="true">
-        {store.selectionNotice}
-      </output>
       <WorkspaceEntryStatus status={store.connection} hasBoard={Boolean(store.boardId)} />
       {(synchronization.state === "locally_preserved" ||
         synchronization.state === "reconnecting") && (

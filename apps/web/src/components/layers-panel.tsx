@@ -124,6 +124,21 @@ export function LayersPanel({
 }): React.JSX.Element {
   const entries = layerEntries(objects);
   const rowRefs = React.useRef<Array<HTMLButtonElement | null>>([]);
+  const headingRef = React.useRef<HTMLHeadingElement>(null);
+  const focusedObjectId = React.useRef<string | null>(null);
+  const focusedIndex = React.useRef(0);
+
+  React.useEffect(() => {
+    const removedId = focusedObjectId.current;
+    if (!removedId || entries.some((entry) => entry.object.id === removedId)) return;
+    const formerIndex = focusedIndex.current;
+    focusedObjectId.current = null;
+    queueMicrotask(() => {
+      const nextIndex = Math.max(0, Math.min(formerIndex, entries.length - 1));
+      if (nextIndex >= 0) rowRefs.current[nextIndex]?.focus();
+      else headingRef.current?.focus();
+    });
+  }, [entries]);
 
   const moveFocus = (event: React.KeyboardEvent<HTMLButtonElement>, index: number): void => {
     if (!(["ArrowUp", "ArrowDown", "Home", "End"] as const).includes(event.key as never)) return;
@@ -142,7 +157,9 @@ export function LayersPanel({
     >
       <header className="layers-panel__header">
         <div>
-          <h2 id="layers-panel-title">Layers</h2>
+          <h2 ref={headingRef} id="layers-panel-title" tabIndex={-1}>
+            Layers
+          </h2>
           <p aria-label={`${entries.length} objects`}>{entries.length} objects</p>
           <p className="layers-panel__view-note">
             <strong>This view</strong> only. Visibility and locks are local and aren’t shared with
@@ -191,6 +208,10 @@ export function LayersPanel({
                   data-locked={locked || undefined}
                   onClick={() => onSelect(entry.object.id)}
                   onKeyDown={(event) => moveFocus(event, index)}
+                  onFocus={() => {
+                    focusedObjectId.current = entry.object.id;
+                    focusedIndex.current = index;
+                  }}
                 >
                   <span className="layers-panel__icon" aria-hidden="true">
                     <ObjectTypeIcon kind={entry.object.kind} />

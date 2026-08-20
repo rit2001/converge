@@ -91,7 +91,7 @@ test("M3.4 canvas interactions accept two-client local controls and authoritativ
     await expect.poll(async () => (await snapshotFor(pageA, boardId)).lastSeq).toBe(2);
 
     await openLayers(pageA);
-    const layers = pageA.getByRole("list", { name: "Board layers, top to bottom" });
+    const layers = pageA.getByRole("list", { name: "Board objects, top to bottom" });
     await expect(
       layers.getByRole("button", { name: /Sticky note, top layer, 1 of 2/ }),
     ).toBeVisible();

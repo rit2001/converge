@@ -118,19 +118,14 @@ export function CommandPalette({
                 aria-disabled={!command.available}
                 className={index === active ? "active" : undefined}
                 onMouseEnter={() => setActive(index)}
+                onClick={() => execute(command)}
               >
-                <button
-                  type="button"
-                  disabled={!command.available}
-                  onClick={() => execute(command)}
-                >
-                  <span>
-                    <strong>{command.label}</strong>
-                    <small>{command.description}</small>
-                    {command.disabledReason && <em>{command.disabledReason}</em>}
-                  </span>
-                  {command.shortcut && <kbd>{command.shortcut}</kbd>}
-                </button>
+                <span>
+                  <strong>{command.label}</strong>
+                  <small>{command.description}</small>
+                  {command.disabledReason && <em>{command.disabledReason}</em>}
+                </span>
+                {command.shortcut && <kbd>{command.shortcut}</kbd>}
               </li>
             ))}
           </ul>

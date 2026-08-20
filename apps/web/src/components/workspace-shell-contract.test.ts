@@ -60,7 +60,7 @@ describe("layered studio shell contract", () => {
     expect(workspace).toContain("<LayersPanel");
     expect(workspace).toContain("objects={store.objects}");
     expect(workspace).toContain("selectedId={store.selectedId}");
-    expect(workspace).toContain("onSelect={(id) => store.select(id)}");
+    expect(workspace).toContain("announce(`${objectActionLabel(id)} selected.`)");
     expect(workspace).toContain('aria-controls="layers-panel"');
     expect(workspace).toContain('event.key === "Escape" && layersOpen');
     expect(styles).toMatch(/\.layers-panel\s*{[^}]*z-index:\s*var\(--layer-panels,\s*600\);/s);

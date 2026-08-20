@@ -572,11 +572,27 @@ contrast to preserve branding.
 Any critical flow lacks keyboard access, AA contrast, visible focus, reduced-motion behavior, or an
 honest small-screen policy.
 
+### M3.7A acceptance
+
+M3.7A is accepted. Layers is the semantic, labelled “Board objects” alternative for the non-DOM
+canvas: it presents durable top-to-bottom order and bounded type, geometry, rotation, stack, selection,
+and local view-state descriptions without exposing identifiers. Completed local create, select, delete,
+move, resize, rotate, hide/show, and lock/unlock boundaries use one generation-fenced polite
+announcement region; pointer frames, cursor/presence updates, retries, and duplicate delivery do not
+announce.
+
+The automated axe gate covers landing, ready empty studio, non-empty studio with the object navigator,
+command palette, Help, and Share at supported WCAG A/AA tags. It reports rule, impact, help text, and
+bounded targets and has no blanket rule suppression. This is repeatable automated coverage, not a full
+accessibility certification; manual keyboard, forced-colors, reduced-motion, narrow-viewport, and 200%
+zoom inspection remains part of release review. Keyboard object manipulation/creation, touch editing
+policy, and theme switching remain later M3.7 work.
+
 ## M3.8 — Performance, visual regression, and final acceptance
 
 **Preconditions**
 
-- M3.1–M3.7 complete.
+- M3.1–M3.7A complete.
 - Reference hardware/browser/DPR and screenshot review ownership approved.
 
 **User-visible invariant**

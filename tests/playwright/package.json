@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.10.2",
     "@converge/api": "workspace:*",
     "@converge/canvas-engine": "workspace:*",
     "@converge/database": "workspace:*",
