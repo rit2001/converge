@@ -116,6 +116,13 @@ evidence is not. Reduced motion renders the latest coordinate immediately.
 
 Announcements are deduplicated and rate-limited. Ordinary successful commands do not create toasts.
 
+### M3.6A command language
+
+The command palette uses concise implemented-action labels grouped as Tools, View, Panels, and Selection.
+Unavailable actions stay discoverable only with a fixed plain-language reason. “Ctrl/⌘ K” opens it; V, H,
+R, N, and 0 operate only outside editable fields. Escape closes the palette before popovers, panels, or
+canvas fallback. The palette never advertises undo, sharing, history, grouping, or durable reordering.
+
 M3.5C's real A/A2/B browser acceptance confirms that the synchronization trigger remains “Synced” only
 after the current board session is ready with no pending command, even when presence is unavailable. The
 roster groups same-user tabs, labels the authenticated group “You”, and never exposes identifiers. Remote

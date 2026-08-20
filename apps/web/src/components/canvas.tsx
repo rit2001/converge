@@ -30,6 +30,9 @@ interface Props {
   rotationFence?: string;
   presence?: PresenceSnapshot | null;
   onPresencePointer?: (cursor: { x: number; y: number } | null) => void;
+  viewportCommand?: { id: number; action: "in" | "out" | "reset" } | undefined;
+  creationTool?: "rectangle" | "sticky" | null;
+  onCreateFromCanvas?: (kind: "rectangle" | "sticky") => void;
 }
 
 export function Canvas({
@@ -44,6 +47,9 @@ export function Canvas({
   rotationFence = "initial",
   presence = null,
   onPresencePointer,
+  viewportCommand,
+  creationTool = null,
+  onCreateFromCanvas,
 }: Props): React.JSX.Element {
   const [viewport, setViewport] = useState({ width: 900, height: 600 });
   const [stage, setStage] = useState({ x: 0, y: 0, scale: 1 });
@@ -117,6 +123,24 @@ export function Canvas({
     if (container.current) observer.observe(container.current);
     return () => observer.disconnect();
   }, []);
+  useEffect(() => {
+    if (!viewportCommand) return;
+    setStage((value) => {
+      const scale =
+        viewportCommand.action === "reset"
+          ? 1
+          : Math.min(
+              3,
+              Math.max(0.25, value.scale * (viewportCommand.action === "in" ? 1.1 : 0.9)),
+            );
+      const center = { x: viewport.width / 2, y: viewport.height / 2 };
+      const world = {
+        x: (center.x - value.x) / value.scale,
+        y: (center.y - value.y) / value.scale,
+      };
+      return { scale, x: center.x - world.x * scale, y: center.y - world.y * scale };
+    });
+  }, [viewportCommand, viewport.height, viewport.width]);
   useEffect(() => {
     const transformer = transformerRef.current;
     const node =
@@ -246,7 +270,12 @@ export function Canvas({
         }}
         onPointerLeave={() => onPresencePointer?.(null)}
         onPointerDown={(event) => {
-          if (event.target === event.target.getStage()) onSelect(null);
+          if (event.target !== event.target.getStage()) return;
+          if (creationTool) {
+            onCreateFromCanvas?.(creationTool);
+            return;
+          }
+          onSelect(null);
         }}
         onWheel={(event) => {
           event.evt.preventDefault();

@@ -1942,6 +1942,74 @@ button {
   }
 }
 
+.command-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--layer-modal, 900);
+  display: grid;
+  place-items: start center;
+  padding: clamp(1rem, 10vh, 6rem) 1rem;
+  background: color-mix(in srgb, var(--color-surface-backdrop, #0f172a) 32%, transparent);
+}
+
+.command-palette {
+  width: min(42rem, 100%);
+  max-height: min(70vh, 36rem);
+  overflow: auto;
+  border: 1px solid var(--color-border, #cbd5e1);
+  border-radius: var(--radius-lg, 12px);
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-lg, 0 16px 40px rgb(15 23 42 / 20%));
+  padding: var(--space-2, 8px);
+}
+
+.command-palette input {
+  width: 100%;
+  min-height: 2.75rem;
+  box-sizing: border-box;
+  border: 1px solid var(--color-border, #cbd5e1);
+  border-radius: var(--radius-md, 8px);
+  padding: 0 var(--space-3, 12px);
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #0f172a);
+}
+
+.command-palette ul {
+  list-style: none;
+  padding: 0;
+  margin: var(--space-2, 8px) 0 0;
+}
+.command-palette li button {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3, 12px);
+  text-align: left;
+  padding: var(--space-2, 8px);
+  border: 0;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: inherit;
+}
+.command-palette li.active button,
+.command-palette li button:hover {
+  background: var(--color-surface-hover, #eef2ff);
+}
+.command-palette li button:disabled {
+  opacity: 0.62;
+}
+.command-palette small,
+.command-palette em {
+  display: block;
+  color: var(--color-text-muted, #475569);
+  font-style: normal;
+}
+.command-palette kbd {
+  align-self: center;
+  white-space: nowrap;
+  color: var(--color-text-muted, #475569);
+}
+
 @media (forced-colors: active) {
   :root {
     --color-alignment-guide: CanvasText;
@@ -1980,6 +2048,12 @@ button {
   .collaborator-trigger,
   .collaborator-details,
   .collaborator-avatar {
+    border: 1px solid CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  .command-palette,
+  .command-palette input {
     border: 1px solid CanvasText;
     forced-color-adjust: auto;
   }

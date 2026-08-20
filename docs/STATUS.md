@@ -161,3 +161,7 @@ and a second owner tab. M3.5C is complete: the real A/A2/B browser acceptance pr
 synchronization, grouped self/session evidence, Redis-routed non-interactive cursors, and presence-only
 interruption/recovery without changing durable editing. This is a bounded correctness acceptance, not a
 capacity, load, membership, or exact-presence guarantee.
+
+M3.6A is complete: a bounded typed command registry, one guarded document-level keyboard dispatcher,
+and an accessible modal command palette expose only implemented workspace actions. The palette has no
+history, sharing, onboarding, command persistence, protocol, or durable-command bypass behavior.

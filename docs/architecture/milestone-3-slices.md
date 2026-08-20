@@ -459,6 +459,18 @@ the wrong lifecycle boundary.
 **Preconditions**
 
 - M3.3–M3.5 accepted.
+
+**M3.6A command palette (complete)**
+
+The workspace owns one static typed command registry for implemented tools, viewport, panel, and
+selection actions. Availability derives from the current BoardStore selection/readiness/local-view state;
+commands invoke existing callbacks and never bypass durable submission or session fencing. One document
+dispatcher owns Ctrl/⌘ K, V, H, R, N, and 0 outside editable/composing targets, and preserves browser
+modifiers and one-keypress destructive semantics. The modal palette is in `overlay-modals`, focuses search,
+traps focus, restores its trigger, and closes before lower-priority Layers/diagnostics Escape behavior.
+Search is bounded deterministic exact-label, label-prefix, keyword-prefix, substring, then description/category
+order. Undo/redo, sharing, history, grouping, durable reorder/rename, and command persistence remain absent.
+
 - Product approves which backend-missing flows remain informational versus receive separate API work.
 
 **User-visible invariant**

@@ -27,6 +27,8 @@ import { WorkspaceEntryStatus } from "./workspace-entry-status";
 import { deriveSynchronizationPresentation } from "../synchronization-presentation";
 import { SynchronizationStatus } from "./synchronization-status";
 import { CollaboratorPresence } from "./collaborator-presence";
+import { CommandPalette } from "./command-palette";
+import { createWorkspaceCommands, type CommandId } from "../commands";
 import type { PresenceSnapshot, PresenceStore } from "../presence-store";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
@@ -153,8 +155,14 @@ export function Workspace(): React.JSX.Element {
     });
   }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
+  const [creationTool, setCreationTool] = useState<"rectangle" | "sticky" | null>(null);
   const [diagnostics, setDiagnostics] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [viewportCommand, setViewportCommand] = useState<{
+    id: number;
+    action: "in" | "out" | "reset";
+  }>();
   const layersTrigger = useRef<HTMLButtonElement>(null);
   const rotationControlsHadFocus = useRef(false);
   const selectedObjectLocked = Boolean(
@@ -179,6 +187,7 @@ export function Workspace(): React.JSX.Element {
     pendingCount: store.pending.length,
     pendingStatus: store.pendingStatus,
   });
+  const terminal = store.connection === "authorization-failed" || store.connection === "error";
   const presence = usePresenceSnapshot(presenceStore);
   const publishPresencePointer = useCallback(
     (cursor: { x: number; y: number } | null) => presenceStore?.publish(cursor, "active"),
@@ -260,6 +269,16 @@ export function Workspace(): React.JSX.Element {
     if (!rotationAvailable || !selectedObject || store.selectedId !== selectedObject.id) return;
     transform(selectedObject.id, { rotation: normalizeRotation(rotation) });
   };
+  const toggleHiddenSelected = (): void => {
+    if (!selectedObject || !rotationAvailable) return;
+    store.setObjectHidden(selectedObject.id, true);
+  };
+  const toggleLockedSelected = (): void => {
+    if (!selectedObject || !rotationAvailable) return;
+    store.setObjectLocked(selectedObject.id, true);
+  };
+  const issueViewport = (action: "in" | "out" | "reset"): void =>
+    setViewportCommand((current) => ({ id: (current?.id ?? 0) + 1, action }));
   const remove = (): void => {
     if (!store.boardId || !store.selectedId || store.lockedObjectIds.has(store.selectedId)) return;
     const targetId = store.selectedId;
@@ -271,31 +290,86 @@ export function Workspace(): React.JSX.Element {
     });
   };
 
+  const commands = useMemo(() => {
+    const action = {
+      "tool.select": () => setTool("select"),
+      "tool.pan": () => setTool("pan"),
+      "tool.rectangle": () => setCreationTool("rectangle"),
+      "tool.sticky": () => setCreationTool("sticky"),
+      "view.zoom-in": () => issueViewport("in"),
+      "view.zoom-out": () => issueViewport("out"),
+      "view.reset-zoom": () => issueViewport("reset"),
+      "panel.layers": () => setLayersOpen(true),
+      "panel.synchronization": () =>
+        document
+          .querySelector<HTMLButtonElement>('[aria-label^="Synchronization status:"]')
+          ?.click(),
+      "panel.collaborators": () =>
+        document.querySelector<HTMLButtonElement>('[aria-label^="Collaborators:"]')?.click(),
+      "panel.diagnostics": () => setDiagnostics(true),
+      "selection.delete": remove,
+      "selection.hide": toggleHiddenSelected,
+      "selection.lock": toggleLockedSelected,
+      "selection.rotate-clockwise": () =>
+        selectedObject && rotateSelected(selectedObject.rotation + 15),
+      "selection.rotate-counterclockwise": () =>
+        selectedObject && rotateSelected(selectedObject.rotation - 15),
+      "selection.reset-rotation": () => rotateSelected(0),
+    } satisfies Record<CommandId, () => void>;
+    return createWorkspaceCommands({
+      ready: store.connection === "ready" && Boolean(store.boardId),
+      hasSelection: Boolean(selectedObject),
+      selectedLocked: selectedObjectLocked,
+      selectedHidden: Boolean(selectedObject && store.hiddenObjectIds.has(selectedObject.id)),
+      rotateAvailable: rotationAvailable,
+      action,
+    });
+  }, [
+    rotationAvailable,
+    selectedObject,
+    selectedObjectLocked,
+    store.boardId,
+    store.connection,
+    store.hiddenObjectIds,
+    store.lockedObjectIds,
+    store.committed.lastSeq,
+  ]);
   useEffect(() => {
-    const keydown = (event: KeyboardEvent): void => {
-      if (
-        event.target instanceof HTMLInputElement ||
-        event.target instanceof HTMLTextAreaElement ||
-        event.target instanceof HTMLSelectElement
-      )
-        return;
-      if (
-        (event.key === "Delete" || event.key === "Backspace") &&
-        store.selectedId &&
-        !store.lockedObjectIds.has(store.selectedId)
-      ) {
-        event.preventDefault();
-        remove();
-      }
-      if (event.key === "v") setTool("select");
-      if (event.key === "h") setTool("pan");
+    const editable = (target: EventTarget | null): boolean =>
+      target instanceof HTMLElement &&
+      (target.isContentEditable ||
+        ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) ||
+        target.getAttribute("role") === "combobox");
+    const command = (id: CommandId): boolean => {
+      const value = commands.find((candidate) => candidate.id === id);
+      if (!value?.available) return false;
+      value.execute();
+      return true;
     };
-    window.addEventListener("keydown", keydown);
-    return () => window.removeEventListener("keydown", keydown);
-  }, [store.selectedId, store.boardId, store.committed.lastSeq, store.lockedObjectIds]);
-
-  useEffect(() => {
     const keydown = (event: KeyboardEvent): void => {
+      if (event.isComposing || editable(event.target)) return;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
+      if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return;
+      if (paletteOpen) return;
+      const id =
+        event.key.toLowerCase() === "v"
+          ? "tool.select"
+          : event.key.toLowerCase() === "h"
+            ? "tool.pan"
+            : event.key.toLowerCase() === "r"
+              ? "tool.rectangle"
+              : event.key.toLowerCase() === "n"
+                ? "tool.sticky"
+                : event.key === "0"
+                  ? "view.reset-zoom"
+                  : event.key === "Delete" || event.key === "Backspace"
+                    ? "selection.delete"
+                    : undefined;
+      if (id && command(id)) event.preventDefault();
       if (event.key === "Escape" && layersOpen) {
         event.preventDefault();
         closeLayers();
@@ -304,9 +378,13 @@ export function Workspace(): React.JSX.Element {
         setDiagnostics(false);
       }
     };
-    window.addEventListener("keydown", keydown);
-    return () => window.removeEventListener("keydown", keydown);
-  }, [diagnostics, layersOpen]);
+    document.addEventListener("keydown", keydown);
+    return () => document.removeEventListener("keydown", keydown);
+  }, [commands, diagnostics, layersOpen, paletteOpen]);
+
+  useEffect(() => {
+    if (terminal) setPaletteOpen(false);
+  }, [terminal]);
 
   useEffect(() => {
     if (rotationAvailable || !rotationControlsHadFocus.current) return;
@@ -328,14 +406,20 @@ export function Workspace(): React.JSX.Element {
           <strong>{store.name || "Preparing board"}</strong>
         </div>
         <div className="board-header-status">
+          <Tooltip label="Open command palette (Ctrl/⌘ K)">
+            <IconButton
+              variant="ghost"
+              aria-label="Open command palette"
+              onClick={() => setPaletteOpen(true)}
+            >
+              ⌘
+            </IconButton>
+          </Tooltip>
           <SynchronizationStatus
             presentation={synchronization}
             pendingCount={store.pending.length}
           />
-          <CollaboratorPresence
-            presence={presence}
-            terminal={store.connection === "authorization-failed" || store.connection === "error"}
-          />
+          <CollaboratorPresence presence={presence} terminal={terminal} />
           <Tooltip label="Open layers">
             <button
               ref={layersTrigger}
@@ -384,7 +468,10 @@ export function Workspace(): React.JSX.Element {
               variant="ghost"
               aria-label="Add rectangle"
               data-testid="add-rectangle"
-              onClick={() => addObject("rectangle")}
+              onClick={() => {
+                setCreationTool(null);
+                addObject("rectangle");
+              }}
             >
               <ToolIcon name="rectangle" />
             </IconButton>
@@ -395,7 +482,10 @@ export function Workspace(): React.JSX.Element {
               variant="ghost"
               aria-label="Add sticky note"
               data-testid="add-sticky"
-              onClick={() => addObject("sticky")}
+              onClick={() => {
+                setCreationTool(null);
+                addObject("sticky");
+              }}
             >
               <ToolIcon name="sticky" />
             </IconButton>
@@ -437,6 +527,12 @@ export function Workspace(): React.JSX.Element {
           onPresencePointer={publishPresencePointer}
           onSelect={(id) => store.select(id)}
           onTransform={transform}
+          viewportCommand={viewportCommand}
+          creationTool={creationTool}
+          onCreateFromCanvas={(kind) => {
+            setCreationTool(null);
+            addObject(kind);
+          }}
         />
       </section>
       {layersOpen && (
@@ -451,6 +547,11 @@ export function Workspace(): React.JSX.Element {
           onClose={closeLayers}
         />
       )}
+      <CommandPalette
+        open={paletteOpen}
+        commands={commands}
+        onClose={() => setPaletteOpen(false)}
+      />
       <output className="ui-visually-hidden" aria-live="polite" aria-atomic="true">
         {store.selectionNotice}
       </output>
