@@ -2026,6 +2026,11 @@ button {
 .studio-help h3 {
   margin-bottom: 0.2rem;
 }
+@media (max-width: 600px) {
+  .studio-welcome {
+    display: none;
+  }
+}
 
 @media (forced-colors: active) {
   :root {

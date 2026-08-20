@@ -17,7 +17,7 @@ test("command palette opens by keyboard, searches, executes one local command, a
     "aria-pressed",
     "true",
   );
-  const trigger = page.getByRole("button", { name: "Open command palette" });
+  const trigger = page.getByLabel("Open command palette", { exact: true });
   await trigger.focus();
   await page.keyboard.press("Enter");
   await page.keyboard.press("Escape");

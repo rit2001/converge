@@ -602,8 +602,22 @@ export function Workspace(): React.JSX.Element {
           <aside className="studio-welcome" aria-label="First-run studio guidance">
             <h2>Your shared canvas is ready</h2>
             <p>Objects are durable; collaboration status is visible in the header.</p>
-            <button onClick={() => setCreationTool("sticky")}>Add a sticky note</button>
-            <button onClick={() => setCreationTool("rectangle")}>Add a rectangle</button>
+            <button
+              onClick={() => {
+                dismissOnboarding("dismissed");
+                setCreationTool("sticky");
+              }}
+            >
+              Add a sticky note
+            </button>
+            <button
+              onClick={() => {
+                dismissOnboarding("dismissed");
+                setCreationTool("rectangle");
+              }}
+            >
+              Add a rectangle
+            </button>
             <button onClick={() => setPaletteOpen(true)}>Open command palette</button>
             <button onClick={() => dismissOnboarding("dismissed")}>Not now</button>
           </aside>
