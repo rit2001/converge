@@ -197,3 +197,11 @@ but defective selection timing invalidated latency acceptance. No frontend-laten
 performance guarantee is claimed, and M3 will not spend further work on this measurement. Deterministic
 bundle budgets remain independently enforced; production-capacity certification is future
 deployment/load work.
+M3.8B completes Milestone 3: ten deterministic pinned-Chromium visual baselines cover the accepted
+Light/Dark desktop, compact, phone view-only, modal/panel, selected-canvas, onboarding, synchronization,
+and real dual-replica roster states. The final release gate passed the complete web/protocol/unit,
+workspace format/lint/typecheck/build, bundle-budget, API presence, ordinary browser, accessibility,
+responsive, keyboard, and dual-replica presence suites. Milestone 3 is complete with no release-blocking
+product defect. M3.8A2 remains explicitly unaccepted, and no latency, 1,000-object performance,
+production-capacity, deployment, full accessibility-certification, or broad browser-certification claim
+is made.

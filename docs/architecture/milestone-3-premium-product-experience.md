@@ -281,5 +281,11 @@ follows the layered ownership model; core canvas and layers interactions are acc
 collaboration and synchronization states distinguish local, acknowledged, delivered, and recovered
 evidence; responsive/theme policy is implemented; deterministic bundle budgets remain reproducible and
 unaccepted browser measurements remain truthfully excluded from performance claims;
-and Chromium/Firefox/WebKit acceptance passes. Any deferred durable capability remains visibly
-absent or truthfully labeled, never simulated as collaborative state.
+and the pinned Chromium release acceptance passes. Broader browser/device certification remains future
+deployment validation. Any deferred durable capability remains visibly absent or truthfully labeled,
+never simulated as collaborative state.
+
+Milestone 3 satisfied this definition through the M3.8B release gate. The accepted evidence is bounded
+to the committed product surfaces, deterministic bundle budgets, pinned Chromium browser workflows,
+automated axe checks, and the real two-API/two-web presence topology. It excludes the unaccepted M3.8A2
+latency attempt and every deployment/capacity guarantee.

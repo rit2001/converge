@@ -666,6 +666,27 @@ checker enforces landing JavaScript, studio JavaScript, and initial CSS gzip bud
 schema/privacy validation. Production-capacity certification remains future deployment/load work with a
 separately approved measurement environment. M3 will not spend further work on this measurement.
 
+### M3.8B final product-experience acceptance
+
+Milestone 3 is accepted on the pinned Chromium reference. Ten deterministic baselines cover Light/Dark
+landing, synchronized Studio onboarding, selected Layers and rotation controls, palette, Help, Share,
+compact synchronization details, phone view-only Layers, and the real dual-replica collaborator roster.
+Animation/caret instability is disabled; only the required dynamic Share URL value is masked. Immediate
+baseline comparison and manual inspection found no release-blocking clipping, overlap, overflow,
+stacking, contrast, focus, or Canvas obstruction defect.
+
+The release gate passed frozen dependency resolution, format, all workspace lint/typecheck tasks, the
+complete web and protocol suites, broader unit tests, production build, deterministic bundle budgets,
+focused API presence/Redis regressions, 14 ordinary browser scenarios, and 3 dual-replica presence
+scenarios. Axe Light/Dark, keyboard-only manipulation, forced-colors/reduced-motion assertions,
+responsive capability fencing, synchronization/presence isolation, and cleanup all remain green. The
+only correction updated two stale tests from the superseded “Desktop editor notice” label to the
+accepted semantic “View-only screen notice.”
+
+This closes M3 without accepting M3.8A2 latency evidence. Authentication UI, invitations/member
+administration, user-facing history/restore, deployment, broader browser certification, full manual
+accessibility certification, and production capacity remain deferred.
+
 **Preconditions**
 
 - M3.1–M3.7A complete.
@@ -702,7 +723,7 @@ visual and performance gates, artifact privacy check, and clean Git diff.
 
 **Commit**
 
-`test(web): accept premium product experience`
+`test(web): accept milestone 3 product experience`
 
 **Explicit exclusions**
 
