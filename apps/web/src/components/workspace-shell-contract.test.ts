@@ -46,6 +46,19 @@ describe("layered studio shell contract", () => {
     expect(workspace).toContain('<dl id="workspace-diagnostics-panel" hidden={!diagnostics}>');
   });
 
+  it("keeps layers as a controlled local panel above the canvas without changing canvas geometry", () => {
+    expect(workspace).toContain("<LayersPanel");
+    expect(workspace).toContain("objects={store.objects}");
+    expect(workspace).toContain("selectedId={store.selectedId}");
+    expect(workspace).toContain("onSelect={(id) => store.select(id)}");
+    expect(workspace).toContain('aria-controls="layers-panel"');
+    expect(workspace).toContain('event.key === "Escape" && layersOpen');
+    expect(styles).toMatch(/\.layers-panel\s*{[^}]*z-index:\s*var\(--layer-panels,\s*600\);/s);
+    expect(styles).toMatch(
+      /@media \(max-width: 600px\)\s*{[\s\S]*\.layers-panel\s*{[^}]*display:\s*none;/s,
+    );
+  });
+
   it("keeps overlay gaps transparent and presents an honest narrow-screen notice", () => {
     expect(styles).toMatch(/\.portal-hosts,\s*\.portal-root\s*{[^}]*pointer-events:\s*none;/s);
     expect(styles).toMatch(/\.studio-narrow-notice\s*{[^}]*display:\s*none;/s);

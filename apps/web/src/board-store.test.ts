@@ -40,6 +40,13 @@ const transformed: CommittedOperation = {
   payload: { x: 90 },
   seq: 2,
 };
+const deleted: CommittedOperation = {
+  ...common,
+  opId: "40000000-0000-4000-8000-000000000003",
+  type: "object.delete",
+  payload: {},
+  seq: 2,
+};
 
 let generation = 0;
 let token: BoardSessionToken;
@@ -103,6 +110,60 @@ describe("committed sequence reconciliation", () => {
       committed: { lastSeq: 1 },
       objects: [{ id: objectId }],
     });
+  });
+});
+
+describe("local controlled selection", () => {
+  it("keeps selection local and does not create a pending command", () => {
+    useBoardStore.getState().ingest(token, created);
+
+    useBoardStore.getState().select(objectId);
+
+    expect(useBoardStore.getState()).toMatchObject({ selectedId: objectId, pending: [] });
+  });
+
+  it("clears a selected object after local optimistic deletion without adding another command", () => {
+    useBoardStore.getState().ingest(token, created);
+    useBoardStore.getState().select(objectId);
+    const pending: DurableCommand = {
+      schemaVersion: 1,
+      opId: "40000000-0000-4000-8000-000000000004",
+      boardId,
+      clientId,
+      baseSeq: 1,
+      targetId: objectId,
+      clientTimestamp: "2026-08-06T12:01:00.000Z",
+      type: "object.delete",
+      payload: {},
+    };
+
+    useBoardStore.getState().addPersistedPending(token, pending);
+
+    expect(useBoardStore.getState().selectedId).toBeNull();
+    expect(useBoardStore.getState().pending).toEqual([pending]);
+  });
+
+  it("clears stale selection and announces an authoritative remote deletion", () => {
+    useBoardStore.getState().ingest(token, created);
+    useBoardStore.getState().select(objectId);
+
+    useBoardStore.getState().ingest(token, deleted);
+
+    expect(useBoardStore.getState()).toMatchObject({
+      selectedId: null,
+      selectionNotice: "Selected object was removed from the board.",
+      objects: [],
+    });
+  });
+
+  it("clears local selection when a replacement session begins", () => {
+    useBoardStore.getState().ingest(token, created);
+    useBoardStore.getState().select(objectId);
+    const replacement = nextToken();
+
+    useBoardStore.getState().beginSession(replacement, "10000000-0000-4000-8000-000000000002");
+
+    expect(useBoardStore.getState()).toMatchObject({ selectedId: null, objects: [] });
   });
 });
 

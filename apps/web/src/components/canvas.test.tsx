@@ -2,7 +2,7 @@ import * as React from "react";
 import { createElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { Group, Transformer } from "react-konva";
+import { Group, Stage, Transformer } from "react-konva";
 import type { BoardSnapshot, CanvasObject, CommittedOperation } from "@converge/protocol";
 import type { BoardSessionToken } from "../board-session";
 import { createBoardStore } from "../board-store";
@@ -23,7 +23,9 @@ vi.mock("react-konva", async () => {
     ),
     Layer: Container,
     Rect: vi.fn(() => null),
-    Stage: Container,
+    Stage: vi.fn(({ children }: { children?: ReactNode }) =>
+      React.createElement(React.Fragment, null, children),
+    ),
     Text: vi.fn(() => null),
     Transformer: vi.fn(() => null),
   };
@@ -98,15 +100,17 @@ function renderCanvas(
   objects: CanvasObject[],
   selectedId: string | null = null,
   onTransform: (id: string, patch: object) => void = vi.fn(),
+  onSelect: (id: string | null) => void = vi.fn(),
 ): RenderedGroupProps[] {
   vi.mocked(Group).mockClear();
   vi.mocked(Transformer).mockClear();
+  vi.mocked(Stage).mockClear();
   renderToStaticMarkup(
     createElement(Canvas, {
       objects,
       selectedId,
       tool: "select",
-      onSelect: vi.fn(),
+      onSelect,
       onTransform,
     }),
   );
@@ -202,5 +206,23 @@ describe("authoritative canvas rotation", () => {
       height: 200,
       rotation: rectangle.rotation,
     });
+  });
+});
+
+describe("canvas selection boundary", () => {
+  it("clears the shared local selection when the empty stage is clicked", () => {
+    const onSelect = vi.fn();
+    renderCanvas([rectangle], rectangle.id, vi.fn(), onSelect);
+    const props = vi.mocked(Stage).mock.calls[0]?.[0] as {
+      onPointerDown: (event: { target: { getStage: () => unknown } }) => void;
+    };
+    const onPointerDown = (event: { target: { getStage: () => unknown } }): void =>
+      props.onPointerDown(event);
+    const stage = {} as { getStage: () => unknown };
+    stage.getStage = () => stage;
+
+    onPointerDown({ target: stage });
+
+    expect(onSelect).toHaveBeenCalledWith(null);
   });
 });

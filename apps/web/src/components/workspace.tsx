@@ -20,6 +20,7 @@ import { indexedDbPendingOperationStore } from "../pending-db";
 import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
 import { IconButton, Separator, StatusPill, Tooltip } from "./ui/primitives";
+import { LayersPanel } from "./layers-panel";
 import { toneForSynchronization, WorkspaceEntryStatus } from "./workspace-entry-status";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
@@ -36,7 +37,11 @@ function commandBase(boardId: string, clientId: string, targetId: string, lastSe
   };
 }
 
-function ToolIcon({ name }: { name: "select" | "pan" | "rectangle" | "sticky" | "delete" }) {
+function ToolIcon({
+  name,
+}: {
+  name: "select" | "pan" | "rectangle" | "sticky" | "delete" | "layers";
+}) {
   const shared = { fill: "none", stroke: "currentColor", strokeWidth: 1.75 };
   if (name === "select")
     return (
@@ -64,6 +69,15 @@ function ToolIcon({ name }: { name: "select" | "pan" | "rectangle" | "sticky" | 
       <svg aria-hidden="true" viewBox="0 0 24 24">
         <path {...shared} d="M6 4h12v12l-4 4H6V4Z" />
         <path {...shared} d="M14 20v-4h4M9 9h6M9 13h4" />
+      </svg>
+    );
+  if (name === "layers")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path {...shared} d="M5 7h14M5 12h14M5 17h14" />
+        <circle {...shared} cx="7" cy="7" r="1" />
+        <circle {...shared} cx="7" cy="12" r="1" />
+        <circle {...shared} cx="7" cy="17" r="1" />
       </svg>
     );
   return (
@@ -130,6 +144,13 @@ export function Workspace(): React.JSX.Element {
   }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
   const [diagnostics, setDiagnostics] = useState(false);
+  const [layersOpen, setLayersOpen] = useState(false);
+  const layersTrigger = useRef<HTMLButtonElement>(null);
+
+  const closeLayers = (): void => {
+    setLayersOpen(false);
+    requestAnimationFrame(() => layersTrigger.current?.focus());
+  };
 
   useEffect(() => {
     return scheduleOwnedSessionStart(
@@ -199,13 +220,12 @@ export function Workspace(): React.JSX.Element {
   };
   const remove = (): void => {
     if (!store.boardId || !store.selectedId) return;
-    const activeSession = session.current;
+    const targetId = store.selectedId;
+    store.select(null);
     void submit({
-      ...commandBase(store.boardId, clientId, store.selectedId, store.committed.lastSeq),
+      ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.delete",
       payload: {},
-    }).then((persisted) => {
-      if (persisted && session.current === activeSession) store.select(null);
     });
   };
 
@@ -230,14 +250,17 @@ export function Workspace(): React.JSX.Element {
 
   useEffect(() => {
     const keydown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape" && diagnostics) {
+      if (event.key === "Escape" && layersOpen) {
+        event.preventDefault();
+        closeLayers();
+      } else if (event.key === "Escape" && diagnostics) {
         event.preventDefault();
         setDiagnostics(false);
       }
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [diagnostics]);
+  }, [diagnostics, layersOpen]);
 
   return (
     <main className="workspace studio-shell" aria-label="Converge studio">
@@ -259,6 +282,19 @@ export function Workspace(): React.JSX.Element {
             tone={toneForSynchronization(store.connection)}
             accessibleLabel={`Synchronization status: ${store.connection}`}
           />
+          <Tooltip label="Open layers">
+            <button
+              ref={layersTrigger}
+              className={`ui-button ui-button--${layersOpen ? "primary" : "secondary"} ui-button--icon layers-trigger`}
+              type="button"
+              aria-label="Open layers panel"
+              aria-expanded={layersOpen}
+              aria-controls="layers-panel"
+              onClick={() => setLayersOpen((value) => !value)}
+            >
+              <ToolIcon name="layers" />
+            </button>
+          </Tooltip>
         </div>
       </header>
       <aside className="toolbar studio-tool-dock" aria-label="Primary canvas tools">
@@ -333,6 +369,17 @@ export function Workspace(): React.JSX.Element {
           onTransform={transform}
         />
       </section>
+      {layersOpen && (
+        <LayersPanel
+          objects={store.objects}
+          selectedId={store.selectedId}
+          onSelect={(id) => store.select(id)}
+          onClose={closeLayers}
+        />
+      )}
+      <output className="ui-visually-hidden" aria-live="polite" aria-atomic="true">
+        {store.selectionNotice}
+      </output>
       <WorkspaceEntryStatus status={store.connection} hasBoard={Boolean(store.boardId)} />
       {store.error && (
         <div className="error-toast" role="alert">

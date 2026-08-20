@@ -65,6 +65,7 @@ export interface BoardStore {
   appliedSeqOpIds: Record<number, string>;
   objects: CanvasObject[];
   selectedId: string | null;
+  selectionNotice: string | null;
   connection: SynchronizationStatus;
   pendingStatus: PendingRecoveryStatus;
   synchronizationDiagnostics: SynchronizationDiagnostics;
@@ -128,6 +129,12 @@ function stateFromSnapshot(snapshot: BoardSnapshot): BoardState {
 
 function derive(committed: BoardState, pending: DurableCommand[]): CanvasObject[] {
   return visibleObjects(optimisticState(committed, pending));
+}
+
+function currentSelection(objects: CanvasObject[], selectedId: string | null) {
+  if (!selectedId || objects.some((object) => object.id === selectedId))
+    return { selectedId, selectionNotice: null };
+  return { selectedId: null, selectionNotice: "Selected object was removed from the board." };
 }
 
 function cloneBoardState(state: BoardState): BoardState {
@@ -230,6 +237,7 @@ export function createBoardStore(
       appliedSeqOpIds: {},
       objects: [],
       selectedId: null,
+      selectionNotice: null,
       connection: "disconnected",
       pendingStatus: "idle",
       synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -248,6 +256,7 @@ export function createBoardStore(
           appliedSeqOpIds: {},
           objects: [],
           selectedId: null,
+          selectionNotice: null,
           connection: "connecting",
           pendingStatus: "idle",
           synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -265,11 +274,13 @@ export function createBoardStore(
         if (!isCurrent(sessionToken, snapshot.id)) return false;
         if (pending.some((command) => command.boardId !== snapshot.id)) return false;
         const committed = stateFromSnapshot(snapshot);
+        const objects = derive(committed, pending);
         set({
           name: snapshot.name,
           committed,
           pending,
-          objects: derive(committed, pending),
+          objects,
+          ...currentSelection(objects, get().selectedId),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -289,10 +300,12 @@ export function createBoardStore(
         if (!isCurrent(sessionToken, snapshot.id)) return false;
         const current = get();
         const committed = stateFromSnapshot(snapshot);
+        const objects = derive(committed, current.pending);
         set({
           name: snapshot.name,
           committed,
-          objects: derive(committed, current.pending),
+          objects,
+          ...currentSelection(objects, current.selectedId),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -312,10 +325,12 @@ export function createBoardStore(
         if (!isCurrent(sessionToken, recoveredBoardId)) return false;
         const current = get();
         const committed = cloneBoardState(recovered);
+        const objects = derive(committed, current.pending);
         set({
           name: boardName,
           committed,
-          objects: derive(committed, current.pending),
+          objects,
+          ...currentSelection(objects, current.selectedId),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -341,6 +356,7 @@ export function createBoardStore(
           appliedSeqOpIds: {},
           objects: [],
           selectedId: null,
+          selectionNotice: null,
           connection: "authorization-failed",
           synchronizationDiagnostics: {
             ...get().synchronizationDiagnostics,
@@ -373,6 +389,7 @@ export function createBoardStore(
           appliedSeqOpIds: {},
           objects: [],
           selectedId: null,
+          selectionNotice: null,
           connection: "disconnected",
           pendingStatus: "idle",
           synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -405,22 +422,33 @@ export function createBoardStore(
         set({ pendingStatus, ...(message === undefined ? {} : { error: message }) });
       },
       select(selectedId) {
-        set({ selectedId });
+        const current = get();
+        const selection = currentSelection(current.objects, selectedId);
+        set({ ...selection, selectionNotice: selectedId ? null : selection.selectionNotice });
       },
       addPersistedPending(sessionToken, command) {
         const current = get();
         if (!isCurrent(sessionToken, command.boardId)) return false;
         if (current.pending.some(({ opId }) => opId === command.opId)) return true;
         const pending = [...current.pending, command];
-        set({ pending, objects: derive(current.committed, pending), error: null });
+        const objects = derive(current.committed, pending);
+        set({
+          pending,
+          objects,
+          ...currentSelection(objects, current.selectedId),
+          error: null,
+        });
         return true;
       },
       removePending(sessionToken, opId, error) {
         if (!isCurrent(sessionToken)) return;
         const pending = get().pending.filter((command) => command.opId !== opId);
+        const current = get();
+        const objects = derive(current.committed, pending);
         set({
           pending,
-          objects: derive(get().committed, pending),
+          objects,
+          ...currentSelection(objects, current.selectedId),
           ...(error === undefined ? {} : { error }),
         });
       },
@@ -465,12 +493,14 @@ export function createBoardStore(
           next = buffered[committed.lastSeq + 1];
         }
         const advanced = committed.lastSeq !== current.committed.lastSeq;
+        const objects = derive(committed, get().pending);
         set({
           committed,
           buffered,
           appliedOpIds,
           appliedSeqOpIds,
-          objects: derive(committed, get().pending),
+          objects,
+          ...currentSelection(objects, current.selectedId),
           ...(advanced && current.boardId
             ? {
                 authoritativeHash: {
