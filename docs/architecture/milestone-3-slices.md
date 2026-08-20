@@ -363,6 +363,22 @@ editing. Recovery uses the current fresh binding session, so replacement snapsho
 replace self evidence; other same-user sessions remain valid multi-tab evidence. The ID is protocol
 evidence only and must never become a visible, accessible, telemetry, diagnostic, or log label.
 
+**M3.5B3A client presence state (complete)**
+
+`PresenceStore` is a separate, generation-owned ephemeral authority; it never enters BoardStore,
+pending persistence, recovery, hashes, or durable commands. Strict self-specific snapshots establish
+the self user only by resolving `selfPresenceSessionId`. Greater per-session revisions replace state;
+equal/lower evidence is ignored, and revisioned leaves create at-most-200 tombstones retained for two
+presence TTL windows so delayed upserts cannot resurrect sessions. At most 100 sessions, one
+earliest-expiry timer, and one outbound coalescing timer are retained. Server observation/expiry
+durations are translated at receipt time, so last-known unavailable evidence disappears on logical
+expiry. The selector groups by user ID, keeps same-user tabs internally, selects active/newest/greatest-
+revision/canonical-session cursor deterministically, and labels only the authenticated group “You.”
+Outbound evidence is strict `presence:update` only, deduplicated and limited to 20 Hz with latest-value
+coalescing; it never uses a durable command path. BoardTransport registers strict presence listeners
+before connection, fences callbacks by its current board session, and clears the store/listeners at
+terminal close. B3 roster and cursor rendering remain pending.
+
 - **M3.5B3 — premium roster and cursor UX:** Group valid sessions by authenticated user (one avatar;
   self is “You”), use the most recently active session cursor, tolerate unavailable presence, and
   render reduced-motion/accessible cursors without exposing user or session IDs.

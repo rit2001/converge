@@ -151,3 +151,6 @@ M3.5B2 API/Redis presence is accepted against two independently composed local-d
 Redis instance, and a disposable migrated database. Frontend presence rendering (M3.5B3) remains pending.
 M3.5B's self-session correction is complete: strict socket-specific snapshots identify the exact
 admitted session without exposing separate principal evidence. M3.5B3A client presence state remains pending.
+M3.5B3A is complete: a bounded generation-fenced client presence authority consumes strict snapshots
+and deltas, resolves authenticated self evidence, and exposes grouped ephemeral state without visual UI.
+Avatar roster and live cursor rendering remain pending.
