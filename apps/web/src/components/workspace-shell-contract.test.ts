@@ -35,6 +35,16 @@ describe("layered studio shell contract", () => {
     expect(workspace).not.toContain("redo");
   });
 
+  it("keeps compact shared rotation controls fenced to the current eligible selection", () => {
+    expect(workspace).toContain("<RotationControls");
+    expect(workspace).toContain("rotationAvailable && selectedObject");
+    expect(workspace).toContain("rotationControlsHadFocus");
+    expect(workspace).toContain("layersTrigger.current?.focus()");
+    expect(workspace).toContain(
+      'rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}`}',
+    );
+  });
+
   it("keeps home, synchronization, terminal feedback, and diagnostics reachable", () => {
     expect(workspace).toContain('href="/" aria-label="Converge home"');
     expect(workspace).toContain("WorkspaceEntryStatus");

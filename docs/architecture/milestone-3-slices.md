@@ -206,6 +206,12 @@ adjustment; exact ties prefer visible-object references over grid, then lexical 
 reference anchor, moving anchor, and signed adjustment. Object identities are implementation-only and
 never appear in product or accessibility UI.
 
+Rotation uses the existing authoritative `object.transform.rotation` field. UI-originated angles are
+finite, normalized into `[0, 360)`, and canonicalize negative zero to zero. Pointer rotation is free
+by default; holding Shift rounds its local preview to the nearest 15 degrees. Rotation never invokes
+positional snapping, and exactly one transform command is emitted only when a valid rotation gesture
+ends.
+
 **Likely files**
 
 - `apps/web/src/components/canvas.tsx`, `apps/web/src/canvas/*`, `apps/web/src/layers/*`

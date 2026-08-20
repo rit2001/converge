@@ -4,9 +4,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Layer, Line, Rect, Stage, Text, Transformer } from "react-konva";
 import type Konva from "konva";
 import type { CanvasObject } from "@converge/protocol";
+import { normalizeRotation, rotationLabel, rotationPreviewAngle } from "../canvas/rotation";
 import { CANVAS_GRID_SPACING, type AlignmentGuide, snapObjectPosition } from "../canvas/snapping";
 
 const EMPTY_OBJECT_IDS: ReadonlySet<string> = new Set();
+
+interface RotationPreview {
+  id: string;
+  angle: number;
+}
 
 interface Props {
   objects: CanvasObject[];
@@ -17,8 +23,10 @@ interface Props {
   onSelect: (id: string | null) => void;
   onTransform: (
     id: string,
-    patch: { x: number; y: number; width?: number; height?: number },
+    patch: { x?: number; y?: number; width?: number; height?: number; rotation?: number },
   ) => void;
+  rotationEnabled?: boolean;
+  rotationFence?: string;
 }
 
 export function Canvas({
@@ -29,6 +37,8 @@ export function Canvas({
   tool,
   onSelect,
   onTransform,
+  rotationEnabled = false,
+  rotationFence = "initial",
 }: Props): React.JSX.Element {
   const [viewport, setViewport] = useState({ width: 900, height: 600 });
   const [stage, setStage] = useState({ x: 0, y: 0, scale: 1 });
@@ -37,9 +47,15 @@ export function Canvas({
   const transformerRef = useRef<Konva.Transformer>(null);
   const activeDragId = useRef<string | null>(null);
   const cancelledDragId = useRef<string | null>(null);
+  const rotationGesture = useRef<{ id: string; fence: string } | null>(null);
+  const rotationInteraction = useRef<{ id: string; fence: string } | null>(null);
+  const fencedRotationId = useRef<string | null>(null);
   const [guides, setGuides] = useState<AlignmentGuide[]>([]);
   const [guideReferenceIds, setGuideReferenceIds] = useState<string[]>([]);
   const [guideStroke, setGuideStroke] = useState("#1769aa");
+  const [rotationFeedbackStroke, setRotationFeedbackStroke] = useState("#5146d8");
+  const [rotationHandleFill, setRotationHandleFill] = useState("#ffffff");
+  const [rotationPreview, setRotationPreview] = useState<RotationPreview | null>(null);
   const visibleObjects = useMemo(
     () => objects.filter((object) => !hiddenObjectIds.has(object.id)),
     [hiddenObjectIds, objects],
@@ -57,6 +73,31 @@ export function Canvas({
     guideReferenceIds.every((id) => visibleObjectIds.has(id))
       ? guides
       : [];
+  const canRotate = Boolean(
+    rotationEnabled &&
+      tool === "select" &&
+      selectedId &&
+      visibleObjectIds.has(selectedId) &&
+      !lockedObjectIds.has(selectedId),
+  );
+  const latestRotationState = useRef({
+    selectedId,
+    visibleObjectIds,
+    lockedObjectIds,
+    canRotate,
+    rotationFence,
+  });
+  latestRotationState.current = {
+    selectedId,
+    visibleObjectIds,
+    lockedObjectIds,
+    canRotate,
+    rotationFence,
+  };
+  const rotationPreviewObject =
+    rotationPreview && rotationPreview.id === selectedId && canRotate
+      ? visibleObjects.find((object) => object.id === rotationPreview.id)
+      : undefined;
 
   useEffect(() => {
     const resize = (): void => {
@@ -85,29 +126,60 @@ export function Canvas({
     clearGuides();
   }, [clearGuides, hiddenObjectIds, lockedObjectIds, objects, tool]);
 
+  const clearRotationPreview = useCallback(() => {
+    rotationInteraction.current = null;
+    setRotationPreview((current) => (current === null ? current : null));
+  }, []);
+
+  const fenceRotationPreview = useCallback(() => {
+    fencedRotationId.current =
+      rotationInteraction.current?.id ?? rotationGesture.current?.id ?? fencedRotationId.current;
+    rotationGesture.current = null;
+    clearRotationPreview();
+  }, [clearRotationPreview]);
+
   useEffect(() => {
-    const updateGuideStroke = (): void => {
-      if (!container.current) return;
-      const token =
-        getComputedStyle(container.current).getPropertyValue("--color-alignment-guide").trim() ||
-        "#1769aa";
+    fenceRotationPreview();
+  }, [
+    canRotate,
+    fenceRotationPreview,
+    hiddenObjectIds,
+    lockedObjectIds,
+    objects,
+    rotationFence,
+    selectedId,
+  ]);
+
+  useEffect(() => {
+    const resolveCanvasToken = (name: string, fallback: string): string => {
+      if (!container.current) return fallback;
+      const token = getComputedStyle(container.current).getPropertyValue(name).trim() || fallback;
       const probe = document.createElement("span");
       probe.style.color = token;
       container.current.append(probe);
       const resolved = getComputedStyle(probe).color;
       probe.remove();
-      setGuideStroke(resolved || "#1769aa");
+      return resolved || fallback;
     };
-    updateGuideStroke();
+    const updateCanvasStrokes = (): void => {
+      if (!container.current) return;
+      setGuideStroke(resolveCanvasToken("--color-alignment-guide", "#1769aa"));
+      setRotationFeedbackStroke(resolveCanvasToken("--color-rotation-feedback", "#5146d8"));
+      setRotationHandleFill(resolveCanvasToken("--color-rotation-handle-fill", "#ffffff"));
+    };
+    updateCanvasStrokes();
     const forcedColors = window.matchMedia("(forced-colors: active)");
-    forcedColors.addEventListener("change", updateGuideStroke);
-    return () => forcedColors.removeEventListener("change", updateGuideStroke);
+    forcedColors.addEventListener("change", updateCanvasStrokes);
+    return () => forcedColors.removeEventListener("change", updateCanvasStrokes);
   }, []);
 
   useEffect(
     () => () => {
       activeDragId.current = null;
       cancelledDragId.current = null;
+      rotationGesture.current = null;
+      rotationInteraction.current = null;
+      fencedRotationId.current = null;
     },
     [],
   );
@@ -140,6 +212,7 @@ export function Canvas({
         onPointerCancel={() => {
           cancelledDragId.current = activeDragId.current;
           clearGuides();
+          fenceRotationPreview();
         }}
         onPointerDown={(event) => {
           if (event.target === event.target.getStage()) onSelect(null);
@@ -215,11 +288,69 @@ export function Canvas({
                 onTransformEnd={(event) => {
                   if (locked) return;
                   const node = event.target;
+                  if (fencedRotationId.current === object.id) {
+                    fencedRotationId.current = null;
+                    return;
+                  }
+                  const gesture = rotationGesture.current;
+                  if (gesture?.id === object.id) {
+                    rotationGesture.current = null;
+                    const interaction = rotationInteraction.current;
+                    const latest = latestRotationState.current;
+                    const canCommitRotation =
+                      interaction?.fence === latest.rotationFence &&
+                      latest.canRotate &&
+                      latest.selectedId === object.id &&
+                      latest.visibleObjectIds.has(object.id) &&
+                      !latest.lockedObjectIds.has(object.id);
+                    const rotation = normalizeRotation(node.rotation());
+                    node.rotation(rotation);
+                    clearRotationPreview();
+                    if (interaction && canCommitRotation) onTransform(object.id, { rotation });
+                    return;
+                  }
+                  const interaction = rotationInteraction.current;
+                  const latest = latestRotationState.current;
+                  if (interaction?.id === object.id) {
+                    const canCommitRotation =
+                      interaction.fence === latest.rotationFence &&
+                      latest.canRotate &&
+                      latest.selectedId === object.id &&
+                      latest.visibleObjectIds.has(object.id) &&
+                      !latest.lockedObjectIds.has(object.id);
+                    const rotation = normalizeRotation(node.rotation());
+                    node.rotation(rotation);
+                    clearRotationPreview();
+                    fencedRotationId.current = null;
+                    if (canCommitRotation) onTransform(object.id, { rotation });
+                    return;
+                  }
                   const width = Math.max(8, object.width * node.scaleX());
                   const height = Math.max(8, object.height * node.scaleY());
                   node.scaleX(1);
                   node.scaleY(1);
                   onTransform(object.id, { x: node.x(), y: node.y(), width, height });
+                }}
+                onTransform={(event) => {
+                  if (!canRotate || selectedId !== object.id || locked) return;
+                  const node = event.target;
+                  const shiftKey = (event.evt as MouseEvent).shiftKey;
+                  const angle = rotationPreviewAngle(node.rotation(), shiftKey);
+                  if (angle === normalizeRotation(object.rotation)) return;
+                  node.rotation(angle);
+                  fencedRotationId.current = null;
+                  rotationInteraction.current = { id: object.id, fence: rotationFence };
+                  setRotationPreview({ id: object.id, angle });
+                }}
+                onTransformStart={() => {
+                  if (
+                    canRotate &&
+                    selectedId === object.id &&
+                    !locked &&
+                    transformerRef.current?.getActiveAnchor() === "rotater"
+                  ) {
+                    rotationGesture.current = { id: object.id, fence: rotationFence };
+                  }
                 }}
               >
                 <Rect
@@ -250,14 +381,29 @@ export function Canvas({
         </Layer>
         <Layer name="canvas-controls">
           <AlignmentGuides guides={renderedGuides} stroke={guideStroke} />
+          {rotationPreviewObject && rotationPreview && (
+            <Text
+              text={rotationLabel(rotationPreview.angle)}
+              x={rotationPreviewObject.x + rotationPreviewObject.width / 2}
+              y={rotationPreviewObject.y - 30 / stage.scale}
+              offsetX={18 / stage.scale}
+              fontSize={12 / stage.scale}
+              fontStyle="bold"
+              fill={rotationFeedbackStroke}
+              listening={false}
+              perfectDrawEnabled={false}
+            />
+          )}
           <Transformer
             ref={transformerRef}
-            rotateEnabled={false}
+            rotateEnabled={canRotate}
             flipEnabled={false}
-            borderStroke="#4f46e5"
-            anchorStroke="#4f46e5"
-            anchorFill="#ffffff"
-            anchorSize={10}
+            borderStroke={rotationFeedbackStroke}
+            anchorStroke={rotationFeedbackStroke}
+            anchorFill={rotationHandleFill}
+            anchorSize={10 / stage.scale}
+            rotateAnchorOffset={20 / stage.scale}
+            rotateAnchorCursor="crosshair"
             boundBoxFunc={(oldBox, newBox) =>
               newBox.width < 24 || newBox.height < 24 ? oldBox : newBox
             }

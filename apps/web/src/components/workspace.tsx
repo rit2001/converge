@@ -16,11 +16,13 @@ import {
   type BoardSessionToken,
 } from "../board-session";
 import { useBoardStore } from "../board-store";
+import { normalizeRotation } from "../canvas/rotation";
 import { indexedDbPendingOperationStore } from "../pending-db";
 import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
 import { IconButton, Separator, StatusPill, Tooltip } from "./ui/primitives";
 import { LayersPanel } from "./layers-panel";
+import { RotationControls } from "./rotation-controls";
 import { toneForSynchronization, WorkspaceEntryStatus } from "./workspace-entry-status";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
@@ -146,8 +148,20 @@ export function Workspace(): React.JSX.Element {
   const [diagnostics, setDiagnostics] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
   const layersTrigger = useRef<HTMLButtonElement>(null);
+  const rotationControlsHadFocus = useRef(false);
   const selectedObjectLocked = Boolean(
     store.selectedId && store.lockedObjectIds.has(store.selectedId),
+  );
+  const selectedObject = useMemo(
+    () => store.objects.find((object) => object.id === store.selectedId),
+    [store.objects, store.selectedId],
+  );
+  const rotationAvailable = Boolean(
+    selectedObject &&
+      store.boardId &&
+      store.connection === "ready" &&
+      !store.hiddenObjectIds.has(selectedObject.id) &&
+      !store.lockedObjectIds.has(selectedObject.id),
   );
   const hasLocalViewControls = store.hiddenObjectIds.size > 0 || store.lockedObjectIds.size > 0;
 
@@ -213,7 +227,7 @@ export function Workspace(): React.JSX.Element {
   };
   const transform = (
     targetId: string,
-    payload: { x: number; y: number; width?: number; height?: number },
+    payload: { x?: number; y?: number; width?: number; height?: number; rotation?: number },
   ): void => {
     if (!store.boardId || store.lockedObjectIds.has(targetId)) return;
     void submit({
@@ -221,6 +235,10 @@ export function Workspace(): React.JSX.Element {
       type: "object.transform",
       payload,
     });
+  };
+  const rotateSelected = (rotation: number): void => {
+    if (!rotationAvailable || !selectedObject || store.selectedId !== selectedObject.id) return;
+    transform(selectedObject.id, { rotation: normalizeRotation(rotation) });
   };
   const remove = (): void => {
     if (!store.boardId || !store.selectedId || store.lockedObjectIds.has(store.selectedId)) return;
@@ -269,6 +287,12 @@ export function Workspace(): React.JSX.Element {
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
   }, [diagnostics, layersOpen]);
+
+  useEffect(() => {
+    if (rotationAvailable || !rotationControlsHadFocus.current) return;
+    rotationControlsHadFocus.current = false;
+    requestAnimationFrame(() => layersTrigger.current?.focus());
+  }, [rotationAvailable]);
 
   return (
     <main className="workspace studio-shell" aria-label="Converge studio">
@@ -355,6 +379,16 @@ export function Workspace(): React.JSX.Element {
             </IconButton>
           </Tooltip>
           <Separator />
+          {rotationAvailable && selectedObject && (
+            <RotationControls
+              object={selectedObject}
+              onRotate={rotateSelected}
+              onFocusWithinChange={(focused) => {
+                rotationControlsHadFocus.current = focused;
+              }}
+            />
+          )}
+          {rotationAvailable && selectedObject && <Separator />}
           <Tooltip label="Delete selected">
             <IconButton
               className="workspace-tool-button"
@@ -375,6 +409,8 @@ export function Workspace(): React.JSX.Element {
           hiddenObjectIds={store.hiddenObjectIds}
           lockedObjectIds={store.lockedObjectIds}
           tool={tool}
+          rotationEnabled={rotationAvailable}
+          rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}`}
           onSelect={(id) => store.select(id)}
           onTransform={transform}
         />

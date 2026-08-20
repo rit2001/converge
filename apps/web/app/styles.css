@@ -61,6 +61,8 @@
   --color-canvas-grid-dot: #c8cdd7;
   --color-canvas-grid-major: #aeb5c3;
   --color-alignment-guide: #1769aa;
+  --color-rotation-feedback: #5146d8;
+  --color-rotation-handle-fill: #ffffff;
   --canvas-grid-size: 22px;
   --canvas-grid-offset: 0 0;
 
@@ -172,6 +174,8 @@
   --color-canvas-grid-dot: #3a3f4c;
   --color-canvas-grid-major: #505666;
   --color-alignment-guide: #6fc7ff;
+  --color-rotation-feedback: #beb8ff;
+  --color-rotation-handle-fill: #242733;
 }
 
 * {
@@ -1254,6 +1258,22 @@ button {
   gap: var(--space-1, 4px);
 }
 
+.rotation-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1, 4px);
+}
+
+.rotation-controls__shared-note {
+  max-width: var(--space-10, 40px);
+  color: var(--color-text-muted, #6b7280);
+  font-size: 0.625rem;
+  font-weight: var(--font-weight-semibold, 650);
+  line-height: 1.1;
+  text-align: center;
+}
+
 .workspace-tool-button svg {
   width: var(--icon-size-medium, 20px);
   height: var(--icon-size-medium, 20px);
@@ -1704,6 +1724,8 @@ button {
 @media (forced-colors: active) {
   :root {
     --color-alignment-guide: CanvasText;
+    --color-rotation-feedback: CanvasText;
+    --color-rotation-handle-fill: Canvas;
     --color-canvas-grid-dot: CanvasText;
   }
 
