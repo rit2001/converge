@@ -15,7 +15,7 @@ import {
   type BoardSessionHandle,
   type BoardSessionToken,
 } from "../board-session";
-import { useBoardStore, visibleInLocalView } from "../board-store";
+import { useBoardStore } from "../board-store";
 import { indexedDbPendingOperationStore } from "../pending-db";
 import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
@@ -146,10 +146,6 @@ export function Workspace(): React.JSX.Element {
   const [diagnostics, setDiagnostics] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
   const layersTrigger = useRef<HTMLButtonElement>(null);
-  const canvasObjects = useMemo(
-    () => visibleInLocalView(store.objects, store.hiddenObjectIds),
-    [store.hiddenObjectIds, store.objects],
-  );
   const selectedObjectLocked = Boolean(
     store.selectedId && store.lockedObjectIds.has(store.selectedId),
   );
@@ -374,8 +370,9 @@ export function Workspace(): React.JSX.Element {
       </aside>
       <section id="studio-canvas-region" className="studio-canvas-region" aria-label="Board canvas">
         <Canvas
-          objects={canvasObjects}
+          objects={store.objects}
           selectedId={store.selectedId}
+          hiddenObjectIds={store.hiddenObjectIds}
           lockedObjectIds={store.lockedObjectIds}
           tool={tool}
           onSelect={(id) => store.select(id)}

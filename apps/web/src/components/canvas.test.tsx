@@ -1,12 +1,15 @@
+// @vitest-environment jsdom
+
 import * as React from "react";
-import { createElement, type ReactNode } from "react";
+import { act, createElement, type ReactNode } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { Group, Stage, Transformer } from "react-konva";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Group, Line, Stage, Transformer } from "react-konva";
 import type { BoardSnapshot, CanvasObject, CommittedOperation } from "@converge/protocol";
 import type { BoardSessionToken } from "../board-session";
 import { createBoardStore } from "../board-store";
-import { Canvas } from "./canvas";
+import { AlignmentGuides, Canvas } from "./canvas";
 
 vi.mock("react-konva", async () => {
   const React = await import("react");
@@ -22,6 +25,7 @@ vi.mock("react-konva", async () => {
       React.createElement(React.Fragment, null, children),
     ),
     Layer: Container,
+    Line: vi.fn(() => React.createElement("i", { "data-alignment-guide": "" })),
     Rect: vi.fn(() => null),
     Stage: vi.fn(({ children }: { children?: ReactNode }) =>
       React.createElement(React.Fragment, null, children),
@@ -57,6 +61,12 @@ const sticky: CanvasObject = {
 };
 
 let generation = 0;
+let root: ReturnType<typeof createRoot> | null = null;
+
+const reactTestEnvironment = globalThis as typeof globalThis & {
+  IS_REACT_ACT_ENVIRONMENT: boolean;
+};
+reactTestEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
 
 function token(): BoardSessionToken {
   generation += 1;
@@ -88,6 +98,15 @@ interface RenderedGroupProps {
   rotation?: number;
   draggable: boolean;
   onClick: () => void;
+  onDragStart: () => void;
+  onDragMove: (event: {
+    evt: { altKey: boolean };
+    target: {
+      x: () => number;
+      y: () => number;
+      position: (value: { x: number; y: number }) => void;
+    };
+  }) => void;
   onDragEnd: (event: { target: { x: () => number; y: () => number } }) => void;
   onTransformEnd: (event: {
     target: {
@@ -105,14 +124,17 @@ function renderCanvas(
   onTransform: (id: string, patch: object) => void = vi.fn(),
   onSelect: (id: string | null) => void = vi.fn(),
   lockedObjectIds: ReadonlySet<string> = new Set(),
+  hiddenObjectIds: ReadonlySet<string> = new Set(),
 ): RenderedGroupProps[] {
   vi.mocked(Group).mockClear();
   vi.mocked(Transformer).mockClear();
   vi.mocked(Stage).mockClear();
+  vi.mocked(Line).mockClear();
   renderToStaticMarkup(
     createElement(Canvas, {
       objects,
       selectedId,
+      hiddenObjectIds,
       lockedObjectIds,
       tool: "select",
       onSelect,
@@ -128,7 +150,21 @@ function snapshot(objects: CanvasObject[]): BoardSnapshot {
 
 beforeEach(() => {
   vi.stubGlobal("React", React);
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe(): void {}
+      disconnect(): void {}
+    },
+  );
+  vi.stubGlobal("matchMedia", () => ({ addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   vi.clearAllMocks();
+});
+
+afterEach(() => {
+  void act(() => root?.unmount());
+  root = null;
+  document.body.replaceChildren();
 });
 
 describe("authoritative canvas rotation", () => {
@@ -254,5 +290,144 @@ describe("canvas selection boundary", () => {
 
     expect(onSelect).not.toHaveBeenCalled();
     expect(onTransform).not.toHaveBeenCalled();
+  });
+
+  it("keeps snapped drag previews local and commits their exact final position once", () => {
+    const reference = { ...sticky, id: "30000000-0000-4000-8000-000000000099", x: 300, y: 210 };
+    const onTransform = vi.fn();
+    const [group] = renderCanvas(
+      [rectangle, reference],
+      rectangle.id,
+      onTransform,
+      vi.fn(),
+      new Set([reference.id]),
+    );
+    let position = { x: 137, y: 107 };
+    const target = {
+      x: () => position.x,
+      y: () => position.y,
+      position: (next: { x: number; y: number }) => {
+        position = next;
+      },
+    };
+
+    group?.onDragStart();
+    group?.onDragMove({ evt: { altKey: false }, target });
+    group?.onDragMove({ evt: { altKey: false }, target });
+
+    expect(position).toEqual({ x: 140, y: 110 });
+    expect(onTransform).not.toHaveBeenCalled();
+    group?.onDragEnd({ target });
+    expect(onTransform).toHaveBeenCalledTimes(1);
+    expect(onTransform).toHaveBeenCalledWith(rectangle.id, { x: 140, y: 110 });
+  });
+
+  it("bypasses snapping while Option/Alt is held", () => {
+    const reference = { ...sticky, id: "30000000-0000-4000-8000-000000000099", x: 300, y: 210 };
+    const onTransform = vi.fn();
+    const [group] = renderCanvas([rectangle, reference], rectangle.id, onTransform);
+    const position = { x: 137, y: 107 };
+    const target = {
+      x: () => position.x,
+      y: () => position.y,
+      position: vi.fn(),
+    };
+
+    group?.onDragStart();
+    group?.onDragMove({ evt: { altKey: true }, target });
+    group?.onDragEnd({ target });
+
+    expect(target.position).not.toHaveBeenCalled();
+    expect(onTransform).toHaveBeenCalledWith(rectangle.id, position);
+  });
+
+  it("renders guide lines as non-interactive canvas controls without identifiers", () => {
+    renderToStaticMarkup(
+      createElement(AlignmentGuides, {
+        guides: [{ axis: "vertical", coordinate: 300, from: 10, to: 200 }],
+      }),
+    );
+
+    expect(vi.mocked(Line).mock.calls[0]?.[0]).toMatchObject({
+      points: [300, 10, 300, 200],
+      listening: false,
+      perfectDrawEnabled: false,
+    });
+    expect(vi.mocked(Line).mock.calls[0]?.[0]).not.toHaveProperty("id");
+  });
+
+  it("clears local guides at every drag termination and replacement boundary", () => {
+    const reference = { ...sticky, id: "30000000-0000-4000-8000-000000000099", x: 300, y: 210 };
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const render = (objects: CanvasObject[], hiddenObjectIds = new Set<string>()): void => {
+      void act(() => {
+        root?.render(
+          <Canvas
+            objects={objects}
+            selectedId={rectangle.id}
+            hiddenObjectIds={hiddenObjectIds}
+            tool="select"
+            onSelect={vi.fn()}
+            onTransform={vi.fn()}
+          />,
+        );
+      });
+    };
+    const currentGroup = (): RenderedGroupProps =>
+      vi
+        .mocked(Group)
+        .mock.calls.map(([props]) => props as unknown as RenderedGroupProps)
+        .reverse()
+        .find((props) => props.id === `object-${rectangle.id}`)!;
+    const drag = (): void => {
+      let position = { x: 137, y: 107 };
+      const target = {
+        x: () => position.x,
+        y: () => position.y,
+        position: (next: { x: number; y: number }) => {
+          position = next;
+        },
+      };
+      void act(() => {
+        currentGroup().onDragStart();
+        currentGroup().onDragMove({ evt: { altKey: false }, target });
+      });
+    };
+
+    render([rectangle, reference]);
+    drag();
+    expect(host.querySelectorAll("[data-alignment-guide]")).toHaveLength(2);
+
+    void act(() => currentGroup().onDragEnd({ target: { x: () => 140, y: () => 110 } }));
+    expect(host.querySelectorAll("[data-alignment-guide]")).toHaveLength(0);
+
+    drag();
+    const stage = vi.mocked(Stage).mock.calls.at(-1)?.[0] as {
+      onPointerCancel: () => void;
+    };
+    void act(() => stage.onPointerCancel());
+    expect(host.querySelectorAll("[data-alignment-guide]")).toHaveLength(0);
+
+    drag();
+    render([reference]);
+    expect(host.querySelectorAll("[data-alignment-guide]")).toHaveLength(0);
+
+    render([rectangle, reference]);
+    drag();
+    render([rectangle, reference], new Set([reference.id]));
+    expect(host.querySelectorAll("[data-alignment-guide]")).toHaveLength(0);
+
+    render([rectangle, reference]);
+    drag();
+    render([]);
+    expect(host.querySelectorAll("[data-alignment-guide]")).toHaveLength(0);
+
+    render([rectangle, reference]);
+    drag();
+    void act(() => root?.unmount());
+    root = null;
+    expect(host.querySelectorAll("[data-alignment-guide]")).toHaveLength(0);
   });
 });

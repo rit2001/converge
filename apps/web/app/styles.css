@@ -60,7 +60,9 @@
 
   --color-canvas-grid-dot: #c8cdd7;
   --color-canvas-grid-major: #aeb5c3;
+  --color-alignment-guide: #1769aa;
   --canvas-grid-size: 22px;
+  --canvas-grid-offset: 0 0;
 
   --space-0: 0;
   --space-0-5: 2px;
@@ -169,6 +171,7 @@
   --color-canvas-focus: #beb8ff;
   --color-canvas-grid-dot: #3a3f4c;
   --color-canvas-grid-major: #505666;
+  --color-alignment-guide: #6fc7ff;
 }
 
 * {
@@ -1266,11 +1269,13 @@ button {
 .canvas-shell {
   position: absolute;
   inset: 0;
+  background-image: radial-gradient(var(--color-canvas-grid-dot, #c8cdd7) 1px, transparent 1px);
+  background-position: var(--canvas-grid-offset, 0 0);
+  background-size: var(--canvas-grid-size, 22px) var(--canvas-grid-size, 22px);
 }
 
 .canvas-shell canvas {
-  background-image: radial-gradient(var(--color-canvas-grid-dot, #c8cdd7) 1px, transparent 1px);
-  background-size: var(--canvas-grid-size, 22px) var(--canvas-grid-size, 22px);
+  background: transparent;
 }
 
 .zoom-pill {
@@ -1697,6 +1702,11 @@ button {
 }
 
 @media (forced-colors: active) {
+  :root {
+    --color-alignment-guide: CanvasText;
+    --color-canvas-grid-dot: CanvasText;
+  }
+
   :root {
     --color-border-focus: Highlight;
     --focus-ring-color: Highlight;

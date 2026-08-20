@@ -54,6 +54,7 @@ const requiredTokens = [
   "--focus-ring-offset",
   "--focus-ring-color",
   "--color-canvas-grid-dot",
+  "--color-alignment-guide",
   "--canvas-grid-size",
 ] as const;
 
@@ -108,6 +109,7 @@ describe("premium foundation contract", () => {
     expect(styles).toContain("animation-iteration-count: 1 !important");
     expect(styles).toContain("@media (forced-colors: active)");
     expect(styles).toContain("forced-color-adjust");
+    expect(styles).toContain("--color-alignment-guide: CanvasText");
   });
 
   it("defines dark-compatible semantic overrides without activating a switcher", () => {

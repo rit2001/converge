@@ -194,6 +194,18 @@ remain immediate while durable mutations occur only at bounded interaction bound
   reducer, repository, snapshot, recovery, and concurrency policy exists.
 - Multi-selection ships only with approved batch/partial-failure semantics.
 
+**Canvas grid and snapping contract**
+
+The M3 canvas grid is an infinite 22-by-22 world-unit lattice anchored at `(0, 0)`; viewport pan and
+zoom only change its presentation. Drag snapping aligns an object's leading edge to that lattice and
+aligns leading edge, center, and trailing edge against the logical axis-aligned bounds of visible
+objects. The tolerance is 8 CSS screen pixels, converted to world units by dividing by current
+viewport scale. Axes resolve independently, Option/Alt bypasses snapping for the current pointer
+sample, and resize snapping is out of scope. Per-axis candidates choose the smallest screen-space
+adjustment; exact ties prefer visible-object references over grid, then lexical object identity,
+reference anchor, moving anchor, and signed adjustment. Object identities are implementation-only and
+never appear in product or accessibility UI.
+
 **Likely files**
 
 - `apps/web/src/components/canvas.tsx`, `apps/web/src/canvas/*`, `apps/web/src/layers/*`
