@@ -191,4 +191,9 @@ network behavior. Automated checks support, but do not claim, full manual access
 M3.8A1 production-topology smoke is complete: a test-owned single-replica harness uses local durable
 delivery, disabled presence, a disposable migrated PostgreSQL database, dynamic ports, an isolated
 production Next build/start, and an authoritative deterministic 100-object fixture. It is harness
-correctness evidence only; the official 100/500/1,000 local reference measurement remains pending.
+correctness evidence only. M3.8A2 is closed as an unaccepted bounded measurement attempt: its diagnostic
+rendered exact 100/500/1,000 object counts without page errors, hydration errors, or horizontal overflow,
+but defective selection timing invalidated latency acceptance. No frontend-latency or 1,000-object
+performance guarantee is claimed, and M3 will not spend further work on this measurement. Deterministic
+bundle budgets remain independently enforced; production-capacity certification is future
+deployment/load work.

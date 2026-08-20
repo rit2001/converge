@@ -232,8 +232,11 @@ and migration review and is not silently bundled into visual polish.
 | Cleanup          | Board/session replacement releases Konva nodes, observers, global listeners, timers, pending request controllers, portals, and presence buffers | Repeated replacement tests and heap/listener snapshots.                 |
 | Pointer network  | Zero requests per raw pointer event. Durable commands occur at interaction boundaries; presence is explicitly batched/rate-limited.             | Request counter in interaction tests.                                   |
 
-Budgets are engineering acceptance targets, not measured capacity claims. Reference hardware,
-browser version, fixture seed, viewport, DPR, and production build must accompany measurements.
+Budgets are engineering acceptance targets, not measured capacity claims. The production-build bundle
+budgets have a deterministic manifest/gzip checker. M3.8A2 browser timing was closed as an unaccepted
+attempt and supplies no latency, frame-rate, or 1,000-object guarantee. Reference hardware, browser
+version, fixture seed, viewport, DPR, and production build must accompany any future measurement;
+production-capacity certification remains deployment/load work.
 
 ## Testing strategy
 
@@ -276,6 +279,7 @@ browser version, fixture seed, viewport, DPR, and production build must accompan
 M3 is complete when the approved product surfaces use one tokenized visual system; the workspace
 follows the layered ownership model; core canvas and layers interactions are accessible and tested;
 collaboration and synchronization states distinguish local, acknowledged, delivered, and recovered
-evidence; responsive/theme policy is implemented; performance budgets have reproducible evidence;
+evidence; responsive/theme policy is implemented; deterministic bundle budgets remain reproducible and
+unaccepted browser measurements remain truthfully excluded from performance claims;
 and Chromium/Firefox/WebKit acceptance passes. Any deferred durable capability remains visibly
 absent or truthfully labeled, never simulated as collaborative state.

@@ -648,7 +648,23 @@ cardinality. Forced partial startup and normal teardown both remove the database
 processes, browser contexts, and any PostgreSQL service started by the harness.
 
 This is a deterministic harness smoke, not accepted performance evidence, capacity evidence, or an
-SLA. The official 100/500/1,000-object measurement and sanitized result artifacts remain pending.
+SLA. The 100/500/1,000-object measurement was attempted in M3.8A2 and is closed below.
+
+### M3.8A2 bounded measurement closure
+
+M3.8A2 is closed as an unaccepted measurement attempt and will not be rerun during M3. The first
+diagnostic rendered exact 100, 500, and 1,000-object Layers counts with no page errors, hydration errors,
+or horizontal overflow, but its selection metric included Playwright action duration and its browser
+durations were not normalized before threshold comparison. A single corrected attempt then failed its
+non-negative selection-duration invariant because an animation-frame timestamp could precede a pointer
+event later in that frame. Neither attempt supports frontend-latency, frame-rate, 1,000-object
+performance, concurrency, capacity, or SLA claims.
+
+The executable multi-tier runner and defective timing probe were removed. The repository retains only
+two sanitized `UNACCEPTED.md` records and an independently tested production-build bundle checker. The
+checker enforces landing JavaScript, studio JavaScript, and initial CSS gzip budgets with strict
+schema/privacy validation. Production-capacity certification remains future deployment/load work with a
+separately approved measurement environment. M3 will not spend further work on this measurement.
 
 **Preconditions**
 
