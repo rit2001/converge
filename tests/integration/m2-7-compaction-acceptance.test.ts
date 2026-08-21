@@ -472,6 +472,7 @@ describe("M2.7 bounded destructive compaction acceptance", () => {
     });
     transport.connect();
     await vi.waitFor(() => expect(useBoardStore.getState().connection).toBe("retry-wait"));
+    await vi.waitFor(() => expect(useBoardStore.getState().authoritativeHash.status).toBe("ready"));
     expect(useBoardStore.getState()).toMatchObject({
       committed: { lastSeq: 3, order: [rectangle.targetId, sticky.targetId] },
       objects: [
