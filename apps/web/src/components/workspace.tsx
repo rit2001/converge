@@ -1,7 +1,8 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { visibleObjects } from "@converge/canvas-engine";
 import {
   boardSnapshotSchema,
@@ -15,8 +16,30 @@ import {
   type BoardSessionToken,
 } from "../board-session";
 import { useBoardStore } from "../board-store";
+import { normalizeRotation } from "../canvas/rotation";
 import { indexedDbPendingOperationStore } from "../pending-db";
+import { scheduleOwnedSessionStart } from "../owned-session-start";
 import { API_URL, BoardTransport, SynchronizationError } from "../transport";
+import { IconButton, Separator, Tooltip } from "./ui/primitives";
+import { LayersPanel } from "./layers-panel";
+import { RotationControls } from "./rotation-controls";
+import { WorkspaceEntryStatus } from "./workspace-entry-status";
+import { deriveSynchronizationPresentation } from "../synchronization-presentation";
+import { SynchronizationStatus } from "./synchronization-status";
+import { CollaboratorPresence } from "./collaborator-presence";
+import { CommandPalette } from "./command-palette";
+import { createWorkspaceCommands, type CommandId } from "../commands";
+import { StudioHelp } from "./studio-help";
+import { ShareDialog } from "./share-dialog";
+import {
+  CanvasActionAnnouncer,
+  nextCanvasAnnouncement,
+  type CanvasAnnouncement,
+} from "../canvas-action-announcer";
+import { readOnboarding, writeOnboarding, type OnboardingState } from "../onboarding";
+import type { PresenceSnapshot, PresenceStore } from "../presence-store";
+import { useEditorCapability } from "../editor-capability";
+import { useTheme } from "../theme-provider";
 
 const Canvas = dynamic(() => import("./canvas").then((module) => module.Canvas), { ssr: false });
 
@@ -32,9 +55,62 @@ function commandBase(boardId: string, clientId: string, targetId: string, lastSe
   };
 }
 
-export function Workspace(): React.JSX.Element {
+function ToolIcon({
+  name,
+}: {
+  name: "select" | "pan" | "rectangle" | "sticky" | "delete" | "layers";
+}) {
+  const shared = { fill: "none", stroke: "currentColor", strokeWidth: 1.75 };
+  if (name === "select")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path {...shared} d="m5 3 14 8-7 2-3 7-4-17Z" />
+      </svg>
+    );
+  if (name === "pan")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path
+          {...shared}
+          d="M8 12V6a2 2 0 0 1 4 0v5m0 1V4a2 2 0 0 1 4 0v8m0 0V7a2 2 0 0 1 4 0v8c0 4-3 6-7 6h-2c-2 0-3-1-4-3l-2-4a2 2 0 0 1 3-2l2 2"
+        />
+      </svg>
+    );
+  if (name === "rectangle")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <rect {...shared} x="4" y="6" width="16" height="12" rx="2" />
+      </svg>
+    );
+  if (name === "sticky")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path {...shared} d="M6 4h12v12l-4 4H6V4Z" />
+        <path {...shared} d="M14 20v-4h4M9 9h6M9 13h4" />
+      </svg>
+    );
+  if (name === "layers")
+    return (
+      <svg aria-hidden="true" viewBox="0 0 24 24">
+        <path {...shared} d="M5 7h14M5 12h14M5 17h14" />
+        <circle {...shared} cx="7" cy="7" r="1" />
+        <circle {...shared} cx="7" cy="12" r="1" />
+        <circle {...shared} cx="7" cy="17" r="1" />
+      </svg>
+    );
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path {...shared} d="M5 7h14M10 11v6m4-6v6M9 7l1-3h4l1 3m-9 0 1 13h10l1-13" />
+    </svg>
+  );
+}
+
+export function Workspace({
+  requestedBoardId,
+}: { requestedBoardId?: string } = {}): React.JSX.Element {
   const store = useBoardStore();
   const clientId = useMemo(() => crypto.randomUUID(), []);
+  const [presenceStore, setPresenceStore] = useState<PresenceStore | null>(null);
   const session = useRef<BoardSessionHandle | null>(null);
   const sessions = useMemo(() => {
     const loadSnapshot = async (boardId: string, signal: AbortSignal): Promise<BoardSnapshot> => {
@@ -80,43 +156,127 @@ export function Workspace(): React.JSX.Element {
           throw new Error("LOCAL_PERSISTENCE_ERROR: Pending storage is unavailable");
         }
       },
-      updateBoardLocation: (boardId) => window.history.replaceState({}, "", `?board=${boardId}`),
-      createTransport: (boardId: string, token: BoardSessionToken) =>
-        new BoardTransport(boardId, clientId, token, {
+      updateBoardLocation: (boardId) =>
+        window.history.replaceState(
+          {},
+          "",
+          requestedBoardId ? `/studio/${boardId}` : `?board=${boardId}`,
+        ),
+      createTransport: (boardId: string, token: BoardSessionToken) => {
+        const transport = new BoardTransport(boardId, clientId, token, {
           pendingStore: indexedDbPendingOperationStore,
-        }),
+        });
+        setPresenceStore(transport.presence);
+        return transport;
+      },
     });
   }, [clientId]);
   const [tool, setTool] = useState<"select" | "pan">("select");
-  const [diagnostics, setDiagnostics] = useState(true);
+  const capability = useEditorCapability();
+  const theme = useTheme();
+  const [creationTool, setCreationTool] = useState<"rectangle" | "sticky" | null>(null);
+  const [diagnostics, setDiagnostics] = useState(false);
+  const [layersOpen, setLayersOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [canvasAnnouncement, setCanvasAnnouncement] = useState<CanvasAnnouncement>({
+    generation: 0,
+    message: "",
+  });
+  const [onboarding, setOnboarding] = useState<OnboardingState>("unseen");
+  const [viewportCommand, setViewportCommand] = useState<{
+    id: number;
+    action: "in" | "out" | "reset";
+  }>();
+  const [canvasFocusRequest, setCanvasFocusRequest] = useState(0);
+  const [viewportCenter, setViewportCenter] = useState({ x: 450, y: 300 });
+  const layersTrigger = useRef<HTMLButtonElement>(null);
+  const rotationControlsHadFocus = useRef(false);
+  const selectedObjectLocked = Boolean(
+    store.selectedId && store.lockedObjectIds.has(store.selectedId),
+  );
+  const selectedObject = useMemo(
+    () => store.objects.find((object) => object.id === store.selectedId),
+    [store.objects, store.selectedId],
+  );
+  const rotationAvailable = Boolean(
+    selectedObject &&
+      store.boardId &&
+      store.connection === "ready" &&
+      !store.hiddenObjectIds.has(selectedObject.id) &&
+      !store.lockedObjectIds.has(selectedObject.id),
+  );
+  const hasLocalViewControls = store.hiddenObjectIds.size > 0 || store.lockedObjectIds.size > 0;
+  const synchronization = deriveSynchronizationPresentation({
+    hasCurrentSession: Boolean(store.sessionToken),
+    hasBoard: Boolean(store.boardId),
+    connection: store.connection,
+    pendingCount: store.pending.length,
+    pendingStatus: store.pendingStatus,
+  });
+  const terminal = store.connection === "authorization-failed" || store.connection === "error";
+  const mutationAllowed =
+    store.connection === "ready" && Boolean(store.boardId) && capability !== "view_only";
+  useEffect(() => setOnboarding(readOnboarding(window.localStorage)), []);
+  const dismissOnboarding = (state: Exclude<OnboardingState, "unseen">): void => {
+    setOnboarding(state);
+    writeOnboarding(window.localStorage, state);
+  };
+  const presence = usePresenceSnapshot(presenceStore);
+  const publishPresencePointer = useCallback(
+    (cursor: { x: number; y: number } | null) => presenceStore?.publish(cursor, "active"),
+    [presenceStore],
+  );
+
+  const closeLayers = (): void => {
+    setLayersOpen(false);
+    requestAnimationFrame(() => layersTrigger.current?.focus());
+  };
 
   useEffect(() => {
-    const boardId = new URLSearchParams(window.location.search).get("board");
-    const handle = sessions.start(boardId);
-    session.current = handle;
-    return () => {
-      sessions.stop(handle);
-      if (session.current === handle) session.current = null;
-    };
-  }, [sessions]);
+    return scheduleOwnedSessionStart(
+      () => {
+        const boardId =
+          requestedBoardId ?? new URLSearchParams(window.location.search).get("board");
+        const handle = sessions.start(boardId);
+        session.current = handle;
+        return handle;
+      },
+      (handle) => {
+        sessions.stop(handle);
+        if (session.current === handle) session.current = null;
+      },
+    );
+  }, [requestedBoardId, sessions]);
 
   const submit = (command: DurableCommand): Promise<boolean> =>
     session.current?.submit(command) ?? Promise.resolve(false);
-  const addObject = (kind: "rectangle" | "sticky"): void => {
-    if (!store.boardId) return;
+  const announce = useCallback((message: string): void => {
+    setCanvasAnnouncement((current) => nextCanvasAnnouncement(current, message));
+  }, []);
+  const objectActionLabel = (id: string): string =>
+    store.objects.find((object) => object.id === id)?.kind === "sticky"
+      ? "Sticky note"
+      : "Rectangle";
+  const addObject = (kind: "rectangle" | "sticky", center?: { x: number; y: number }): void => {
+    if (!store.boardId || !mutationAllowed) return;
     const targetId = crypto.randomUUID();
-    const position = {
+    const defaultPosition = {
       x: 120 + store.objects.length * 24,
       y: 100 + store.objects.length * 20,
     };
+    const size = kind === "sticky" ? { width: 200, height: 160 } : { width: 180, height: 110 };
+    const position = center
+      ? { x: center.x - size.width / 2, y: center.y - size.height / 2 }
+      : defaultPosition;
     const payload =
       kind === "sticky"
         ? {
             id: targetId,
             kind,
             ...position,
-            width: 200,
-            height: 160,
+            ...size,
             rotation: 0,
             fill: "#fde68a",
             text: "New note",
@@ -125,8 +285,7 @@ export function Workspace(): React.JSX.Element {
             id: targetId,
             kind,
             ...position,
-            width: 180,
-            height: 110,
+            ...size,
             rotation: 0,
             fill: "#818cf8",
             text: "" as const,
@@ -137,185 +296,575 @@ export function Workspace(): React.JSX.Element {
       type: "object.create",
       payload,
     }).then((persisted) => {
-      if (persisted && session.current === activeSession) store.select(targetId);
+      if (persisted && session.current === activeSession) {
+        store.select(targetId);
+        announce(`${kind === "sticky" ? "Sticky note" : "Rectangle"} created.`);
+      }
     });
   };
   const transform = (
     targetId: string,
-    payload: { x: number; y: number; width?: number; height?: number },
+    payload: { x?: number; y?: number; width?: number; height?: number; rotation?: number },
   ): void => {
-    if (!store.boardId) return;
+    if (!store.boardId || !mutationAllowed || store.lockedObjectIds.has(targetId)) return;
+    const object = store.objects.find((candidate) => candidate.id === targetId);
+    const actionLabel = objectActionLabel(targetId);
+    const activeSession = session.current;
     void submit({
       ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.transform",
       payload,
+    }).then((persisted) => {
+      if (persisted && session.current === activeSession)
+        announce(
+          payload.rotation !== undefined
+            ? `${actionLabel} rotated.`
+            : payload.width !== undefined || payload.height !== undefined
+              ? `${actionLabel} resized to width ${Math.round(payload.width ?? object?.width ?? 0)}, height ${Math.round(payload.height ?? object?.height ?? 0)}.`
+              : `${actionLabel} moved to x ${Math.round(payload.x ?? object?.x ?? 0)}, y ${Math.round(payload.y ?? object?.y ?? 0)}.`,
+        );
     });
   };
+  const rotateSelected = (rotation: number): void => {
+    if (!rotationAvailable || !selectedObject || store.selectedId !== selectedObject.id) return;
+    transform(selectedObject.id, { rotation: normalizeRotation(rotation) });
+  };
+  const toggleHiddenSelected = (): void => {
+    if (!selectedObject || !rotationAvailable) return;
+    store.setObjectHidden(selectedObject.id, true);
+    announce(`${objectActionLabel(selectedObject.id)} hidden in this view.`);
+  };
+  const toggleLockedSelected = (): void => {
+    if (!selectedObject || !rotationAvailable) return;
+    store.setObjectLocked(selectedObject.id, true);
+    announce(`${objectActionLabel(selectedObject.id)} locked in this view.`);
+  };
+  const issueViewport = (action: "in" | "out" | "reset"): void =>
+    setViewportCommand((current) => ({ id: (current?.id ?? 0) + 1, action }));
   const remove = (): void => {
-    if (!store.boardId || !store.selectedId) return;
+    if (
+      !store.boardId ||
+      !mutationAllowed ||
+      !store.selectedId ||
+      store.lockedObjectIds.has(store.selectedId)
+    )
+      return;
+    const targetId = store.selectedId;
+    const actionLabel = objectActionLabel(targetId);
+    store.select(null);
     const activeSession = session.current;
     void submit({
-      ...commandBase(store.boardId, clientId, store.selectedId, store.committed.lastSeq),
+      ...commandBase(store.boardId, clientId, targetId, store.committed.lastSeq),
       type: "object.delete",
       payload: {},
     }).then((persisted) => {
-      if (persisted && session.current === activeSession) store.select(null);
+      if (persisted && session.current === activeSession) announce(`${actionLabel} deleted.`);
     });
   };
 
+  const commands = useMemo(() => {
+    const action = {
+      "tool.select": () => setTool("select"),
+      "tool.pan": () => setTool("pan"),
+      "tool.rectangle": () => setCreationTool("rectangle"),
+      "tool.sticky": () => setCreationTool("sticky"),
+      "view.zoom-in": () => issueViewport("in"),
+      "view.zoom-out": () => issueViewport("out"),
+      "view.reset-zoom": () => issueViewport("reset"),
+      "view.focus-canvas": () => setCanvasFocusRequest((value) => value + 1),
+      "create.rectangle-center": () => addObject("rectangle", viewportCenter),
+      "create.sticky-center": () => addObject("sticky", viewportCenter),
+      "panel.layers": () => setLayersOpen(true),
+      "panel.synchronization": () =>
+        document
+          .querySelector<HTMLButtonElement>('[aria-label^="Synchronization status:"]')
+          ?.click(),
+      "panel.collaborators": () =>
+        document.querySelector<HTMLButtonElement>('[aria-label^="Collaborators:"]')?.click(),
+      "panel.diagnostics": () => setDiagnostics(true),
+      "panel.help": () => {
+        setPaletteOpen(false);
+        setHelpOpen(true);
+      },
+      "panel.share": () => {
+        setPaletteOpen(false);
+        setHelpOpen(false);
+        setShareOpen(true);
+      },
+      "theme.system": () => theme.setPreference("system"),
+      "theme.light": () => theme.setPreference("light"),
+      "theme.dark": () => theme.setPreference("dark"),
+      "selection.delete": remove,
+      "selection.hide": toggleHiddenSelected,
+      "selection.lock": toggleLockedSelected,
+      "selection.rotate-clockwise": () =>
+        selectedObject && rotateSelected(selectedObject.rotation + 15),
+      "selection.rotate-counterclockwise": () =>
+        selectedObject && rotateSelected(selectedObject.rotation - 15),
+      "selection.reset-rotation": () => rotateSelected(0),
+    } satisfies Record<CommandId, () => void>;
+    return createWorkspaceCommands({
+      ready: store.connection === "ready" && Boolean(store.boardId),
+      hasSelection: Boolean(selectedObject),
+      selectedLocked: selectedObjectLocked,
+      selectedHidden: Boolean(selectedObject && store.hiddenObjectIds.has(selectedObject.id)),
+      rotateAvailable: rotationAvailable,
+      canvasAvailable: store.connection === "ready" && Boolean(store.boardId),
+      mutationAllowed,
+      viewOnly: capability === "view_only",
+      themePreference: theme.preference,
+      action,
+    });
+  }, [
+    rotationAvailable,
+    selectedObject,
+    selectedObjectLocked,
+    store.boardId,
+    store.connection,
+    store.hiddenObjectIds,
+    store.lockedObjectIds,
+    store.committed.lastSeq,
+    viewportCenter,
+    mutationAllowed,
+    theme.preference,
+  ]);
   useEffect(() => {
-    const keydown = (event: KeyboardEvent): void => {
-      if ((event.key === "Delete" || event.key === "Backspace") && store.selectedId) {
-        event.preventDefault();
-        remove();
-      }
-      if (event.key === "v") setTool("select");
-      if (event.key === "h") setTool("pan");
+    const editable = (target: EventTarget | null): boolean =>
+      target instanceof HTMLElement &&
+      (target.isContentEditable ||
+        ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) ||
+        target.getAttribute("role") === "combobox");
+    const command = (id: CommandId): boolean => {
+      const value = commands.find((candidate) => candidate.id === id);
+      if (!value?.available) return false;
+      value.execute();
+      return true;
     };
-    window.addEventListener("keydown", keydown);
-    return () => window.removeEventListener("keydown", keydown);
-  }, [store.selectedId, store.boardId, store.committed.lastSeq]);
+    const keydown = (event: KeyboardEvent): void => {
+      if (event.isComposing || editable(event.target)) return;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setHelpOpen(false);
+        setPaletteOpen(true);
+        return;
+      }
+      if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return;
+      if (paletteOpen) return;
+      if (event.key === "?") {
+        event.preventDefault();
+        setPaletteOpen(false);
+        setHelpOpen(true);
+        return;
+      }
+      const id =
+        event.key.toLowerCase() === "v"
+          ? "tool.select"
+          : event.key.toLowerCase() === "h"
+            ? "tool.pan"
+            : event.key.toLowerCase() === "r"
+              ? "tool.rectangle"
+              : event.key.toLowerCase() === "n"
+                ? "tool.sticky"
+                : event.key === "0"
+                  ? "view.reset-zoom"
+                  : event.key === "Delete" || event.key === "Backspace"
+                    ? "selection.delete"
+                    : undefined;
+      if (id && command(id)) event.preventDefault();
+      if (event.key === "Escape" && layersOpen) {
+        event.preventDefault();
+        closeLayers();
+      } else if (event.key === "Escape" && diagnostics) {
+        event.preventDefault();
+        setDiagnostics(false);
+      }
+    };
+    document.addEventListener("keydown", keydown);
+    return () => document.removeEventListener("keydown", keydown);
+  }, [commands, diagnostics, layersOpen, paletteOpen]);
+
+  useEffect(() => {
+    if (terminal) {
+      setPaletteOpen(false);
+      setHelpOpen(false);
+      setShareOpen(false);
+      requestAnimationFrame(() => layersTrigger.current?.focus());
+    }
+  }, [terminal]);
+
+  useEffect(() => {
+    if (capability === "view_only") setCreationTool(null);
+  }, [capability]);
+
+  useEffect(() => {
+    if (terminal) setPaletteOpen(false);
+  }, [terminal]);
+
+  useEffect(() => {
+    if (rotationAvailable || !rotationControlsHadFocus.current) return;
+    rotationControlsHadFocus.current = false;
+    requestAnimationFrame(() => layersTrigger.current?.focus());
+  }, [rotationAvailable]);
 
   return (
-    <main className="workspace">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">C</span>
-          <div>
-            <strong>Converge</strong>
-            <span>{store.name}</span>
-          </div>
+    <main
+      className="workspace studio-shell"
+      aria-label="Converge studio"
+      data-editor-capability={capability}
+    >
+      <header className="topbar studio-board-header" aria-label="Board header">
+        <Link className="brand" href="/" aria-label="Converge home">
+          <span className="brand-mark" aria-hidden="true">
+            C
+          </span>
+          <span className="brand-name">Converge</span>
+        </Link>
+        <div className="board-label" aria-label={`Board: ${store.name || "Preparing board"}`}>
+          <span>Board</span>
+          <strong>{store.name || "Preparing board"}</strong>
         </div>
-        <div className="connection">
-          <i className={store.connection} />
-          {store.connection}
+        <div className="board-header-status">
+          <Tooltip label="Open command palette (Ctrl/⌘ K)">
+            <IconButton
+              variant="ghost"
+              aria-label="Open command palette"
+              onClick={() => setPaletteOpen(true)}
+            >
+              ⌘
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Open studio help (?)">
+            <IconButton
+              variant="ghost"
+              aria-label="Open studio help"
+              onClick={() => {
+                setPaletteOpen(false);
+                setHelpOpen(true);
+              }}
+            >
+              ?
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Share board">
+            <IconButton
+              variant="ghost"
+              aria-label="Share board"
+              disabled={!store.boardId || terminal}
+              onClick={() => {
+                setPaletteOpen(false);
+                setHelpOpen(false);
+                setShareOpen(true);
+              }}
+            >
+              ↗
+            </IconButton>
+          </Tooltip>
+          <SynchronizationStatus
+            presentation={synchronization}
+            pendingCount={store.pending.length}
+          />
+          <CollaboratorPresence presence={presence} terminal={terminal} />
+          <Tooltip label="Open layers">
+            <button
+              ref={layersTrigger}
+              className={`ui-button ui-button--${layersOpen ? "primary" : "secondary"} ui-button--icon layers-trigger`}
+              type="button"
+              aria-label="Open layers panel"
+              aria-expanded={layersOpen}
+              aria-controls="layers-panel"
+              onClick={() => setLayersOpen((value) => !value)}
+            >
+              <ToolIcon name="layers" />
+            </button>
+          </Tooltip>
         </div>
-        <button className="avatar" title="Development identity">
-          LD
-        </button>
       </header>
-      <aside className="toolbar" aria-label="Canvas tools">
-        <button
-          className={tool === "select" ? "active" : ""}
-          onClick={() => setTool("select")}
-          title="Select (V)"
-        >
-          ↖
-        </button>
-        <button
-          className={tool === "pan" ? "active" : ""}
-          onClick={() => setTool("pan")}
-          title="Pan (H)"
-        >
-          ✋
-        </button>
-        <hr />
-        <button
-          data-testid="add-rectangle"
-          onClick={() => addObject("rectangle")}
-          title="Add rectangle"
-        >
-          ▭
-        </button>
-        <button
-          data-testid="add-sticky"
-          onClick={() => addObject("sticky")}
-          title="Add sticky note"
-        >
-          ▤
-        </button>
-        <hr />
-        <button onClick={remove} disabled={!store.selectedId} title="Delete selected">
-          ⌫
-        </button>
+      <aside className="toolbar studio-tool-dock" aria-label="Primary canvas tools">
+        <div role="toolbar" aria-label="Canvas tools">
+          <Tooltip label="Select (V)">
+            <IconButton
+              className="workspace-tool-button"
+              variant={tool === "select" ? "primary" : "ghost"}
+              aria-label="Select tool"
+              aria-pressed={tool === "select"}
+              aria-keyshortcuts="V"
+              onClick={() => setTool("select")}
+            >
+              <ToolIcon name="select" />
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Pan (H)">
+            <IconButton
+              className="workspace-tool-button"
+              variant={tool === "pan" ? "primary" : "ghost"}
+              aria-label="Pan tool"
+              aria-pressed={tool === "pan"}
+              aria-keyshortcuts="H"
+              onClick={() => setTool("pan")}
+            >
+              <ToolIcon name="pan" />
+            </IconButton>
+          </Tooltip>
+          <Separator />
+          <Tooltip label="Add rectangle">
+            <IconButton
+              className="workspace-tool-button"
+              variant="ghost"
+              aria-label="Add rectangle"
+              data-testid="add-rectangle"
+              disabled={!mutationAllowed}
+              onClick={() => {
+                setCreationTool(null);
+                addObject("rectangle");
+              }}
+            >
+              <ToolIcon name="rectangle" />
+            </IconButton>
+          </Tooltip>
+          <Tooltip label="Add sticky note">
+            <IconButton
+              className="workspace-tool-button"
+              variant="ghost"
+              aria-label="Add sticky note"
+              data-testid="add-sticky"
+              disabled={!mutationAllowed}
+              onClick={() => {
+                setCreationTool(null);
+                addObject("sticky");
+              }}
+            >
+              <ToolIcon name="sticky" />
+            </IconButton>
+          </Tooltip>
+          <Separator />
+          {rotationAvailable && selectedObject && (
+            <RotationControls
+              object={selectedObject}
+              onRotate={rotateSelected}
+              onFocusWithinChange={(focused) => {
+                rotationControlsHadFocus.current = focused;
+              }}
+            />
+          )}
+          {rotationAvailable && selectedObject && <Separator />}
+          <Tooltip label="Delete selected">
+            <IconButton
+              className="workspace-tool-button"
+              variant="ghost"
+              aria-label="Delete selected"
+              disabled={!mutationAllowed || !store.selectedId || selectedObjectLocked}
+              onClick={remove}
+            >
+              <ToolIcon name="delete" />
+            </IconButton>
+          </Tooltip>
+        </div>
       </aside>
-      <Canvas
-        objects={store.objects}
-        selectedId={store.selectedId}
-        tool={tool}
-        onSelect={(id) => store.select(id)}
-        onTransform={transform}
+      <section id="studio-canvas-region" className="studio-canvas-region" aria-label="Board canvas">
+        <Canvas
+          objects={store.objects}
+          selectedId={store.selectedId}
+          hiddenObjectIds={store.hiddenObjectIds}
+          lockedObjectIds={store.lockedObjectIds}
+          tool={tool}
+          rotationEnabled={rotationAvailable && mutationAllowed}
+          rotationFence={`${store.sessionGeneration ?? "none"}:${store.connection}:${capability}`}
+          presence={presence}
+          onPresencePointer={publishPresencePointer}
+          onSelect={(id) => {
+            store.select(id);
+            if (id) announce("Object selected.");
+          }}
+          onTransform={transform}
+          keyboardEditingEnabled={rotationAvailable && mutationAllowed}
+          editingEnabled={mutationAllowed}
+          capability={capability}
+          canvasFocusRequest={canvasFocusRequest}
+          onViewportCenterChange={setViewportCenter}
+          onKeyboardRejected={announce}
+          viewportCommand={viewportCommand}
+          creationTool={creationTool}
+          onCreateFromCanvas={(kind) => {
+            setCreationTool(null);
+            addObject(kind);
+          }}
+        />
+      </section>
+      {layersOpen && (
+        <LayersPanel
+          objects={store.objects}
+          selectedId={store.selectedId}
+          hiddenObjectIds={store.hiddenObjectIds}
+          lockedObjectIds={store.lockedObjectIds}
+          onSelect={(id) => {
+            store.select(id);
+            announce(`${objectActionLabel(id)} selected.`);
+          }}
+          onToggleHidden={(id) => {
+            const hidden = !store.hiddenObjectIds.has(id);
+            store.setObjectHidden(id, hidden);
+            announce(`${objectActionLabel(id)} ${hidden ? "hidden" : "shown"} in this view.`);
+          }}
+          onToggleLocked={(id) => {
+            const locked = !store.lockedObjectIds.has(id);
+            store.setObjectLocked(id, locked);
+            announce(`${objectActionLabel(id)} ${locked ? "locked" : "unlocked"} in this view.`);
+          }}
+          onClose={closeLayers}
+        />
+      )}
+      <CommandPalette
+        open={paletteOpen}
+        commands={commands}
+        onClose={() => setPaletteOpen(false)}
       />
-      {store.error && <div className="error-toast">{store.error}</div>}
-      <section className={`diagnostics ${diagnostics ? "open" : ""}`}>
-        <button onClick={() => setDiagnostics((value) => !value)}>
-          <span>Diagnostics</span>
-          <b>{diagnostics ? "−" : "+"}</b>
-        </button>
-        {diagnostics && (
-          <dl>
-            <div>
-              <dt>Board</dt>
-              <dd data-testid="board-id">{store.boardId ?? "none"}</dd>
-            </div>
-            <div>
-              <dt>Connection</dt>
-              <dd>{store.connection}</dd>
-            </div>
-            <div>
-              <dt>Last sequence</dt>
-              <dd data-testid="last-seq">{store.committed.lastSeq}</dd>
-            </div>
-            <div>
-              <dt>Pending</dt>
-              <dd data-testid="pending-count">{store.pending.length}</dd>
-            </div>
-            <div>
-              <dt>Pending recovery</dt>
-              <dd data-testid="pending-status">{store.pendingStatus}</dd>
-            </div>
-            <div>
-              <dt>Sync attempt</dt>
-              <dd data-testid="sync-attempt">{store.synchronizationDiagnostics.attempt}</dd>
-            </div>
-            <div>
-              <dt>Sync retry</dt>
-              <dd data-testid="sync-retry-code">
-                {store.synchronizationDiagnostics.retryScheduled
-                  ? `${store.synchronizationDiagnostics.retryCode ?? "retry"} (${store.synchronizationDiagnostics.retryDelayMs ?? 0}ms)`
-                  : "none"}
-              </dd>
-            </div>
-            <div>
-              <dt>Sync buffer</dt>
-              <dd data-testid="sync-buffer">
-                {store.synchronizationDiagnostics.bufferedCount}/
-                {store.synchronizationDiagnostics.bufferCountLimit} operations,{" "}
-                {store.synchronizationDiagnostics.bufferedBytes}/
-                {store.synchronizationDiagnostics.bufferByteLimit} bytes
-              </dd>
-            </div>
-            <div className="hash">
-              <dt>Committed objects</dt>
-              <dd data-testid="committed-objects">
-                {JSON.stringify(visibleObjects(store.committed))}
-              </dd>
-            </div>
-            <div>
-              <dt>Hash board</dt>
-              <dd data-testid="hash-board-id">{store.authoritativeHash.boardId ?? "none"}</dd>
-            </div>
-            <div>
-              <dt>Hash sequence</dt>
-              <dd data-testid="hash-seq">{store.authoritativeHash.seq ?? "none"}</dd>
-            </div>
-            <div>
-              <dt>Hash session</dt>
-              <dd data-testid="hash-session-generation">
-                {store.authoritativeHash.sessionGeneration ?? "none"}
-              </dd>
-            </div>
-            <div>
-              <dt>Hash status</dt>
-              <dd data-testid="hash-status">{store.authoritativeHash.status}</dd>
-            </div>
-            <div className="hash">
-              <dt>Authoritative hash</dt>
-              <dd data-testid="state-hash">{store.authoritativeHash.value ?? "unavailable"}</dd>
-            </div>
-          </dl>
+      <StudioHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
+      <ShareDialog boardId={store.boardId} open={shareOpen} onClose={() => setShareOpen(false)} />
+      {store.connection === "ready" &&
+        store.objects.length === 0 &&
+        store.pending.length === 0 &&
+        onboarding === "unseen" &&
+        !paletteOpen &&
+        !helpOpen &&
+        !terminal && (
+          <aside className="studio-welcome" aria-label="First-run studio guidance">
+            <h2>Your shared canvas is ready</h2>
+            <p>Objects are durable; collaboration status is visible in the header.</p>
+            <button
+              onClick={() => {
+                dismissOnboarding("dismissed");
+                setCreationTool("sticky");
+              }}
+            >
+              Add a sticky note
+            </button>
+            <button
+              onClick={() => {
+                dismissOnboarding("dismissed");
+                setCreationTool("rectangle");
+              }}
+            >
+              Add a rectangle
+            </button>
+            <button onClick={() => setPaletteOpen(true)}>Open command palette</button>
+            <button onClick={() => dismissOnboarding("dismissed")}>Not now</button>
+          </aside>
         )}
+      <CanvasActionAnnouncer announcement={canvasAnnouncement} />
+      <WorkspaceEntryStatus status={store.connection} hasBoard={Boolean(store.boardId)} />
+      {(synchronization.state === "locally_preserved" ||
+        synchronization.state === "reconnecting") && (
+        <aside className="synchronization-notice" role="status">
+          {synchronization.pendingPreservedLocally
+            ? "Pending changes are kept on this device while recovery continues."
+            : "Editing is temporarily paused while the board reconnects."}
+        </aside>
+      )}
+      {capability === "view_only" && (
+        <aside className="studio-narrow-notice" aria-label="View-only screen notice" role="status">
+          <strong>View-only on this screen</strong>
+          <span>Use a larger screen to edit this board.</span>
+          {hasLocalViewControls && (
+            <button
+              className="studio-narrow-reset"
+              type="button"
+              onClick={() => store.clearLocalViewControls()}
+            >
+              Restore local layers
+            </button>
+          )}
+        </aside>
+      )}
+      <section className={`diagnostics studio-system-details ${diagnostics ? "open" : ""}`}>
+        <button
+          type="button"
+          aria-expanded={diagnostics}
+          aria-controls="workspace-diagnostics-panel"
+          onClick={() => setDiagnostics((value) => !value)}
+        >
+          <span>Technical details</span>
+          <b aria-hidden="true">{diagnostics ? "−" : "+"}</b>
+        </button>
+        <dl id="workspace-diagnostics-panel" hidden={!diagnostics}>
+          <div>
+            <dt>Board</dt>
+            <dd data-testid="board-id">{store.boardId ?? "none"}</dd>
+          </div>
+          <div>
+            <dt>Connection</dt>
+            <dd>{store.connection}</dd>
+          </div>
+          <div>
+            <dt>Last sequence</dt>
+            <dd data-testid="last-seq">{store.committed.lastSeq}</dd>
+          </div>
+          <div>
+            <dt>Pending</dt>
+            <dd data-testid="pending-count">{store.pending.length}</dd>
+          </div>
+          <div>
+            <dt>Pending recovery</dt>
+            <dd data-testid="pending-status">{store.pendingStatus}</dd>
+          </div>
+          <div>
+            <dt>Sync attempt</dt>
+            <dd data-testid="sync-attempt">{store.synchronizationDiagnostics.attempt}</dd>
+          </div>
+          <div>
+            <dt>Sync retry</dt>
+            <dd data-testid="sync-retry-code">
+              {store.synchronizationDiagnostics.retryScheduled
+                ? `${store.synchronizationDiagnostics.retryCode ?? "retry"} (${store.synchronizationDiagnostics.retryDelayMs ?? 0}ms)`
+                : "none"}
+            </dd>
+          </div>
+          <div>
+            <dt>Sync buffer</dt>
+            <dd data-testid="sync-buffer">
+              {store.synchronizationDiagnostics.bufferedCount}/
+              {store.synchronizationDiagnostics.bufferCountLimit} operations,{" "}
+              {store.synchronizationDiagnostics.bufferedBytes}/
+              {store.synchronizationDiagnostics.bufferByteLimit} bytes
+            </dd>
+          </div>
+          <div className="hash">
+            <dt>Committed objects</dt>
+            <dd data-testid="committed-objects">
+              {JSON.stringify(visibleObjects(store.committed))}
+            </dd>
+          </div>
+          <div>
+            <dt>Hash board</dt>
+            <dd data-testid="hash-board-id">{store.authoritativeHash.boardId ?? "none"}</dd>
+          </div>
+          <div>
+            <dt>Hash sequence</dt>
+            <dd data-testid="hash-seq">{store.authoritativeHash.seq ?? "none"}</dd>
+          </div>
+          <div>
+            <dt>Hash session</dt>
+            <dd data-testid="hash-session-generation">
+              {store.authoritativeHash.sessionGeneration ?? "none"}
+            </dd>
+          </div>
+          <div>
+            <dt>Hash status</dt>
+            <dd data-testid="hash-status">{store.authoritativeHash.status}</dd>
+          </div>
+          <div className="hash">
+            <dt>Authoritative hash</dt>
+            <dd data-testid="state-hash">{store.authoritativeHash.value ?? "unavailable"}</dd>
+          </div>
+        </dl>
       </section>
     </main>
+  );
+}
+
+function usePresenceSnapshot(presence: PresenceStore | null): PresenceSnapshot | null {
+  return useSyncExternalStore(
+    (listener) => presence?.subscribe(listener) ?? (() => undefined),
+    () => presence?.snapshot() ?? null,
+    () => null,
   );
 }

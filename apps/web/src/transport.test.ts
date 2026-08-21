@@ -233,6 +233,7 @@ class FakeSocket {
   disconnectCalls = 0;
   readonly joins: Array<{ request: unknown; acknowledge: (value: JoinBoardAck) => void }> = [];
   readonly submissions: DurableCommand[] = [];
+  readonly presenceUpdates: unknown[] = [];
   readonly submissionAcknowledgements: Array<(value: unknown) => void> = [];
   private readonly listeners = new Map<string, Listener[]>();
   readonly io = {
@@ -242,6 +243,15 @@ class FakeSocket {
   on(event: string, listener: Listener): this {
     this.addListener(event, listener);
     return this;
+  }
+
+  off(event: string): this {
+    this.listeners.delete(event);
+    return this;
+  }
+
+  presence(event: string, value: unknown): void {
+    this.dispatch(event, value);
   }
 
   emit(event: string, ...values: unknown[]): this {
@@ -258,7 +268,7 @@ class FakeSocket {
       if (typeof acknowledge !== "function")
         throw new Error("Operation acknowledgement is required");
       this.submissionAcknowledgements.push(acknowledge as (value: unknown) => void);
-    }
+    } else if (event === "presence:update") this.presenceUpdates.push(values[0]);
     return this;
   }
 
@@ -409,6 +419,54 @@ function requireRecovery(socket: FakeSocket, index = 0): void {
     retryable: true,
   });
 }
+
+describe("presence transport boundary", () => {
+  it("parses only current-board evidence without changing durable readiness and publishes bounded fields", async () => {
+    const test = harness();
+    succeedJoin(test.socket, 0, 0);
+    await settle();
+    const before = useBoardStore.getState().connection;
+    const participant = {
+      presenceSessionId: "50000000-0000-4000-8000-000000000005",
+      userId: "60000000-0000-4000-8000-000000000006",
+      displayName: "Ada",
+      revision: 1,
+      activity: "active" as const,
+      cursor: null,
+      observedAt: "2026-08-20T12:00:00.000Z",
+      expiresAt: "2026-08-20T12:00:45.000Z",
+    };
+    test.socket.presence("board:presence-snapshot", {
+      schemaVersion: 1,
+      boardId,
+      observedAt: participant.observedAt,
+      selfPresenceSessionId: participant.presenceSessionId,
+      participants: [participant],
+    });
+    expect(test.transport.presence.snapshot()).toMatchObject({
+      selfUserId: participant.userId,
+      availability: "available",
+    });
+    expect(useBoardStore.getState().connection).toBe(before);
+    test.transport.presence.publish({ x: 10, y: 20 }, "active");
+    expect(test.socket.presenceUpdates).toEqual([
+      { schemaVersion: 1, boardId, cursor: { x: 10, y: 20 }, activity: "active" },
+    ]);
+    test.socket.presence("presence:participant-upsert", {
+      schemaVersion: 1,
+      boardId: "70000000-0000-4000-8000-000000000007",
+      participant,
+    });
+    expect(test.transport.presence.snapshot().collaborators).toHaveLength(1);
+    test.transport.disconnect();
+    test.socket.presence("presence:availability", {
+      schemaVersion: 1,
+      boardId,
+      status: "available",
+    });
+    expect(test.transport.presence.snapshot().collaborators).toEqual([]);
+  });
+});
 
 beforeEach(() => {
   useBoardStore.getState().endSession(useBoardStore.getState().sessionToken as BoardSessionToken);

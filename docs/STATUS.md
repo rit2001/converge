@@ -113,3 +113,95 @@ Milestone 2 work.
 
 The recorded local baseline supports only its exact correctness and timing evidence; no production
 capacity, scalability, deployment, or 10,000-user claim is currently supported.
+
+## Milestone 3 planning status
+
+The premium product experience architecture, original product language, frontend layering/motion
+decision, accessibility and performance budgets, durable Layers-panel capability audit, and eight
+independently reviewable implementation slices are defined. M3.1 now establishes the light-theme
+semantic token system, dark-compatible token values, reduced-motion and forced-color policies,
+centralized workspace layers and portal hosts, accessible UI primitives, and tokenized existing
+workspace connection chrome. It adds no dependency and changes no synchronization, protocol,
+database, canvas-authority, route, or deployment behavior. Complete workspace composition, landing
+and board-entry surfaces, canvas-tool redesign, collaboration presence, product dialogs, theme
+switching, responsive policy, and performance acceptance remain in M3.2–M3.8. M3.4 is complete:
+real two-client browser acceptance covers authoritative Canvas/Layers selection and order, explicitly
+local hide/lock isolation and recovery, deterministic drag snapping with transient guides, and
+authoritative rotation controls. Multi-select, undo/redo, grouping, durable reorder or rename,
+presence, sharing, history, and palette work remain excluded from M3.4.
+
+M3.5 is complete. M3.5A is complete: the workspace derives a fail-closed, bounded synchronization
+presentation from existing BoardStore and pending-queue evidence only. It distinguishes connecting,
+restoring, synced, saving, reconnecting, device-local preservation, access removal, blocked recovery,
+and unavailable states without changing transport, persistence, recovery, or protocol behavior.
+
+M3.5B1 is complete: the strict, versioned ephemeral presence schemas and multi-replica Redis
+Pub/Sub-plus-TTL architecture are defined with bounded, lossy semantics and no durable-plane impact.
+M3.5B2 runtime presence is accepted; final M3.5 multi-client browser acceptance remains pending.
+
+M3.5B2A is complete: an uncomposed, separately owned atomic Redis presence transport now provides
+bounded session records, expiry indexes, revisioned tombstones, snapshots, and validated Pub/Sub
+deltas. Socket.IO admission/scheduling and the frontend presence surface remain pending in B2B/B3.
+
+M3.5B2B1 is complete: presence is independently composed behind `API_PRESENCE_ENABLED`, binds only
+after successful board join acknowledgement, and remains isolated from HTTP/socket editing readiness.
+Its Redis transport reconnection correction is complete: fresh three-client generations retry under
+a bounded full-jitter supervisor and notify the runtime only after a complete resubscription.
+M3.5B2 API/Redis presence is accepted against two independently composed local-delivery APIs, one
+Redis instance, and a disposable migrated database.
+M3.5B's self-session correction is complete: strict socket-specific snapshots identify the exact
+admitted session without exposing separate principal evidence.
+M3.5B3A is complete: a bounded generation-fenced client presence authority consumes strict snapshots
+and deltas, resolves authenticated self evidence, and exposes grouped ephemeral state without visual UI.
+M3.5B3B is complete: the header now presents bounded grouped collaborators and the canvas renders
+non-interactive remote cursors from that ephemeral authority.
+M3.5C1 is complete: a test-owned Playwright harness now composes two independently bundled web origins
+with two production-composed API replicas, a disposable database, real Redis presence, distinct principals,
+and a second owner tab. M3.5C is complete: the real A/A2/B browser acceptance proves independent truthful
+synchronization, grouped self/session evidence, Redis-routed non-interactive cursors, and presence-only
+interruption/recovery without changing durable editing. This is a bounded correctness acceptance, not a
+capacity, load, membership, or exact-presence guarantee.
+
+M3.6A is complete: a bounded typed command registry, one guarded document-level keyboard dispatcher,
+and an accessible modal command palette expose only implemented workspace actions. The palette has no
+history, sharing, onboarding, command persistence, protocol, or durable-command bypass behavior.
+M3.6B is complete: v1 local-only first-run guidance and reopenable Studio help explain only implemented
+canvas, local-view, synchronization, and ephemeral-presence behavior; share and history remain pending.
+M3.6C1 is complete: canonical authenticated `/studio/[boardId]` links and a local clipboard Share dialog
+preserve existing access checks. Links grant no access; invitations, member administration, and version
+history remain pending.
+M3.6 is complete. M3.7 is next; user-facing version history is explicitly deferred until its authorized
+forward-only list/preview/restore backend contract exists. `/recovery` remains automatic verified recovery,
+not interactive history.
+M3.7A is accepted: Layers is the labelled semantic “Board objects” Canvas alternative with bounded
+geometry/state descriptions, and completed local canvas actions use one generation-fenced polite
+announcer. Automated axe coverage has no critical or serious WCAG A/AA violations on the landing,
+studio, object navigator, palette, Help, and Share surfaces; it supplements, but is not, full manual
+accessibility certification. Keyboard manipulation, touch policy, and theme work remain pending.
+M3.7B is complete: keyboard-only users can create supported objects at the visible viewport center and,
+after focusing the labelled Canvas editing surface, move or resize one visible unlocked selection through
+the existing authoritative transform path. Touch policy and theme work remain pending.
+M3.7C1 is complete: responsive capability is local UI policy—full editor on desktop, compact editor on
+tablet/narrow desktop, and view-only below 640 CSS pixels (plus coarse-pointer short landscape). Phone
+view-only retains synchronization, inspection, pan, and zoom while fencing durable mutation; theme
+preference remains pending.
+M3.7C2 completes M3.7: System, Light, and Dark are supported as a versioned device-local preference.
+They change only semantic presentation tokens and Canvas UI overlays, never board data, sessions, or
+network behavior. Automated checks support, but do not claim, full manual accessibility certification.
+M3.8A1 production-topology smoke is complete: a test-owned single-replica harness uses local durable
+delivery, disabled presence, a disposable migrated PostgreSQL database, dynamic ports, an isolated
+production Next build/start, and an authoritative deterministic 100-object fixture. It is harness
+correctness evidence only. M3.8A2 is closed as an unaccepted bounded measurement attempt: its diagnostic
+rendered exact 100/500/1,000 object counts without page errors, hydration errors, or horizontal overflow,
+but defective selection timing invalidated latency acceptance. No frontend-latency or 1,000-object
+performance guarantee is claimed, and M3 will not spend further work on this measurement. Deterministic
+bundle budgets remain independently enforced; production-capacity certification is future
+deployment/load work.
+M3.8B completes Milestone 3: ten deterministic pinned-Chromium visual baselines cover the accepted
+Light/Dark desktop, compact, phone view-only, modal/panel, selected-canvas, onboarding, synchronization,
+and real dual-replica roster states. The final release gate passed the complete web/protocol/unit,
+workspace format/lint/typecheck/build, bundle-budget, API presence, ordinary browser, accessibility,
+responsive, keyboard, and dual-replica presence suites. Milestone 3 is complete with no release-blocking
+product defect. M3.8A2 remains explicitly unaccepted, and no latency, 1,000-object performance,
+production-capacity, deployment, full accessibility-certification, or broad browser-certification claim
+is made.

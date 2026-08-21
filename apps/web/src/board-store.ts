@@ -65,6 +65,9 @@ export interface BoardStore {
   appliedSeqOpIds: Record<number, string>;
   objects: CanvasObject[];
   selectedId: string | null;
+  selectionNotice: string | null;
+  hiddenObjectIds: ReadonlySet<string>;
+  lockedObjectIds: ReadonlySet<string>;
   connection: SynchronizationStatus;
   pendingStatus: PendingRecoveryStatus;
   synchronizationDiagnostics: SynchronizationDiagnostics;
@@ -104,6 +107,9 @@ export interface BoardStore {
     message?: string | null,
   ): void;
   select(id: string | null): void;
+  setObjectHidden(id: string, hidden: boolean): void;
+  setObjectLocked(id: string, locked: boolean): void;
+  clearLocalViewControls(): void;
   addPersistedPending(token: BoardSessionToken, command: DurableCommand): boolean;
   removePending(token: BoardSessionToken, opId: string, error?: string): void;
   ingest(token: BoardSessionToken, operation: CommittedOperation): IngestResult | "stale";
@@ -128,6 +134,39 @@ function stateFromSnapshot(snapshot: BoardSnapshot): BoardState {
 
 function derive(committed: BoardState, pending: DurableCommand[]): CanvasObject[] {
   return visibleObjects(optimisticState(committed, pending));
+}
+
+export function visibleInLocalView(
+  objects: CanvasObject[],
+  hiddenObjectIds: ReadonlySet<string>,
+): CanvasObject[] {
+  return objects.filter((object) => !hiddenObjectIds.has(object.id));
+}
+
+function currentSelection(objects: CanvasObject[], selectedId: string | null) {
+  if (!selectedId || objects.some((object) => object.id === selectedId))
+    return { selectedId, selectionNotice: null };
+  return { selectedId: null, selectionNotice: "Selected object was removed from the board." };
+}
+
+function localViewState(
+  objects: CanvasObject[],
+  selectedId: string | null,
+  hiddenObjectIds: ReadonlySet<string>,
+  lockedObjectIds: ReadonlySet<string>,
+) {
+  const activeIds = new Set(objects.map((object) => object.id));
+  const hidden = new Set([...hiddenObjectIds].filter((id) => activeIds.has(id)));
+  const locked = new Set([...lockedObjectIds].filter((id) => activeIds.has(id)));
+  const selection = currentSelection(objects, selectedId);
+  return {
+    ...selection,
+    ...(selection.selectedId && hidden.has(selection.selectedId)
+      ? { selectedId: null, selectionNotice: null }
+      : {}),
+    hiddenObjectIds: hidden,
+    lockedObjectIds: locked,
+  };
 }
 
 function cloneBoardState(state: BoardState): BoardState {
@@ -230,6 +269,9 @@ export function createBoardStore(
       appliedSeqOpIds: {},
       objects: [],
       selectedId: null,
+      selectionNotice: null,
+      hiddenObjectIds: new Set(),
+      lockedObjectIds: new Set(),
       connection: "disconnected",
       pendingStatus: "idle",
       synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -248,6 +290,9 @@ export function createBoardStore(
           appliedSeqOpIds: {},
           objects: [],
           selectedId: null,
+          selectionNotice: null,
+          hiddenObjectIds: new Set(),
+          lockedObjectIds: new Set(),
           connection: "connecting",
           pendingStatus: "idle",
           synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -265,11 +310,18 @@ export function createBoardStore(
         if (!isCurrent(sessionToken, snapshot.id)) return false;
         if (pending.some((command) => command.boardId !== snapshot.id)) return false;
         const committed = stateFromSnapshot(snapshot);
+        const objects = derive(committed, pending);
         set({
           name: snapshot.name,
           committed,
           pending,
-          objects: derive(committed, pending),
+          objects,
+          ...localViewState(
+            objects,
+            get().selectedId,
+            get().hiddenObjectIds,
+            get().lockedObjectIds,
+          ),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -289,10 +341,17 @@ export function createBoardStore(
         if (!isCurrent(sessionToken, snapshot.id)) return false;
         const current = get();
         const committed = stateFromSnapshot(snapshot);
+        const objects = derive(committed, current.pending);
         set({
           name: snapshot.name,
           committed,
-          objects: derive(committed, current.pending),
+          objects,
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -312,10 +371,17 @@ export function createBoardStore(
         if (!isCurrent(sessionToken, recoveredBoardId)) return false;
         const current = get();
         const committed = cloneBoardState(recovered);
+        const objects = derive(committed, current.pending);
         set({
           name: boardName,
           committed,
-          objects: derive(committed, current.pending),
+          objects,
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           buffered: {},
           appliedOpIds: {},
           appliedSeqOpIds: {},
@@ -341,6 +407,9 @@ export function createBoardStore(
           appliedSeqOpIds: {},
           objects: [],
           selectedId: null,
+          selectionNotice: null,
+          hiddenObjectIds: new Set(),
+          lockedObjectIds: new Set(),
           connection: "authorization-failed",
           synchronizationDiagnostics: {
             ...get().synchronizationDiagnostics,
@@ -373,6 +442,9 @@ export function createBoardStore(
           appliedSeqOpIds: {},
           objects: [],
           selectedId: null,
+          selectionNotice: null,
+          hiddenObjectIds: new Set(),
+          lockedObjectIds: new Set(),
           connection: "disconnected",
           pendingStatus: "idle",
           synchronizationDiagnostics: idleSynchronizationDiagnostics(),
@@ -405,22 +477,73 @@ export function createBoardStore(
         set({ pendingStatus, ...(message === undefined ? {} : { error: message }) });
       },
       select(selectedId) {
-        set({ selectedId });
+        const current = get();
+        if (selectedId && current.hiddenObjectIds.has(selectedId)) {
+          set({ selectedId: null, selectionNotice: null });
+          return;
+        }
+        const selection = currentSelection(current.objects, selectedId);
+        set({ ...selection, selectionNotice: selectedId ? null : selection.selectionNotice });
+      },
+      setObjectHidden(id, hidden) {
+        const current = get();
+        if (!current.objects.some((object) => object.id === id)) return;
+        const hiddenObjectIds = new Set(current.hiddenObjectIds);
+        if (hidden) hiddenObjectIds.add(id);
+        else hiddenObjectIds.delete(id);
+        set({
+          ...localViewState(
+            current.objects,
+            current.selectedId,
+            hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
+        });
+      },
+      setObjectLocked(id, locked) {
+        const current = get();
+        if (!current.objects.some((object) => object.id === id)) return;
+        const lockedObjectIds = new Set(current.lockedObjectIds);
+        if (locked) lockedObjectIds.add(id);
+        else lockedObjectIds.delete(id);
+        set({ lockedObjectIds });
+      },
+      clearLocalViewControls() {
+        set({ hiddenObjectIds: new Set(), lockedObjectIds: new Set() });
       },
       addPersistedPending(sessionToken, command) {
         const current = get();
         if (!isCurrent(sessionToken, command.boardId)) return false;
         if (current.pending.some(({ opId }) => opId === command.opId)) return true;
         const pending = [...current.pending, command];
-        set({ pending, objects: derive(current.committed, pending), error: null });
+        const objects = derive(current.committed, pending);
+        set({
+          pending,
+          objects,
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
+          error: null,
+        });
         return true;
       },
       removePending(sessionToken, opId, error) {
         if (!isCurrent(sessionToken)) return;
         const pending = get().pending.filter((command) => command.opId !== opId);
+        const current = get();
+        const objects = derive(current.committed, pending);
         set({
           pending,
-          objects: derive(get().committed, pending),
+          objects,
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           ...(error === undefined ? {} : { error }),
         });
       },
@@ -465,12 +588,19 @@ export function createBoardStore(
           next = buffered[committed.lastSeq + 1];
         }
         const advanced = committed.lastSeq !== current.committed.lastSeq;
+        const objects = derive(committed, get().pending);
         set({
           committed,
           buffered,
           appliedOpIds,
           appliedSeqOpIds,
-          objects: derive(committed, get().pending),
+          objects,
+          ...localViewState(
+            objects,
+            current.selectedId,
+            current.hiddenObjectIds,
+            current.lockedObjectIds,
+          ),
           ...(advanced && current.boardId
             ? {
                 authoritativeHash: {

@@ -1,0 +1,92 @@
+"use client";
+import { createPortal } from "react-dom";
+import { useEffect, useRef } from "react";
+import * as React from "react";
+import { useTheme, type ThemePreference } from "../theme-provider";
+export function StudioHelp({
+  open,
+  onClose,
+}: {
+  open: boolean;
+  onClose: () => void;
+}): React.JSX.Element | null {
+  const theme = useTheme();
+  const close = useRef<HTMLButtonElement>(null);
+  const previous = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (open) {
+      previous.current = document.activeElement as HTMLElement;
+      queueMicrotask(() => close.current?.focus());
+    } else previous.current?.focus();
+  }, [open]);
+  if (!open || typeof document === "undefined") return null;
+  return createPortal(
+    <div className="command-palette-backdrop">
+      <section
+        className="command-palette studio-help"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="studio-help-title"
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            onClose();
+          }
+          if (event.key === "Tab") {
+            event.preventDefault();
+            close.current?.focus();
+          }
+        }}
+      >
+        <button ref={close} className="ui-button ui-button--ghost" onClick={onClose}>
+          Close help
+        </button>
+        <h2 id="studio-help-title">Studio help</h2>
+        <p>Use the canvas tools and header status to work confidently.</p>
+        <h3>Create</h3>
+        <p>
+          <kbd>R</kbd> Rectangle · <kbd>N</kbd> Sticky note
+        </p>
+        <h3>Navigate</h3>
+        <p>
+          <kbd>V</kbd> Select · <kbd>H</kbd> Hand/pan · <kbd>0</kbd> Reset zoom
+        </p>
+        <h3>Work efficiently</h3>
+        <p>
+          <kbd>Ctrl/⌘ K</kbd> Command palette · <kbd>Delete</kbd> eligible selection · Shift rotates
+          by 15° · Alt/Option bypasses snapping.
+        </p>
+        <p>
+          In the command palette, create a rectangle or sticky note at the viewport center. Focus
+          the canvas to move a selected object with <kbd>Arrow</kbd>, hold <kbd>Shift</kbd> for 10
+          units, or hold <kbd>Alt/Option</kbd> with <kbd>Arrow</kbd> to resize.
+        </p>
+        <p>On a phone-sized screen, the board stays view-only; use a larger screen to edit.</p>
+        <fieldset>
+          <legend>Appearance</legend>
+          <p>System follows this device.</p>
+          {(["system", "light", "dark"] as const).map((preference) => (
+            <label key={preference}>
+              <input
+                type="radio"
+                name="theme-preference"
+                checked={theme.preference === preference}
+                onChange={() => theme.setPreference(preference as ThemePreference)}
+              />
+              {preference[0]?.toUpperCase()}
+              {preference.slice(1)}
+            </label>
+          ))}
+        </fieldset>
+        <h3>Organize and collaborate</h3>
+        <p>
+          Layers and “This view” visibility/locking are local. Rotation is shared. Synchronization
+          shows saving/recovery; collaborator cursors are ephemeral, and unavailable presence does
+          not mean changes are unsaved.
+        </p>
+      </section>
+    </div>,
+    document.getElementById("overlay-modals")!,
+  );
+}

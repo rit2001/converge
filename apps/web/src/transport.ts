@@ -7,6 +7,8 @@ import {
   joinBoardAckSchema,
   operationRangeResponseSchema,
   protocolErrorSchema,
+  type PresenceClientToServerEvents,
+  type PresenceServerToClientEvents,
   type BoardRecoveryMaterial,
   type ClientToServerEvents,
   type CommittedOperation,
@@ -24,6 +26,7 @@ import {
   type SubmissionAttempt,
 } from "./pending-command-queue";
 import { indexedDbPendingOperationStore, type PendingOperationStore } from "./pending-db";
+import { PresenceStore } from "./presence-store";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 export const SYNC_ACK_TIMEOUT_MS = 10_000;
@@ -32,7 +35,10 @@ export const SYNC_RETRY_CAP_MS = 10_000;
 export const LIVE_BUFFER_MAX_COUNT = 1_000;
 export const LIVE_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
 
-type BoardSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
+type BoardSocket = Socket<
+  ServerToClientEvents & PresenceServerToClientEvents,
+  ClientToServerEvents & PresenceClientToServerEvents
+>;
 
 const transportScheduler: RetryScheduler = {
   setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
@@ -186,6 +192,7 @@ export interface BoardTransportOptions {
   fetcher?: typeof fetch;
   loadRecovery?: (boardId: string, signal: AbortSignal) => Promise<unknown>;
   synchronization?: Partial<SynchronizationLimits>;
+  presenceStore?: PresenceStore;
 }
 
 export class SynchronizationError extends Error {
@@ -206,6 +213,7 @@ const terminalAuthorizationCodes = new Set([
 ]);
 
 export class BoardTransport {
+  readonly presence: PresenceStore;
   private socket: BoardSocket | null = null;
   private connectionGeneration = 0;
   private nextAttemptId = 0;
@@ -245,6 +253,7 @@ export class BoardTransport {
       liveBufferMaxBytes: LIVE_BUFFER_MAX_BYTES,
       ...options.synchronization,
     };
+    this.presence = options.presenceStore ?? new PresenceStore(boardId, sessionToken);
     const state = useBoardStore.getState();
     this.pendingQueue = new PendingCommandQueue({
       boardId,
@@ -283,6 +292,14 @@ export class BoardTransport {
     useBoardStore.getState().setConnection(this.sessionToken, "connecting");
     const socket = this.socketFactory(this.apiUrl);
     this.socket = socket;
+    this.presence.setPublisher((update) => {
+      if (this.isSessionActive() && !this.terminal && socket === this.socket)
+        socket.emit("presence:update", update);
+    });
+    socket.on("board:presence-snapshot", (raw) => this.receivePresence(socket, "snapshot", raw));
+    socket.on("presence:participant-upsert", (raw) => this.receivePresence(socket, "upsert", raw));
+    socket.on("presence:participant-leave", (raw) => this.receivePresence(socket, "leave", raw));
+    socket.on("presence:availability", (raw) => this.receivePresence(socket, "availability", raw));
     socket.on("connect", () => {
       if (!this.isSessionActive() || socket !== this.socket) return;
       this.connectionGeneration += 1;
@@ -299,6 +316,11 @@ export class BoardTransport {
       this.cancelRetry();
       this.invalidateAttempt();
       this.clearLiveBuffer();
+      this.presence.receiveAvailability({
+        schemaVersion: 1,
+        boardId: this.boardId,
+        status: "unavailable",
+      });
       if (!this.terminal) useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
     });
     socket.on("operation:committed", (raw: unknown) => this.receiveLive(socket, raw));
@@ -327,6 +349,8 @@ export class BoardTransport {
     this.cancelRetry();
     this.invalidateAttempt();
     this.clearLiveBuffer();
+    this.presence.close();
+    this.removePresenceListeners(this.socket);
     this.socket?.disconnect();
     this.socket = null;
     if (!this.terminal) useBoardStore.getState().setConnection(this.sessionToken, "disconnected");
@@ -744,6 +768,26 @@ export class BoardTransport {
     );
   }
 
+  private receivePresence(
+    socket: BoardSocket,
+    kind: "snapshot" | "upsert" | "leave" | "availability",
+    raw: unknown,
+  ): void {
+    if (!this.isSessionActive() || this.terminal || socket !== this.socket) return;
+    if (kind === "snapshot") this.presence.receiveSnapshot(raw);
+    else if (kind === "upsert") this.presence.receiveUpsert(raw);
+    else if (kind === "leave") this.presence.receiveLeave(raw);
+    else this.presence.receiveAvailability(raw);
+  }
+
+  private removePresenceListeners(socket: BoardSocket | null): void {
+    const removable = socket as (BoardSocket & { off?: (event: string) => void }) | null;
+    removable?.off?.("board:presence-snapshot");
+    removable?.off?.("presence:participant-upsert");
+    removable?.off?.("presence:participant-leave");
+    removable?.off?.("presence:availability");
+  }
+
   private receiveConnectionError(socket: BoardSocket, error: unknown): void {
     if (!this.isSessionActive() || socket !== this.socket) return;
     if (error === null || typeof error !== "object" || !Object.hasOwn(error, "data")) return;
@@ -769,6 +813,8 @@ export class BoardTransport {
     this.clearLiveBuffer();
     this.connectionGeneration += 1;
     this.terminal = true;
+    this.presence.close();
+    this.removePresenceListeners(socket);
     updateState();
     socket.disconnect();
     this.socket = null;

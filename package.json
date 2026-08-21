@@ -24,6 +24,7 @@
     "benchmark:k6:sequential": "CONVERGE_K6_ACCEPTANCE_MODE=sequential node scripts/run-isolated-k6-smoke.mjs",
     "benchmark:k6:smoke": "node scripts/run-k6-smoke.mjs",
     "build": "turbo build",
+    "check:web-budgets": "node scripts/check-web-budgets.mjs",
     "check:prometheus": "node scripts/check-prometheus.mjs",
     "dev": "node scripts/root-environment.mjs pnpm run dev:workspace",
     "dev:workspace": "turbo dev --parallel",

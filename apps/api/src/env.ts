@@ -42,6 +42,10 @@ const environmentShape = {
     .transform((value) => value === "true"),
   API_METRICS_BEARER_TOKEN: z.string().refine(isBearerToken).default(""),
   API_DELIVERY_MODE: z.enum(["local", "distributed"]).default("local"),
+  API_PRESENCE_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   REDIS_URL: z.string().url().optional(),
   REDIS_STREAM_KEY: z.string().optional(),
   REDIS_API_QUEUE_MAX_EVENTS: z.coerce
@@ -141,6 +145,12 @@ const environmentSchema = z
           message: "Redis stream key is invalid",
         });
     }
+    if (environment.API_PRESENCE_ENABLED && environment.REDIS_URL === undefined)
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["REDIS_URL"],
+        message: "Redis URL is required for presence",
+      });
     if (environment.DELIVERY_WATCHDOG_BATCH_SIZE > environment.REDIS_DELIVERY_MAX_BOARD_STATES)
       context.addIssue({
         code: z.ZodIssueCode.custom,
