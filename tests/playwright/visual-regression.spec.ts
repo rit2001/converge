@@ -78,7 +78,7 @@ async function setInitialPreference(
   );
 }
 
-test("accepted landing remains visually stable across themes", async ({ page }) => {
+test("accepted Light landing remains visually stable", async ({ page }) => {
   const errors = observePageErrors(page);
   await installDeterministicVisualPolicy(page);
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -87,17 +87,26 @@ test("accepted landing remains visually stable across themes", async ({ page }) 
   await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await capture(page, "landing-light-desktop.png");
-  await page.evaluate(() =>
-    localStorage.setItem("converge:theme:v1", JSON.stringify({ version: 1, preference: "dark" })),
-  );
-  await page.reload();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  errors.assertClean();
+});
+
+test("accepted Dark landing remains visually stable", async ({ page }) => {
+  const errors = observePageErrors(page);
+  await installDeterministicVisualPolicy(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await setInitialPreference(page, "dark", "unseen");
+  await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect
+    .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).colorScheme))
+    .toBe("dark");
   await capture(page, "landing-dark-desktop.png");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   errors.assertClean();
 });
 
-test("accepted Studio overlays remain visually stable across themes", async ({ page }) => {
+test("accepted Studio canvas chrome remains visually stable", async ({ page }) => {
   const errors = observePageErrors(page);
   await installDeterministicVisualPolicy(page);
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -119,16 +128,46 @@ test("accepted Studio overlays remain visually stable across themes", async ({ p
   await expect(page.getByLabel(/Shared rotation controls/)).toBeVisible();
   await capture(page, "studio-selection-layers-light-desktop.png");
 
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  errors.assertClean();
+});
+
+test("accepted Studio modal overlays remain visually stable", async ({ page }) => {
+  const errors = observePageErrors(page);
+  await installDeterministicVisualPolicy(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await setInitialPreference(page, "dark", "dismissed");
+  await page.goto("/studio");
+  await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
+  await page.getByTestId("add-rectangle").click();
+  await page.getByTestId("add-sticky").click();
+  await page.getByRole("button", { name: "Open layers panel" }).click();
+  const list = page.getByRole("list", { name: "Board objects, top to bottom" });
+  await expect(list.getByRole("listitem")).toHaveCount(2);
+  await list.getByRole("button", { name: /Rectangle, bottom layer, 2 of 2/ }).click();
   await page.getByRole("button", { name: "Close layers panel" }).click();
   await page.getByRole("button", { name: "Open studio help" }).click();
-  const help = page.getByRole("dialog", { name: "Studio help" });
-  await help.getByRole("radio", { name: "Dark" }).check();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "Open studio help" }).click();
   await capture(page, "studio-help-dark-desktop.png");
   await page.keyboard.press("Escape");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  errors.assertClean();
+});
 
+test("accepted Studio palette and Share overlays remain visually stable", async ({ page }) => {
+  const errors = observePageErrors(page);
+  await installDeterministicVisualPolicy(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await setInitialPreference(page, "dark", "dismissed");
+  await page.goto("/studio");
+  await expect(page.getByRole("button", { name: "Synchronization status: Synced" })).toBeVisible();
+  await page.getByTestId("add-rectangle").click();
+  await page.getByTestId("add-sticky").click();
+  await page.getByRole("button", { name: "Open layers panel" }).click();
+  const list = page.getByRole("list", { name: "Board objects, top to bottom" });
+  await expect(list.getByRole("listitem")).toHaveCount(2);
+  await list.getByRole("button", { name: /Rectangle, bottom layer, 2 of 2/ }).click();
+  await page.getByRole("button", { name: "Close layers panel" }).click();
   await page.keyboard.press("ControlOrMeta+K");
   await expect(page.getByRole("dialog", { name: "Command palette" })).toBeVisible();
   await capture(page, "studio-palette-dark-desktop.png");
